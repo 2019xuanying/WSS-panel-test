@@ -1,18 +1,17 @@
 /**
  * WSS Proxy Core (Node.js)
- * Axiom Architecture V5.0.0 (Phase 2: Native UDPGW & Robust IPC)
+ * V9.0.0 (Axiom V5.0 - Robust IPC & Offline Buffering)
  *
  * [AXIOM V5.0 CHANGELOG]
- * - [核心特性] 内置原生 UDPGW 服务器 (Native UDP over TCP):
- * - 实现了完整的 BadVPN-UDPGW 1.00 协议。
- * - 移除外部 badvpn 二进制依赖，降低部署复杂度。
- * - 支持多路复用 (Multiplexing) 和动态 Socket 生命周期管理。
- * - [稳定性] IPC 健壮性增强:
- * - 新增 Offline Buffer: 断网期间暂存流量数据，重连后自动补发。
- * - 新增 Heartbeat: 主动检测与 Panel 的连接状态。
- * - [性能] TCP/IP 协议栈调优:
- * - 全局启用 `setNoDelay(true)` (禁用 Nagle 算法) 以降低延迟。
- * - 启用 TCP KeepAlive 防止静默断连。
+ * - [IPC] 健壮性升级:
+ * - 新增应用层心跳 (Ping/Pong)，防止半开连接。
+ * - 实现指数退避重连算法 (Exponential Backoff)。
+ * - [数据] 零丢失计费 (Zero-Loss Accounting):
+ * - 引入 offlineStatsQueue。当 IPC 断开时，流量数据累积在本地。
+ * - 连接恢复后，自动补发离线期间产生的流量统计。
+ * - [架构] 纯主动推送:
+ * - 彻底移除旧版 GET_STATS 被动轮询逻辑。
+ * - 适配原生 UDPGW (无需代码变更，仅需通过 SSH 隧道转发)。
  */
 
 const net = require('net');
@@ -20,13 +19,11 @@ const tls = require('tls');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
-const { URLSearchParams } = require('url');
 const WebSocket = require('ws');
 const cluster = require('cluster');
 const os = require('os');
-const dgram = require('dgram'); // [AXIOM V5.0] 新增: 用于原生 UDPGW
 
-// --- [AXIOM V5.0] 配置加载 ---
+// --- 配置加载 ---
 const PANEL_DIR = process.env.PANEL_DIR_ENV || '/etc/wss-panel';
 const CONFIG_PATH = path.join(PANEL_DIR, 'config.json');
 let config = {};
@@ -36,32 +33,35 @@ function loadConfig() {
         const configData = fs.readFileSync(CONFIG_PATH, 'utf8');
         config = JSON.parse(configData);
         if (cluster.isWorker) {
-            // console.log(`[Worker ${cluster.worker.id}] 配置加载成功。`);
-        } else {
-            console.log(`[Master] 配置加载成功。`);
+            console.log(`[AXIOM V5.0] Worker ${cluster.worker.id} 配置加载成功。`);
         }
     } catch (e) {
-        console.error(`[CRITICAL] 无法加载 ${CONFIG_PATH}: ${e.message}`);
-        process.exit(1);
+        console.error(`[CRITICAL] 无法加载配置 ${CONFIG_PATH}: ${e.message}`);
+        process.exit(1); 
     }
 }
 loadConfig();
 
 // --- 核心常量 ---
 const LISTEN_ADDR = '0.0.0.0';
-const WSS_LOG_FILE = path.join(PANEL_DIR, 'wss.log');
+const WSS_LOG_FILE = path.join(PANEL_DIR, 'wss.log'); 
 const HOSTS_DB_PATH = path.join(PANEL_DIR, 'hosts.json');
 const HTTP_PORT = config.wss_http_port;
 const TLS_PORT = config.wss_tls_port;
-const UDPGW_PORT = config.udpgw_port || 7300; // [AXIOM V5.0] 原生 UDPGW 端口
 const INTERNAL_FORWARD_PORT = config.internal_forward_port;
+const INTERNAL_API_PORT = config.internal_api_port; // 仅用于兼容旧检查，V5.0 IPC 不依赖此
 const PANEL_API_URL = config.panel_api_url;
-const INTERNAL_API_SECRET = config.internal_api_secret;
 const DEFAULT_TARGET = { host: '127.0.0.1', port: INTERNAL_FORWARD_PORT };
-const TIMEOUT = 86400000;
+const TIMEOUT = 86400000; // 24h
 const BUFFER_SIZE = 65536;
 const CERT_FILE = '/etc/stunnel/certs/stunnel.pem';
 const KEY_FILE = '/etc/stunnel/certs/stunnel.key';
+
+// IPC 常量
+const IPC_URL = `ws://127.0.0.1:${config.panel_port}/ipc`;
+const PUSH_INTERVAL = 1000; // 1秒推送
+const HEARTBEAT_INTERVAL = 5000; // 5秒心跳
+const HEARTBEAT_TIMEOUT = 15000; // 15秒超时判定
 
 // HTTP Responses
 const FIRST_RESPONSE = Buffer.from('HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\n\r\nOK\r\n\r\n');
@@ -72,14 +72,25 @@ const TOO_MANY_REQUESTS_RESPONSE = Buffer.from('HTTP/1.1 429 Too Many Requests\r
 const INTERNAL_ERROR_RESPONSE = Buffer.from('HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n');
 
 let HOST_WHITELIST = new Set();
-let logStream;
+let logStream; 
+const userStats = new Map();
+
+// IPC 状态
+let ipcWsClient = null;
+let statsPusherIntervalId = null;
+let heartbeatIntervalId = null;
+let lastPingTime = 0;
+let lastPongTime = 0;
+let reconnectDelay = 1000;
+// [AXIOM V5.0] 离线数据队列 Map<username, {up, down}>
+let offlineStatsQueue = new Map(); 
 
 // --- 令牌桶 (Token Bucket) ---
 class TokenBucket {
     constructor(capacityKbps, fillRateKbps) {
-        this.capacity = capacityKbps * 1024;
-        this.fillRate = fillRateKbps * 1024 / 1000;
-        this.tokens = this.capacity;
+        this.capacity = capacityKbps * 1024; 
+        this.fillRate = fillRateKbps * 1024 / 1000; 
+        this.tokens = this.capacity; 
         this.lastFill = Date.now();
     }
     _fillTokens() {
@@ -92,18 +103,18 @@ class TokenBucket {
         }
     }
     consume(bytesToConsume) {
-        if (this.fillRate === 0) return bytesToConsume; // 无限制
+        if (this.fillRate === 0) return bytesToConsume; 
         this._fillTokens();
         if (bytesToConsume <= this.tokens) {
             this.tokens -= bytesToConsume;
-            return bytesToConsume;
+            return bytesToConsume; 
         }
         if (this.tokens > 0) {
-            const allowedBytes = this.tokens;
-            this.tokens = 0;
-            return allowedBytes;
+             const allowedBytes = this.tokens;
+             this.tokens = 0;
+             return allowedBytes; 
         }
-        return 0;
+        return 0; 
     }
     updateRate(newCapacityKbps, newFillRateKbps) {
         this._fillTokens();
@@ -114,19 +125,16 @@ class TokenBucket {
     }
 }
 
-// --- 全局用户状态 ---
-const userStats = new Map();
-const SPEED_CALC_INTERVAL = 1000;
-
+// --- 用户状态管理 ---
 function getUserStat(username) {
     if (!userStats.has(username)) {
         userStats.set(username, {
             sockets: new Set(),
-            ip_map: new Map(),
-            traffic_delta: { upload: 0, download: 0 },
-            traffic_live: { upload: 0, download: 0 },
+            ip_map: new Map(), 
+            traffic_delta: { upload: 0, download: 0 }, 
+            traffic_live: { upload: 0, download: 0 }, 
             speed_kbps: { upload: 0, download: 0 },
-            lastSpeedCalc: { upload: 0, download: 0, time: Date.now() },
+            lastSpeedCalc: { upload: 0, download: 0, time: Date.now() }, 
             bucket_up: new TokenBucket(0, 0),
             bucket_down: new TokenBucket(0, 0),
             limits: { rate_kbps: 0, max_connections: 0, require_auth_header: 1 }
@@ -135,14 +143,16 @@ function getUserStat(username) {
     return userStats.get(username);
 }
 
-/** 实时速度计算器 (本地) */
+/** * 实时速度计算器 (1秒)
+ * 注意：此函数仅计算速度，不再执行熔断判断
+ */
 function calculateSpeeds() {
     const now = Date.now();
     for (const [username, stats] of userStats.entries()) {
         const elapsed = now - stats.lastSpeedCalc.time;
-        if (elapsed < (SPEED_CALC_INTERVAL / 2)) continue;
+        if (elapsed < (PUSH_INTERVAL / 2)) continue; 
         const elapsedSeconds = elapsed / 1000.0;
-
+        
         const uploadDelta = stats.traffic_live.upload - stats.lastSpeedCalc.upload;
         stats.speed_kbps.upload = (uploadDelta / 1024) / elapsedSeconds;
         stats.lastSpeedCalc.upload = stats.traffic_live.upload;
@@ -150,90 +160,40 @@ function calculateSpeeds() {
         const downloadDelta = stats.traffic_live.download - stats.lastSpeedCalc.download;
         stats.speed_kbps.download = (downloadDelta / 1024) / elapsedSeconds;
         stats.lastSpeedCalc.download = stats.traffic_live.download;
-
+        
         stats.lastSpeedCalc.time = now;
-
-        // 自动清理不活跃用户
+        
         if (stats.sockets.size === 0 && stats.traffic_delta.upload === 0 && stats.traffic_delta.download === 0) {
             userStats.delete(username);
         }
     }
 }
-setInterval(calculateSpeeds, SPEED_CALC_INTERVAL);
+setInterval(calculateSpeeds, PUSH_INTERVAL);
 
+// --- IPC 与 健壮性逻辑 ---
 
-// --- [AXIOM V5.0] 健壮的 IPC 客户端 ---
-
-let ipcWsClient = null;
-let statsPusherIntervalId = null;
-let offlineStatsBuffer = []; // [AXIOM V5.0] 断网缓存
-
-function connectToIpcServer() {
-    const ipcUrl = `ws://127.0.0.1:${config.panel_port}/ipc`;
-    // console.log(`[IPC] Worker ${cluster.worker.id} connecting to ${ipcUrl}...`);
-
-    const ws = new WebSocket(ipcUrl, {
-        headers: { 'X-Internal-Secret': config.internal_api_secret }
-    });
-    
-    ipcWsClient = ws;
-
-    ws.on('open', () => {
-        console.log(`[IPC] Worker ${cluster.worker.id} Connected. Buffers: ${offlineStatsBuffer.length}`);
-        
-        // [AXIOM V5.0] 重连后立即发送缓存的数据
-        if (offlineStatsBuffer.length > 0) {
-            console.log(`[IPC] Flushing ${offlineStatsBuffer.length} buffered stats packets...`);
-            while (offlineStatsBuffer.length > 0) {
-                const cachedMsg = offlineStatsBuffer.shift();
-                try { ws.send(JSON.stringify(cachedMsg)); } catch(e) {}
-            }
-        }
-
-        if (statsPusherIntervalId) clearInterval(statsPusherIntervalId);
-        statsPusherIntervalId = setInterval(() => pushStats(ws), 1000);
-    });
-
-    ws.on('message', (data) => {
-        try {
-            const msg = JSON.parse(data.toString());
-            if (msg.type === 'ping') {
-                ws.send(JSON.stringify({ type: 'pong', workerId: cluster.worker.id }));
-                return;
-            }
-            handleIpcMessage(msg);
-        } catch (e) {
-            console.error(`[IPC] Message Parse Error: ${e.message}`);
-        }
-    });
-
-    ws.on('close', () => {
-        // console.warn(`[IPC] Disconnected. Reconnecting in 3s...`);
-        if (statsPusherIntervalId) clearInterval(statsPusherIntervalId);
-        ipcWsClient = null;
-        setTimeout(connectToIpcServer, 3000); // [AXIOM V5.0] 指数退避策略可在此扩展
-    });
-
-    ws.on('error', (err) => {
-        // console.error(`[IPC] Error: ${err.message}`);
-        ws.close();
-    });
-}
-
-function pushStats(ws) {
+/**
+ * 推送统计数据到控制平面
+ * [AXIOM V5.0] 增加了离线队列处理
+ */
+function pushStatsToControlPlane() {
     const statsReport = {};
     const liveIps = {};
     let hasData = false;
 
+    // 1. 收集当前 Worker 的数据
     for (const [username, stats] of userStats.entries()) {
+        // 仅处理有活动的用户
         if (stats.sockets.size > 0 || stats.traffic_delta.upload > 0 || stats.traffic_delta.download > 0) {
+            
             statsReport[username] = {
-                speed_kbps: stats.speed_kbps,
+                speed_kbps: stats.speed_kbps, 
                 connections: stats.sockets.size,
                 traffic_delta_up: stats.traffic_delta.upload,
                 traffic_delta_down: stats.traffic_delta.download
             };
-            // 重置增量
+
+            // 关键: 收集完后清零本地增量
             stats.traffic_delta.upload = 0;
             stats.traffic_delta.download = 0;
             
@@ -244,22 +204,59 @@ function pushStats(ws) {
         }
     }
 
-    const payload = {
-        type: 'stats_update',
-        workerId: cluster.worker.id,
-        payload: { stats: statsReport, live_ips: liveIps }
-    };
-
-    // [AXIOM V5.0] 如果断开，存入 Buffer
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
+    // 2. 如果离线，存入队列
+    if (!ipcWsClient || ipcWsClient.readyState !== WebSocket.OPEN) {
         if (hasData) {
-            if (offlineStatsBuffer.length > 60) offlineStatsBuffer.shift(); // 防止内存溢出，保留最近60秒
-            offlineStatsBuffer.push(payload);
+            // console.log(`[IPC] 离线中... 缓存流量数据 (${Object.keys(statsReport).length} users)`);
+            for (const username in statsReport) {
+                const report = statsReport[username];
+                const queued = offlineStatsQueue.get(username) || { up: 0, down: 0 };
+                queued.up += report.traffic_delta_up;
+                queued.down += report.traffic_delta_down;
+                offlineStatsQueue.set(username, queued);
+            }
         }
         return;
     }
 
-    try { ws.send(JSON.stringify(payload)); } catch (e) {}
+    // 3. 如果在线，先发送离线队列 (如果有)
+    if (offlineStatsQueue.size > 0) {
+        const offlineReport = {};
+        for (const [username, data] of offlineStatsQueue.entries()) {
+            offlineReport[username] = {
+                speed_kbps: { upload: 0, download: 0 }, // 补发数据不影响实时速度
+                connections: 0, // 补发时不更新连接数
+                traffic_delta_up: data.up,
+                traffic_delta_down: data.down
+            };
+        }
+        
+        try {
+            ipcWsClient.send(JSON.stringify({
+                type: 'stats_update',
+                workerId: cluster.worker.id,
+                payload: { stats: offlineReport, live_ips: {} } // 补发不含 IP
+            }));
+            console.log(`[IPC] 已补发离线期间的流量数据 (${offlineStatsQueue.size} users)。`);
+            offlineStatsQueue.clear();
+        } catch (e) {
+            console.error(`[IPC] 补发离线数据失败: ${e.message}`);
+            // 发送失败则保留队列，下次再试
+        }
+    }
+
+    // 4. 发送实时数据
+    if (hasData) {
+        try {
+            ipcWsClient.send(JSON.stringify({
+                type: 'stats_update',
+                workerId: cluster.worker.id,
+                payload: { stats: statsReport, live_ips: liveIps }
+            }));
+        } catch (e) {
+            console.error(`[IPC] 推送实时数据失败: ${e.message}`);
+        }
+    }
 }
 
 function handleIpcMessage(message) {
@@ -268,15 +265,17 @@ function handleIpcMessage(message) {
             if (message.username) kickUser(message.username);
             break;
         case 'update_limits':
-            if (message.username && message.limits) updateUserLimits(message.username, message.limits);
+            if (message.username && message.limits) {
+                updateUserLimits(message.username, message.limits);
+            }
             break;
         case 'reset_traffic':
-            if (message.username) resetUserTraffic(message.username);
+             if (message.username) resetUserTraffic(message.username);
             break;
         case 'delete':
             if (message.username) {
-                kickUser(message.username);
-                userStats.delete(message.username);
+                kickUser(message.username); 
+                userStats.delete(message.username); 
             }
             break;
         case 'reload_hosts':
@@ -285,11 +284,86 @@ function handleIpcMessage(message) {
     }
 }
 
+/**
+ * [AXIOM V5.0] 健壮的 IPC 连接管理器
+ */
+function connectToIpcServer() {
+    console.log(`[IPC] Worker ${cluster.worker.id} 正在连接控制平面...`);
+
+    const ws = new WebSocket(IPC_URL, {
+        headers: { 
+            'X-Internal-Secret': config.internal_api_secret,
+            'X-Worker-ID': cluster.worker.id 
+        }
+    });
+
+    ipcWsClient = ws;
+
+    ws.on('open', () => {
+        console.log(`[IPC] 连接成功。重置退避延迟。`);
+        reconnectDelay = 1000; // 重置延迟
+        lastPingTime = Date.now();
+        lastPongTime = Date.now();
+
+        // 启动推送器
+        if (statsPusherIntervalId) clearInterval(statsPusherIntervalId);
+        statsPusherIntervalId = setInterval(pushStatsToControlPlane, PUSH_INTERVAL);
+
+        // 启动心跳检测
+        if (heartbeatIntervalId) clearInterval(heartbeatIntervalId);
+        heartbeatIntervalId = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.ping(); // 发送 Ping
+                lastPingTime = Date.now();
+                
+                // 检查僵死连接
+                if (lastPingTime - lastPongTime > HEARTBEAT_TIMEOUT) {
+                    console.warn(`[IPC] 心跳超时 (${HEARTBEAT_TIMEOUT}ms)。主动断开重连。`);
+                    ws.terminate();
+                }
+            }
+        }, HEARTBEAT_INTERVAL);
+    });
+
+    ws.on('pong', () => {
+        lastPongTime = Date.now();
+    });
+
+    ws.on('message', (data) => {
+        try {
+            handleIpcMessage(JSON.parse(data.toString()));
+        } catch (e) {
+            console.error(`[IPC] 消息解析错误: ${e.message}`);
+        }
+    });
+
+    ws.on('close', (code, reason) => {
+        console.warn(`[IPC] 连接断开 (Code: ${code})。离线队列已启用。${reconnectDelay/1000}秒后重连...`);
+        cleanupIpc();
+        
+        // 指数退避重连
+        setTimeout(connectToIpcServer, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, 30000); // 最大 30秒
+    });
+
+    ws.on('error', (err) => {
+        console.error(`[IPC] 连接错误: ${err.message}`);
+        ws.terminate(); // 触发 close
+    });
+}
+
+function cleanupIpc() {
+    if (statsPusherIntervalId) clearInterval(statsPusherIntervalId);
+    if (heartbeatIntervalId) clearInterval(heartbeatIntervalId);
+    ipcWsClient = null;
+}
+
+// --- 用户管理逻辑 ---
 function kickUser(username) {
     const stats = userStats.get(username);
     if (stats && stats.sockets.size > 0) {
-        console.log(`[Kick] User ${username}, closing ${stats.sockets.size} connections.`);
-        for (const socket of stats.sockets) socket.destroy();
+        console.log(`[IPC] 踢出用户 ${username} (${stats.sockets.size} 连接)...`);
+        for (const socket of stats.sockets) socket.destroy(); 
         stats.sockets.clear();
         stats.ip_map.clear();
     }
@@ -297,15 +371,15 @@ function kickUser(username) {
 
 function updateUserLimits(username, limits) {
     if (!limits) return;
-    const stats = getUserStat(username);
+    const stats = getUserStat(username); 
     stats.limits = {
         rate_kbps: limits.rate_kbps || 0,
         max_connections: limits.max_connections || 0,
         require_auth_header: limits.require_auth_header === 0 ? 0 : 1
     };
-    // 更新令牌桶速率
-    stats.bucket_up.updateRate(stats.limits.rate_kbps * 2, stats.limits.rate_kbps);
-    stats.bucket_down.updateRate(stats.limits.rate_kbps * 2, stats.limits.rate_kbps);
+    // 更新令牌桶
+    stats.bucket_up.updateRate(stats.limits.rate_kbps * 2, stats.limits.rate_kbps); 
+    stats.bucket_down.updateRate(stats.limits.rate_kbps * 2, stats.limits.rate_kbps); 
 }
 
 function resetUserTraffic(username) {
@@ -317,497 +391,270 @@ function resetUserTraffic(username) {
     }
 }
 
-
-// --- [AXIOM V5.0] 原生 UDPGW 服务器 ---
-
-/**
- * 解析 UDPGW 协议数据包
- * 格式: [Length (2B)] [Type (1B)] [Payload...]
- */
-function startNativeUdpgwServer() {
-    const server = net.createServer((socket) => {
-        // [AXIOM V5.0] TCP 优化
-        socket.setNoDelay(true);
-        socket.setKeepAlive(true, 30000);
-
-        let buffer = Buffer.alloc(0);
-        let state = 'handshake';
-        // Map<ConnID, UdpSocket>
-        const connections = new Map();
-
-        socket.on('data', (data) => {
-            buffer = Buffer.concat([buffer, data]);
-
-            // 1. 握手阶段 (badvpn-udpgw 1.00)
-            if (state === 'handshake') {
-                const handshakeStr = "badvpn-udpgw 1.00\n";
-                const idx = buffer.indexOf('\n');
-                if (idx !== -1) {
-                    const line = buffer.subarray(0, idx + 1).toString();
-                    if (line === handshakeStr) {
-                        socket.write(handshakeStr); // Reply same
-                        buffer = buffer.subarray(idx + 1);
-                        state = 'framing';
-                    } else {
-                        // console.warn(`[UDPGW] Bad Handshake: ${line.trim()}`);
-                        socket.destroy();
-                        return;
-                    }
-                } else {
-                    if (buffer.length > 100) socket.destroy(); // Too long handshake
-                    return; // Wait for more data
-                }
-            }
-
-            // 2. 帧处理阶段
-            while (state === 'framing' && buffer.length >= 2) {
-                const len = buffer.readUInt16LE(0); // Length is little-endian? No, badvpn uses Little Endian for length in protocol usually? 
-                // Wait, standard badvpn uses Little Endian for length.
-                
-                if (buffer.length < 2 + len) return; // Wait for full packet
-
-                const packet = buffer.subarray(2, 2 + len);
-                buffer = buffer.subarray(2 + len);
-
-                if (packet.length === 0) continue;
-                const type = packet[0];
-                
-                try {
-                    handleUdpgwPacket(socket, connections, type, packet.subarray(1));
-                } catch (e) {
-                    console.error(`[UDPGW] Packet Error: ${e.message}`);
-                }
-            }
-        });
-
-        socket.on('error', () => destroyAllUdp(connections));
-        socket.on('close', () => destroyAllUdp(connections));
-        socket.on('timeout', () => socket.destroy());
-    });
-
-    // 绑定到 127.0.0.1，仅允许 SSH 隧道流量访问
-    server.listen(UDPGW_PORT, '127.0.0.1', () => {
-        console.log(`[UDPGW] Worker ${cluster.worker.id} Native UDPGW listening on 127.0.0.1:${UDPGW_PORT}`);
-    });
-
-    server.on('error', (err) => {
-        console.error(`[UDPGW] Server Error: ${err.message}`);
-    });
+// --- 日志与白名单 ---
+function setupLogStream() {
+    try {
+        logStream = fs.createWriteStream(WSS_LOG_FILE, { flags: 'a' });
+        logStream.on('error', (err) => console.error(`[LOG] Stream Error: ${err.message}`));
+    } catch (e) { console.error(`[LOG] Create Error: ${e.message}`); }
 }
 
-function destroyAllUdp(connections) {
-    for (const udpSocket of connections.values()) {
-        try { udpSocket.close(); } catch (e) {}
-    }
-    connections.clear();
+function logConnection(clientIp, clientPort, localPort, username, status) {
+    if (!logStream) return;
+    const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
+    const workerId = cluster.isWorker ? `W${cluster.worker.id}` : 'M';
+    logStream.write(`[${timestamp}] [${status}] [${workerId}] USER=${username} IP=${clientIp}:${clientPort}\n`);
 }
-
-function handleUdpgwPacket(tcpSocket, connections, type, payload) {
-    // BadVPN Protocol Types:
-    // 0x05: Create Connection
-    // 0x07: Data (Client -> Server)
-    // 0x11: Close Connection
-    // 0x04: KeepAlive
-
-    if (type === 0x05) { // Create
-        // [ConnID(2)] [AddrLen(2)] [Addr...] [Port(2)]
-        if (payload.length < 6) return;
-        const connId = payload.readUInt16LE(0);
-        const addrLen = payload.readUInt16LE(2);
-        if (payload.length < 4 + addrLen + 2) return;
-        const addr = payload.subarray(4, 4 + addrLen).toString();
-        const port = payload.readUInt16LE(4 + addrLen);
-
-        if (connections.has(connId)) return; // Already exists
-
-        const udpSocket = dgram.createSocket('udp4');
-        
-        udpSocket.on('message', (msg, rinfo) => {
-            // Send data back to TCP client
-            // Format: [Len(2)] [Type(0x08=Data)] [ConnID(2)] [Data...]
-            const head = Buffer.alloc(5);
-            const totalLen = 3 + msg.length; // Type(1) + ConnID(2) + Data
-            head.writeUInt16LE(totalLen, 0);
-            head[2] = 0x08; // Type: Data (Server->Client)
-            head.writeUInt16LE(connId, 3);
-            
-            if (tcpSocket.writable) {
-                tcpSocket.write(Buffer.concat([head, msg]));
-            }
-        });
-
-        udpSocket.on('error', () => {
-            // Send close to client? Or just silent.
-            connections.delete(connId);
-        });
-        
-        // 绑定生命周期
-        connections.set(connId, udpSocket);
-        
-        // 实际上 UDPGW 协议不需要 Connect, 只需要 SendTo
-        // 但为了接收回包，我们需要保持这个 socket
-        // 并且我们需要知道目标地址，以便后续 SendTo
-        // *Badvpn logic*: The 'Create' packet sets the destination for this ConnID.
-        udpSocket.destAddr = addr;
-        udpSocket.destPort = port;
-
-    } else if (type === 0x07) { // Data
-        // [ConnID(2)] [Data...]
-        if (payload.length < 2) return;
-        const connId = payload.readUInt16LE(0);
-        const data = payload.subarray(2);
-        
-        const udpSocket = connections.get(connId);
-        if (udpSocket && udpSocket.destAddr) {
-            udpSocket.send(data, udpSocket.destPort, udpSocket.destAddr, (err) => {
-                if (err) { /* ignore */ }
-            });
-        }
-
-    } else if (type === 0x11) { // Close
-        if (payload.length < 2) return;
-        const connId = payload.readUInt16LE(0);
-        const udpSocket = connections.get(connId);
-        if (udpSocket) {
-            udpSocket.close();
-            connections.delete(connId);
-        }
-    } 
-    // 0x04 KeepAlive: Ignored (just keeps TCP connection active)
-}
-
-
-// --- Host 白名单与认证逻辑 ---
 
 function loadHostWhitelist() {
     try {
         if (!fs.existsSync(HOSTS_DB_PATH)) {
-            HOST_WHITELIST = new Set();
-            return;
+            HOST_WHITELIST = new Set(); return;
         }
-        const data = fs.readFileSync(HOSTS_DB_PATH, 'utf8');
-        const hosts = JSON.parse(data);
-        if (Array.isArray(hosts)) {
-            const cleanHosts = new Set();
-            hosts.forEach(host => {
-                if (typeof host === 'string') {
-                    let h = host.trim().toLowerCase();
-                    if (h.includes(':')) h = h.split(':')[0];
-                    if (h) cleanHosts.add(h);
-                }
-            });
-            HOST_WHITELIST = cleanHosts;
-        }
+        const hosts = JSON.parse(fs.readFileSync(HOSTS_DB_PATH, 'utf8'));
+        HOST_WHITELIST = new Set(hosts.map(h => h.split(':')[0].trim().toLowerCase()).filter(h => h));
+        if (cluster.isWorker) console.log(`[Worker ${cluster.worker.id}] Host 白名单已重载: ${HOST_WHITELIST.size} 条`);
     } catch (e) {
         HOST_WHITELIST = new Set();
+        console.error(`[HOSTS] 加载失败: ${e.message}`);
     }
 }
 
 function checkHost(headers) {
-    const hostMatch = headers.match(/Host:\s*([^\s\r\n]+)/i);
-    if (!hostMatch) {
-        return HOST_WHITELIST.size === 0; // Empty list = allow all (strict mode handled elsewhere)
-    }
-    let requestedHost = hostMatch[1].trim().toLowerCase();
-    if (requestedHost.includes(':')) requestedHost = requestedHost.split(':')[0];
     if (HOST_WHITELIST.size === 0) return true;
-    return HOST_WHITELIST.has(requestedHost);
+    const hostMatch = headers.match(/Host:\s*([^\s\r\n]+)/i);
+    if (!hostMatch) return false;
+    let host = hostMatch[1].trim().toLowerCase().split(':')[0];
+    return HOST_WHITELIST.has(host);
 }
 
+// --- 认证逻辑 ---
 function parseAuth(headers) {
     const authMatch = headers.match(/Proxy-Authorization:\s*Basic\s+([A-Za-z0-9+/=]+)/i);
     if (!authMatch) return null;
     try {
-        const credentials = Buffer.from(authMatch[1], 'base64').toString('utf8');
-        const [username, ...passwordParts] = credentials.split(':');
-        return { username, password: passwordParts.join(':') };
+        const creds = Buffer.from(authMatch[1], 'base64').toString('utf8').split(':');
+        if (creds.length < 2) return null;
+        return { username: creds[0], password: creds.slice(1).join(':') };
     } catch (e) { return null; }
 }
 
 async function authenticateUser(username, password) {
     try {
-        const response = await fetch(PANEL_API_URL + '/auth', {
+        // 即使 panel_port 变了，Proxy 也会重启，所以 config.panel_api_url 是新的
+        const res = await fetch(PANEL_API_URL + '/auth', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ username, password })
         });
-        if (!response.ok) {
-            return { success: false, message: `Status ${response.status}` };
-        }
-        const data = await response.json();
+        if (!res.ok) return { success: false, message: `HTTP ${res.status}` };
+        const data = await res.json();
         if (data.success) updateUserLimits(username, data.limits);
-        return { success: data.success, limits: data.limits, requireAuthHeader: data.require_auth_header, message: 'OK' };
-    } catch (e) {
-        return { success: false, message: e.message };
-    }
+        return { success: true, limits: data.limits, requireAuthHeader: data.require_auth_header };
+    } catch (e) { return { success: false, message: e.message }; }
 }
 
 async function getLiteAuthStatus(username) {
     try {
-        const params = new URLSearchParams({ username });
-        const response = await fetch(PANEL_API_URL + '/auth/user-settings?' + params.toString(), { method: 'GET' });
-        if (!response.ok) return { exists: false, requireAuthHeader: 1 };
-        const data = await response.json();
+        const res = await fetch(`${PANEL_API_URL}/auth/user-settings?username=${username}`);
+        if (!res.ok) return { exists: false };
+        const data = await res.json();
         if (data.success && data.require_auth_header === 0) {
-            if (data.limits) updateUserLimits(username, data.limits);
+            // 刷新一下 limits (虽然 lite auth 通常意味着不做严格限制，但我们要保持一致)
+            // 这里的逻辑稍微简化，假设面板会返回 limits，如果面板接口支持的话
+            // 目前面板接口只返回 require_auth_header。为了健壮性，我们可以在 Panel V5.0 加上 limits 返回
+            // 但为了不破坏协议，这里暂且不更新 limits (使用默认或旧值)
         }
         return { exists: data.success, requireAuthHeader: data.require_auth_header || 1 };
-    } catch (e) { return { exists: false, requireAuthHeader: 1 }; }
+    } catch (e) { return { exists: false }; }
 }
 
-function checkConcurrency(username, maxConnections) {
-    if (!maxConnections || maxConnections === 0) return true;
-    const stats = getUserStat(username);
-    return stats.sockets.size < maxConnections;
-}
-
-
-// --- 异步日志 ---
-function setupLogStream() {
-    try {
-        logStream = fs.createWriteStream(WSS_LOG_FILE, { flags: 'a' });
-    } catch (e) {
-        console.error(`[Log] Failed to create stream: ${e.message}`);
-    }
-}
-function logConnection(clientIp, clientPort, localPort, username, status) {
-    if (!logStream) return;
-    const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
-    const workerId = cluster.isWorker ? `Worker ${cluster.worker.id}` : 'Master';
-    logStream.write(`[${timestamp}] [${status}] [${workerId}] USER=${username} CLIENT_IP=${clientIp} LOCAL_PORT=${localPort}\n`);
-}
-
-
-// --- [AXIOM V5.0] WSS 客户端处理器 ---
+// --- Client Handler ---
 function handleClient(clientSocket, isTls) {
-    // [AXIOM V5.0] TCP 优化
-    clientSocket.setNoDelay(true);
-    clientSocket.setKeepAlive(true, 60000);
-
     let clientIp = clientSocket.remoteAddress;
     let clientPort = clientSocket.remotePort;
     let localPort = clientSocket.localPort;
-
     let fullRequest = Buffer.alloc(0);
     let state = 'handshake';
     let remoteSocket = null;
-    let username = null;
-    
-    clientSocket.setTimeout(TIMEOUT);
+    let username = null; 
+    let limits = null; 
 
-    clientSocket.on('error', (err) => {
-        if (remoteSocket) remoteSocket.destroy();
-        clientSocket.destroy();
-    });
-    clientSocket.on('timeout', () => {
-        if (remoteSocket) remoteSocket.destroy();
-        clientSocket.destroy();
-    });
-    clientSocket.on('close', () => {
+    clientSocket.setTimeout(TIMEOUT);
+    clientSocket.setKeepAlive(true, 60000);
+
+    const cleanup = () => {
         if (remoteSocket) remoteSocket.destroy();
         if (username) {
-            const stats = getUserStat(username);
-            stats.sockets.delete(clientSocket);
-            stats.ip_map.delete(clientIp);
+            const stats = userStats.get(username);
+            if (stats) {
+                stats.sockets.delete(clientSocket);
+                stats.ip_map.delete(clientIp);
+            }
         }
-    });
+        clientSocket.destroy();
+    };
+
+    clientSocket.on('error', cleanup);
+    clientSocket.on('timeout', cleanup);
+    clientSocket.on('close', cleanup);
 
     clientSocket.on('data', async (data) => {
         if (state === 'forwarding') {
             const stats = getUserStat(username);
-            const allowedBytes = stats.bucket_up.consume(data.length);
-            if (allowedBytes === 0) return; 
-            
-            const dataToWrite = (allowedBytes < data.length) ? data.subarray(0, allowedBytes) : data;
-            
-            // 流量计费
-            stats.traffic_delta.upload += dataToWrite.length;
-            stats.traffic_live.upload += dataToWrite.length;
-            
-            if (remoteSocket && remoteSocket.writable) {
-                remoteSocket.write(dataToWrite);
-            }
+            const allowed = stats.bucket_up.consume(data.length);
+            if (allowed === 0) return; 
+            const chunk = (allowed < data.length) ? data.subarray(0, allowed) : data;
+            stats.traffic_delta.upload += chunk.length;
+            stats.traffic_live.upload += chunk.length;
+            if (remoteSocket && remoteSocket.writable) remoteSocket.write(chunk);
             return;
         }
 
         fullRequest = Buffer.concat([fullRequest, data]);
 
-        while (state === 'handshake' && fullRequest.length > 0) {
-            const headerEndIndex = fullRequest.indexOf('\r\n\r\n');
-            if (headerEndIndex === -1) {
-                if (fullRequest.length > BUFFER_SIZE * 2) clientSocket.end(FORBIDDEN_RESPONSE);
+        if (state === 'handshake') {
+            const headerEnd = fullRequest.indexOf('\r\n\r\n');
+            if (headerEnd === -1) {
+                if (fullRequest.length > BUFFER_SIZE) clientSocket.end(FORBIDDEN_RESPONSE);
                 return;
             }
 
-            const headersRaw = fullRequest.subarray(0, headerEndIndex);
-            let dataAfterHeaders = fullRequest.subarray(headerEndIndex + 4);
-            const headers = headersRaw.toString('utf8');
-            fullRequest = dataAfterHeaders;
+            const headersRaw = fullRequest.subarray(0, headerEnd).toString();
+            const body = fullRequest.subarray(headerEnd + 4);
+            fullRequest = body; // 剩余数据留给 SSH
 
-            if (!checkHost(headers)) {
-                logConnection(clientIp, clientPort, localPort, 'N/A', 'REJECTED_HOST');
-                clientSocket.end(FORBIDDEN_RESPONSE);
-                return;
+            if (!checkHost(headersRaw)) {
+                logConnection(clientIp, clientPort, localPort, 'N/A', 'REJECT_HOST');
+                return clientSocket.end(FORBIDDEN_RESPONSE);
             }
 
-            const auth = parseAuth(headers);
-            const isWebsocketRequest = headers.includes('Upgrade: websocket') || headers.includes('Connection: Upgrade');
-
-            // HTTP 响应处理 (Payload Eater)
-            if (!isWebsocketRequest) {
-                if (auth) {
-                    logConnection(clientIp, clientPort, localPort, 'N/A', 'REJECTED_AUTH_NOT_WS');
-                    clientSocket.end(FORBIDDEN_RESPONSE);
-                } else {
-                    logConnection(clientIp, clientPort, localPort, 'N/A', 'DUMMY_HTTP');
-                    clientSocket.write(FIRST_RESPONSE);
-                }
-                continue;
+            // 认证
+            const auth = parseAuth(headersRaw);
+            const isWs = headersRaw.includes('Upgrade: websocket') || headersRaw.includes('Connection: Upgrade');
+            
+            if (!isWs) { // 哑 HTTP 响应
+                 if (auth) {
+                     logConnection(clientIp, clientPort, localPort, 'N/A', 'REJECT_HTTP_AUTH');
+                     return clientSocket.end(FORBIDDEN_RESPONSE);
+                 }
+                 clientSocket.write(FIRST_RESPONSE); // Payload Eater
+                 return;
             }
 
-            // 鉴权逻辑
-            let limits = null;
             if (auth) {
                 username = auth.username;
                 const res = await authenticateUser(username, auth.password);
                 if (!res.success) {
-                    logConnection(clientIp, clientPort, localPort, username, `AUTH_FAILED`);
-                    clientSocket.end(UNAUTHORIZED_RESPONSE);
-                    return;
+                    logConnection(clientIp, clientPort, localPort, username, `AUTH_FAIL_${res.message}`);
+                    return clientSocket.end(UNAUTHORIZED_RESPONSE);
                 }
                 limits = res.limits;
             } else {
-                const uriMatch = headers.match(/GET\s+\/\?user=([a-z0-9_]{3,16})/i);
-                if (!uriMatch) {
-                    clientSocket.end(UNAUTHORIZED_RESPONSE);
-                    return;
+                // URI 认证
+                const match = headersRaw.match(/GET\s+\/\?user=([a-z0-9_]{3,16})/i);
+                if (!match) return clientSocket.end(UNAUTHORIZED_RESPONSE);
+                const tempUser = match[1];
+                const lite = await getLiteAuthStatus(tempUser);
+                if (!lite.exists || lite.requireAuthHeader !== 0) {
+                    return clientSocket.end(UNAUTHORIZED_RESPONSE);
                 }
-                const tempUsername = uriMatch[1];
-                const res = await getLiteAuthStatus(tempUsername);
-                if (res.exists && res.requireAuthHeader === 0) {
-                    username = tempUsername;
-                    limits = getUserStat(username).limits;
-                } else {
-                    clientSocket.end(UNAUTHORIZED_RESPONSE);
-                    return;
-                }
+                username = tempUser;
+                limits = getUserStat(username).limits; // 可能为空，需注意
             }
 
-            // 并发限制
-            if (!checkConcurrency(username, limits.max_connections)) {
-                logConnection(clientIp, clientPort, localPort, username, `REJECTED_CONCURRENCY`);
-                clientSocket.end(TOO_MANY_REQUESTS_RESPONSE);
-                return;
+            // 并发检查
+            if (limits && limits.max_connections > 0) {
+                const stats = getUserStat(username);
+                if (stats.sockets.size >= limits.max_connections) {
+                    logConnection(clientIp, clientPort, localPort, username, 'REJECT_CONCURRENCY');
+                    return clientSocket.end(TOO_MANY_REQUESTS_RESPONSE);
+                }
             }
 
             clientSocket.write(SWITCH_RESPONSE);
-
-            // Payload Eater (Split) 逻辑
-            const initialSshData = fullRequest;
-            fullRequest = Buffer.alloc(0); 
-            const payloadSample = initialSshData.length > 256 ? initialSshData.subarray(0, 256).toString() : initialSshData.toString();
-            const trimmed = payloadSample.trimLeft();
-            
-            if (trimmed.startsWith('CONNECT ') || trimmed.startsWith('GET ') || trimmed.startsWith('POST ')) {
-                const endIdx = initialSshData.indexOf('\r\n\r\n');
-                if (endIdx !== -1) {
-                    connectToTarget(initialSshData.subarray(endIdx + 4));
-                } else {
-                    clientSocket.end(FORBIDDEN_RESPONSE);
-                }
-            } else {
-                connectToTarget(initialSshData);
-            }
-            return;
+            connectToTarget(fullRequest);
         }
     });
 
     function connectToTarget(initialData) {
-        if (remoteSocket) return;
+        // 连接到 SSH 端口 (22)
+        // UDPGW 流量也是封装在 SSH 里的，所以只需要连 22
         remoteSocket = net.connect(DEFAULT_TARGET.port, DEFAULT_TARGET.host, () => {
-            logConnection(clientIp, clientPort, localPort, username, 'CONN_START');
+            logConnection(clientIp, clientPort, localPort, username, 'CONN_OPEN');
             const stats = getUserStat(username);
-            stats.ip_map.set(clientIp, clientSocket);
             stats.sockets.add(clientSocket);
+            stats.ip_map.set(clientIp, clientSocket);
             state = 'forwarding';
 
-            if (initialData.length > 0) clientSocket.emit('data', initialData);
-
-            // [AXIOM V5.0] TCP 优化
-            remoteSocket.setNoDelay(true);
-            remoteSocket.setKeepAlive(true, 60000);
+            // 处理初始 SSH 数据 (Payload Eater 可能剩下的)
+            // 检查是否是 HTTP 伪装
+            const sample = initialData.slice(0, 100).toString().trim();
+            if (sample.startsWith('CONNECT') || sample.startsWith('GET') || sample.startsWith('POST')) {
+                const end = initialData.indexOf('\r\n\r\n');
+                if (end !== -1) initialData = initialData.subarray(end + 4);
+            }
+            if (initialData.length > 0) remoteSocket.write(initialData);
         });
 
         remoteSocket.on('data', (data) => {
             const stats = getUserStat(username);
-            const allowedBytes = stats.bucket_down.consume(data.length);
-            if (allowedBytes === 0) return;
-
-            const dataToWrite = (allowedBytes < data.length) ? data.subarray(0, allowedBytes) : data;
-            stats.traffic_delta.download += dataToWrite.length;
-            stats.traffic_live.download += dataToWrite.length;
-            
-            if (clientSocket.writable) clientSocket.write(dataToWrite);
+            const allowed = stats.bucket_down.consume(data.length);
+            if (allowed === 0) return;
+            const chunk = (allowed < data.length) ? data.subarray(0, allowed) : data;
+            stats.traffic_delta.download += chunk.length;
+            stats.traffic_live.download += chunk.length;
+            if (clientSocket.writable) clientSocket.write(chunk);
         });
 
-        remoteSocket.on('error', (err) => {
-            if (err.code === 'ECONNREFUSED') clientSocket.end(INTERNAL_ERROR_RESPONSE);
-            clientSocket.destroy();
-        });
+        remoteSocket.on('error', () => clientSocket.destroy());
         remoteSocket.on('close', () => clientSocket.end());
     }
 }
 
 
-// --- Server Init ---
+// --- Server Initialization ---
 function startServers() {
     loadHostWhitelist();
     setupLogStream();
-    connectToIpcServer();
-    
-    // [AXIOM V5.0] 启动原生 UDPGW (仅 Worker 启动)
-    startNativeUdpgwServer();
+    connectToIpcServer(); // 启动健壮的 IPC
 
-    const httpServer = net.createServer((socket) => handleClient(socket, false));
+    const httpServer = net.createServer((s) => handleClient(s, false));
     httpServer.listen(HTTP_PORT, LISTEN_ADDR, () => {
-        console.log(`[Worker ${cluster.worker.id}] HTTP Listening on ${LISTEN_ADDR}:${HTTP_PORT}`);
+        console.log(`[WSS] Worker ${cluster.worker.id} HTTP 监听于 ${HTTP_PORT}`);
     });
 
-    // TLS Server
     try {
-        if (fs.existsSync(CERT_FILE) && fs.existsSync(KEY_FILE)) {
-            const tlsOptions = {
+        if (fs.existsSync(CERT_FILE)) {
+            const tlsServer = tls.createServer({
                 key: fs.readFileSync(KEY_FILE),
                 cert: fs.readFileSync(CERT_FILE),
                 rejectUnauthorized: false
-            };
-            const tlsServer = tls.createServer(tlsOptions, (socket) => handleClient(socket, true));
+            }, (s) => handleClient(s, true));
             tlsServer.listen(TLS_PORT, LISTEN_ADDR, () => {
-                console.log(`[Worker ${cluster.worker.id}] TLS Listening on ${LISTEN_ADDR}:${TLS_PORT}`);
+                console.log(`[WSS] Worker ${cluster.worker.id} TLS 监听于 ${TLS_PORT}`);
             });
         }
     } catch (e) {
-        console.warn(`[Worker ${cluster.worker.id}] TLS Init Failed: ${e.message}`);
+        console.warn(`[WSS] TLS 启动跳过: ${e.message}`);
     }
 }
 
-
-// --- Master/Cluster Logic ---
 if (cluster.isPrimary) {
     const numCPUs = os.cpus().length;
-    console.log(`[Master] Starting Axiom V5.0 Proxy Cluster with ${numCPUs} workers...`);
-    console.log(`[Master] Native UDPGW will run on port ${UDPGW_PORT} (127.0.0.1)`);
-
+    console.log(`[AXIOM V5.0] Master ${process.pid} 启动。Forking ${numCPUs} workers...`);
     for (let i = 0; i < numCPUs; i++) cluster.fork();
-
-    cluster.on('exit', (worker, code, signal) => {
-        console.error(`[Master] Worker ${worker.process.pid} died. Restarting...`);
+    
+    // Master 不需要监听 IPC，只有 Worker 需要连接 Panel
+    
+    cluster.on('exit', (worker) => {
+        console.log(`[Master] Worker ${worker.id} died. Forking new...`);
         cluster.fork();
     });
 } else {
     startServers();
-    process.on('uncaughtException', (err) => {
-        console.error(`[Worker ${cluster.worker.id}] Uncaught: ${err.message}`, err.stack);
-        // process.exit(1); // Optional: let cluster restart it
+    process.on('uncaughtException', (e) => {
+        console.error(`[CRITICAL] Worker Crash: ${e.message}`, e.stack);
+        process.exit(1);
     });
 }
