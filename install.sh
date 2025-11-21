@@ -5,11 +5,11 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V2.1.1 (Axiom Refactor - Fixed Dependency Order)
+# V2.1.2 (Axiom Refactor - Auto Firewall Open)
 #
-# [AXIOM V5.3 CHANGELOG]
-# - [FIXED CRITICAL BUG] 修复了部署顺序错误：确保 wss_panel.service 在任何依赖它的服务启动前被加载。
-# - [核心] UDPGW 服务名称为 'udp_server'。
+# [AXIOM V5.4 CHANGELOG]
+# - [FEATURE] 自动开放所有 WSS/Panel/Stunnel/UDPGW 所需的外部端口 (TCP/UDP)。
+# - 修复了由于 IPTables 默认策略限制导致面板无法访问的问题。
 # ==========================================================
 
 
@@ -61,7 +61,7 @@ touch "$WSS_LOG_FILE"
 # [AXIOM V2.0] 交互式端口和用户配置
 # =============================
 echo "----------------------------------"
-echo "==== WSS 基础设施配置 (V5.3 Native UDPGW) ===="
+echo "==== WSS 基础设施配置 (V5.4 Auto Firewall) ===="
 echo "请确认或修改以下端口和服务用户设置 (回车以使用默认值)。"
 
 # 1. 端口
@@ -131,7 +131,7 @@ fi
 
 
 echo "----------------------------------"
-echo "==== 系统清理与依赖检查 (V5.3) ===="
+echo "==== 系统清理与依赖检查 (V5.4) ===="
 # 停止所有相关服务并清理旧文件
 systemctl stop wss stunnel4 udpgw udp_server wss_panel sshd_stunnel || true
 
@@ -339,7 +339,6 @@ echo "----------------------------------"
 
 # =============================
 # 部署 Systemd 服务文件 (UDP, WSS, PANEL)
-# [AXIOM V5.3] 确保所有文件就位，再进行 daemon-reload 和启动。
 # =============================
 echo "==== 部署 Native UDPGW Service 文件 ===="
 
@@ -381,6 +380,52 @@ chown -R "$panel_user:$panel_user" "$PANEL_DIR"
 chown "$panel_user:$panel_user" "$WSS_LOG_FILE"
 chown "$panel_user:$panel_user" "$CONFIG_PATH"
 chmod 600 "$CONFIG_PATH"
+
+
+# =============================
+# IPTABLES 规则设置 (FIXED)
+# =============================
+echo "==== 配置 IPTABLES (开放外部端口) ===="
+# 1. 设置 IP 阻断链 (WSS Proxy 内部使用)
+BLOCK_CHAIN="WSS_IP_BLOCK"
+# 清理旧链
+iptables -F $BLOCK_CHAIN 2>/dev/null || true
+iptables -X $BLOCK_CHAIN 2>/dev/null || true
+# 创建新链并插入到 INPUT 链的第 1 位
+iptables -N $BLOCK_CHAIN 2>/dev/null || true
+iptables -I INPUT 1 -j $BLOCK_CHAIN 
+
+# 2. 开放所有 WSS 基础设施使用的外部端口
+echo "正在开放 WSS/Panel/Stunnel/UDPGW 所需的端口..."
+
+# WSS HTTP/TLS 端口 (TCP)
+iptables -I INPUT -p tcp --dport $WSS_HTTP_PORT -j ACCEPT
+iptables -I INPUT -p tcp --dport $WSS_TLS_PORT -j ACCEPT
+
+# Stunnel/SSH 端口 (TCP)
+iptables -I INPUT -p tcp --dport $STUNNEL_PORT -j ACCEPT
+
+# Panel 端口 (TCP/IPC)
+iptables -I INPUT -p tcp --dport $PANEL_PORT -j ACCEPT
+
+# Native UDPGW 端口 (TCP/UDP for client compatibility)
+# 开放 TCP 和 UDP，以确保 BadVPN 客户端的兼容性
+iptables -I INPUT -p tcp --dport $UDPGW_PORT -j ACCEPT
+iptables -I INPUT -p udp --dport $UDPGW_PORT -j ACCEPT
+
+
+# 3. 启用并保存规则 (这是关键，确保规则持久化)
+if ! command -v netfilter-persistent >/dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt install -y netfilter-persistent iptables-persistent || true
+fi
+if command -v netfilter-persistent >/dev/null; then
+    echo "正在保存 IPTABLES 规则..."
+    /sbin/iptables-save > "$IPTABLES_RULES"
+    systemctl enable netfilter-persistent || true
+    systemctl start netfilter-persistent || true
+fi
+echo "IPTABLES 规则配置完成，相关端口已开放。"
+echo "----------------------------------"
 
 
 # =============================
@@ -466,5 +511,5 @@ systemctl restart sshd_stunnel
 systemctl restart stunnel4 
 
 echo "=================================================="
-echo "✅ 部署完成！(Axiom V5.3 - Fixed Dependency)"
+echo "✅ 部署完成！(Axiom V5.4 - Final Fix)"
 echo "=================================================="
