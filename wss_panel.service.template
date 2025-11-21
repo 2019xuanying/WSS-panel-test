@@ -1,23 +1,27 @@
 [Unit]
-Description=WSS User Management Panel (Control Plane)
+Description=WSS Node.js Proxy Core (Data Plane)
 After=network.target
+After=wss_panel.service
+BindsTo=wss_panel.service
 
 [Service]
 Type=simple
 
-# [AXIOM V2.0] 移除所有硬编码的端口/密钥环境变量。
-# 服务将从 /etc/wss-panel/config.json 读取配置。
-# 保留 PANEL_DIR_ENV 是为了帮助进程找到 config.json。
-Environment=PANEL_DIR_ENV=@PANEL_DIR@
+# [AXIOM V5.0] WSS Proxy Configuration
+# 确保找到 ws 模块
 Environment=NODE_PATH=/usr/lib/node_modules:/usr/local/lib/node_modules:@PANEL_DIR@/node_modules
+# 指定配置文件目录
+Environment=PANEL_DIR_ENV=@PANEL_DIR@
 
-WorkingDirectory=@PANEL_DIR@
-ExecStart=/usr/bin/node @PANEL_DIR@/@PANEL_BACKEND_SCRIPT_PATH@
-
+ExecStart=/usr/bin/node @WSS_PROXY_SCRIPT_PATH@
 Restart=on-failure
-# [AXIOM V1.7.0] 最小权限: 不再使用 root
-User=@PANEL_USER@
-Group=@PANEL_USER@
+RestartSec=3s
+User=root
+StandardOutput=journal
+StandardError=journal
+
+# 确保日志文件存在及权限
+ExecStartPre=/bin/bash -c "touch @WSS_LOG_FILE_PATH@ && chmod 644 @WSS_LOG_FILE_PATH@"
 
 [Install]
 WantedBy=multi-user.target
