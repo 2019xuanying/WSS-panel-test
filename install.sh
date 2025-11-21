@@ -5,14 +5,15 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V2.1.0 (Axiom V5.0 - Native UDPGW & Smart Push)
+# V2.1.0 (Axiom Refactor - Native UDPGW)
 #
 # [AXIOM V5.0 CHANGELOG]
-# - [移除] 彻底移除 badvpn-udpgw 编译逻辑 (无需 cmake/gcc)。
-# - [新增] 部署原生 wss_udpgw.js 到 /usr/local/bin。
-# - [优化] 适配 Systemd 模板以支持 Node.js UDPGW。
-# - [依赖] 确保 npm install 安装 ws 模块。
+# - [核心] 移除对外部 badvpn-udpgw 的所有依赖。
+# - [核心] 新增部署 Native UDPGW 脚本 (udp_server.js)。
+# - [核心] UDPGW 服务名称从 'udpgw' 更改为 'udp_server'。
+# - [核心] 移除 BadVPN 编译和内核调优 (Native UDPGW 无需调优)。
 # ==========================================================
+
 
 # =============================
 # 文件路径定义
@@ -31,9 +32,10 @@ DB_PATH="$PANEL_DIR/wss_panel.db"
 
 # 脚本目标路径
 WSS_PROXY_PATH="/usr/local/bin/wss_proxy.js"
-WSS_UDPGW_PATH="/usr/local/bin/wss_udpgw.js" # [AXIOM V5.0] 新增
 PANEL_BACKEND_FILE="wss_panel.js"
 PANEL_BACKEND_DEST="$PANEL_DIR/$PANEL_BACKEND_FILE" 
+UDP_SERVER_FILE="udp_server.js"
+UDP_SERVER_DEST="$PANEL_DIR/$UDP_SERVER_FILE" # [AXIOM V5.0] 新增
 PANEL_HTML_DEST="$PANEL_DIR/index.html"
 PANEL_JS_DEST="$PANEL_DIR/app.js"
 LOGIN_HTML_DEST="$PANEL_DIR/login.html" 
@@ -43,6 +45,10 @@ PACKAGE_JSON_DEST="$PANEL_DIR/package.json"
 SSHD_STUNNEL_CONFIG="/etc/ssh/sshd_config_stunnel"
 SSHD_STUNNEL_SERVICE="/etc/systemd/system/sshd_stunnel.service"
 
+# [AXIOM V5.0] 新服务文件路径
+UDP_SERVICE_PATH="/etc/systemd/system/udp_server.service" 
+
+
 # 创建基础目录
 mkdir -p "$PANEL_DIR" 
 mkdir -p /etc/stunnel/certs
@@ -50,10 +56,10 @@ mkdir -p /var/log/stunnel4
 touch "$WSS_LOG_FILE"
 
 # =============================
-# 交互式端口和用户配置
+# [AXIOM V2.0] 交互式端口和用户配置
 # =============================
 echo "----------------------------------"
-echo "==== WSS 基础设施配置 (Axiom V5.0) ===="
+echo "==== WSS 基础设施配置 (V5.0 Native UDPGW) ===="
 echo "请确认或修改以下端口和服务用户设置 (回车以使用默认值)。"
 
 # 1. 端口
@@ -66,7 +72,8 @@ WSS_TLS_PORT=${WSS_TLS_PORT:-443}
 read -p "  3. Stunnel (SSH/TLS) 端口 [444]: " STUNNEL_PORT
 STUNNEL_PORT=${STUNNEL_PORT:-444}
 
-read -p "  4. UDPGW (Native) 端口 [7300]: " UDPGW_PORT
+# [AXIOM V5.0] Native UDPGW 端口
+read -p "  4. Native UDPGW 端口 [7300]: " UDPGW_PORT
 UDPGW_PORT=${UDPGW_PORT:-7300}
 
 read -p "  5. Web 面板端口 [54321]: " PANEL_PORT
@@ -92,15 +99,17 @@ echo "配置确认："
 echo "Panel 用户: $panel_user"
 echo "WSS (80/443) -> $WSS_HTTP_PORT/$WSS_TLS_PORT (转发至 $INTERNAL_FORWARD_PORT)"
 echo "Stunnel (444) -> $STUNNEL_PORT (转发至 $SSHD_STUNNEL_PORT)"
-echo "Native UDPGW -> $UDPGW_PORT"
+echo "Native UDPGW (TCP) -> $UDPGW_PORT"
 echo "Web Panel (HTTP) & IPC (WS) -> $PANEL_PORT"
 echo "---------------------------------"
+
 
 # 交互式设置 ROOT 密码
 if [ -f "$ROOT_HASH_FILE" ]; then
     echo "使用已保存的面板 Root 密码。面板端口: $PANEL_PORT"
 else
     echo "==== 管理面板配置 (首次或重置) ===="
+    
     echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
     while true; do
       read -s -p "面板密码: " pw1 && echo
@@ -118,12 +127,13 @@ else
     done
 fi
 
+
 echo "----------------------------------"
 echo "==== 系统清理与依赖检查 (V5.0) ===="
-# 停止所有相关服务
-systemctl stop wss stunnel4 udpgw wss_panel sshd_stunnel || true
+# 停止所有相关服务并清理旧文件
+systemctl stop wss stunnel4 udpgw udp_server wss_panel sshd_stunnel || true
 
-# 依赖检查和安装 (无需 cmake/gcc 编译 badvpn)
+# 依赖检查和安装
 apt update -y
 if ! command -v node >/dev/null; then
     echo "正在安装 Node.js (推荐 v18/v20 LTS)..."
@@ -131,7 +141,7 @@ if ! command -v node >/dev/null; then
     apt install -y nodejs
 fi
 
-# 安装基础工具
+# [AXIOM V5.0] 移除 badvpn 相关依赖（如 cmake, build-essential）
 apt install -y wget curl git net-tools openssl stunnel4 iproute2 iptables procps libsqlite3-dev passwd sudo || echo "警告: 依赖安装失败，可能影响功能。"
 
 if ! id -u "$panel_user" >/dev/null 2>&1; then
@@ -144,7 +154,6 @@ fi
 echo "安装 Node.js 依赖..."
 cp "$REPO_ROOT/package.json" "$PACKAGE_JSON_DEST"
 cd "$PANEL_DIR"
-# 确保安装包含 ws 等新依赖
 if ! npm install --production; then
     echo "严重警告: Node.js 核心依赖安装失败。"
     exit 1
@@ -189,16 +198,15 @@ tee "$CONFIG_PATH" > /dev/null <<EOF
   "proxy_api_url": "$PROXY_API_URL"
 }
 EOF
-chown "$panel_user:$panel_user" "$CONFIG_PATH"
 chmod 600 "$CONFIG_PATH"
 echo "----------------------------------"
+
 
 # =============================
 # 配置 Sudoers
 # =============================
 echo "==== 配置 Sudoers (最小权限) ===="
 SUDOERS_FILE="/etc/sudoers.d/99-wss-panel"
-# 获取命令的绝对路径
 CMD_USERADD=$(command -v useradd)
 CMD_USERMOD=$(command -v usermod)
 CMD_USERDEL=$(command -v userdel)
@@ -210,6 +218,7 @@ CMD_IPTABLES_SAVE=$(command -v iptables-save)
 CMD_JOURNALCTL=$(command -v journalctl)
 CMD_SYSTEMCTL=$(command -v systemctl)
 CMD_GETENT=$(command -v getent)
+CMD_SED=$(command -v sed)
 
 tee "$SUDOERS_FILE" > /dev/null <<EOF
 $panel_user ALL=(ALL) NOPASSWD: $CMD_USERADD
@@ -223,30 +232,32 @@ $panel_user ALL=(ALL) NOPASSWD: $CMD_IPTABLES_SAVE
 $panel_user ALL=(ALL) NOPASSWD: $CMD_JOURNALCTL
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart wss
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart stunnel4
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart udpgw
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart udp_server # [AXIOM V5.0] 更改
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart wss_panel
 $panel_user ALL=(ALL) NOPASSWD: $CMD_GETENT
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active wss
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active stunnel4
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active udpgw
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active udp_server # [AXIOM V5.0] 更改
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active wss_panel
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SED
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL daemon-reload
 EOF
 
 chmod 440 "$SUDOERS_FILE"
 if ! visudo -c -f "$SUDOERS_FILE"; then
-    echo "Sudoers 语法检查失败，尝试修复..."
     rm -f "$SUDOERS_FILE"
-    # 继续执行，但不启用 sudo 可能会导致面板部分功能失效
+    exit 1
 fi
 echo "Sudoers 配置完成。"
 echo "----------------------------------"
 
+
 # =============================
 # 内核调优 (Buffer Tuning)
+# [AXIOM V5.0] 移除 BadVPN 编译，但保留内核调优
 # =============================
 echo "==== 配置内核网络参数 (Buffer Tuning) ===="
-# [AXIOM V5.0] 针对原生 UDPGW 的缓冲区优化
+# [AXIOM V4.6] 终极缓冲区调优：支持 8MB 默认缓冲和 32MB 最大缓冲
 sed -i '/# WSS_NET_START/,/# WSS_NET_END/d' /etc/sysctl.conf
 cat >> /etc/sysctl.conf <<EOF
 # WSS_NET_START
@@ -258,7 +269,7 @@ net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_keepalive_time = 60
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_keepalive_intvl = 5
-# [AXIOM V5.0] Buffer Tuning (Max 32MB, Default 8MB)
+# [AXIOM V4.6] UDPGW Buffer Tuning (Max 32MB, Default 8MB)
 net.core.rmem_max = 33554432
 net.core.wmem_max = 33554432
 net.core.rmem_default = 8388608
@@ -272,52 +283,37 @@ echo "----------------------------------"
 # 部署代码文件
 # =============================
 echo "==== 部署 Node.js 代码文件 ===="
-# 1. Proxy
 cp "$REPO_ROOT/wss_proxy.js" "$WSS_PROXY_PATH"
 chmod +x "$WSS_PROXY_PATH"
-
-# 2. [AXIOM V5.0] Native UDPGW
-if [ -f "$REPO_ROOT/wss_udpgw.js" ]; then
-    cp "$REPO_ROOT/wss_udpgw.js" "$WSS_UDPGW_PATH"
-    chmod +x "$WSS_UDPGW_PATH"
-    echo "原生 UDPGW 脚本已部署。"
-else
-    echo "错误: 找不到 wss_udpgw.js 文件！"
-    exit 1
-fi
-
-# 3. Panel
 cp "$REPO_ROOT/wss_panel.js" "$PANEL_BACKEND_DEST"
 chmod +x "$PANEL_BACKEND_DEST"
+cp "$REPO_ROOT/udp_server.js" "$UDP_SERVER_DEST" # [AXIOM V5.0] 新增
+chmod +x "$UDP_SERVER_DEST" # [AXIOM V5.0] 新增
 cp "$REPO_ROOT/index.html" "$PANEL_HTML_DEST"
 cp "$REPO_ROOT/app.js" "$PANEL_JS_DEST"
 cp "$REPO_ROOT/login.html" "$LOGIN_HTML_DEST"
-
 if [ ! -f "$DB_PATH" ]; then echo "Database will be initialized on start."; fi
 [ ! -f "$WSS_LOG_FILE" ] && touch "$WSS_LOG_FILE"
 [ ! -f "$PANEL_DIR/audit.log" ] && touch "$PANEL_DIR/audit.log"
 [ ! -f "$PANEL_DIR/hosts.json" ] && echo '[]' > "$PANEL_DIR/hosts.json"
 echo "----------------------------------"
 
+
 # =============================
 # 安装 Stunnel4
 # =============================
-echo "==== 配置 Stunnel4 ===="
+echo "==== 重新安装 Stunnel4 ===="
 if ! getent group shell_users >/dev/null; then groupadd shell_users; fi
 
-mkdir -p /etc/stunnel/certs
-if [ ! -f /etc/stunnel/certs/stunnel.pem ]; then
-    openssl req -x509 -nodes -newkey rsa:2048 \
-    -keyout /etc/stunnel/certs/stunnel.key \
-    -out /etc/stunnel/certs/stunnel.crt \
-    -days 1095 \
-    -subj "/CN=wss-panel" > /dev/null 2>&1
-    cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem
-    chmod 600 /etc/stunnel/certs/*.key
-    chmod 600 /etc/stunnel/certs/*.pem
-fi
+openssl req -x509 -nodes -newkey rsa:2048 \
+-keyout /etc/stunnel/certs/stunnel.key \
+-out /etc/stunnel/certs/stunnel.crt \
+-days 1095 \
+-subj "/CN=example.com" > /dev/null 2>&1
+sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
+chmod 600 /etc/stunnel/certs/*.key
+chmod 600 /etc/stunnel/certs/*.pem
 
-# 使用模板写入 Stunnel 配置
 tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
 pid=/var/run/stunnel.pid
 setuid=root
@@ -339,52 +335,44 @@ systemctl enable stunnel4
 systemctl restart stunnel4
 echo "----------------------------------"
 
+
 # =============================
-# 部署 Systemd 服务
+# 安装 UDPGW (Native Node.js)
+# [AXIOM V5.0] 移除 BadVPN 编译步骤
 # =============================
-echo "==== 部署 Systemd 服务 ===="
+echo "==== 部署 Native UDPGW Service ===="
 
-# 1. UDPGW (Native)
-UDPGW_SERVICE_PATH="/etc/systemd/system/udpgw.service"
-UDPGW_TEMPLATE="$REPO_ROOT/udpgw.service.template"
-cp "$UDPGW_TEMPLATE" "$UDPGW_SERVICE_PATH"
-# UDPGW 模板使用 @PANEL_DIR@ 变量
-sed -i "s|@PANEL_DIR@|$PANEL_DIR|g" "$UDPGW_SERVICE_PATH"
+# [AXIOM V5.0] 创建新的 udp_server.service 文件
+tee "$UDP_SERVICE_PATH" > /dev/null <<EOF
+[Unit]
+Description=WSS Native UDP Gateway (BadVPN Protocol)
+After=network.target
+After=wss_panel.service
+BindsTo=wss_panel.service
 
-# 2. WSS Proxy
-WSS_SERVICE_PATH="/etc/systemd/system/wss.service"
-WSS_TEMPLATE="$REPO_ROOT/wss.service.template"
-cp "$WSS_TEMPLATE" "$WSS_SERVICE_PATH"
-sed -i "s|@WSS_LOG_FILE_PATH@|$WSS_LOG_FILE|g" "$WSS_SERVICE_PATH"
-sed -i "s|@WSS_PROXY_SCRIPT_PATH@|$WSS_PROXY_PATH|g" "$WSS_SERVICE_PATH"
-sed -i "s|@PANEL_DIR@|$PANEL_DIR|g" "$WSS_SERVICE_PATH"
+[Service]
+Type=simple
+# [AXIOM V5.0] 启动 Native UDPGW Node.js 脚本
+Environment=PANEL_DIR_ENV=$PANEL_DIR
+ExecStart=/usr/bin/node $UDP_SERVER_DEST
+Restart=on-failure
+User=root
+StandardOutput=journal
+StandardError=journal
 
-# 3. WSS Panel
-PANEL_SERVICE_PATH="/etc/systemd/system/wss_panel.service"
-PANEL_TEMPLATE="$REPO_ROOT/wss_panel.service.template"
-cp "$PANEL_TEMPLATE" "$PANEL_SERVICE_PATH"
-sed -i "s|@PANEL_DIR@|$PANEL_DIR|g" "$PANEL_SERVICE_PATH"
-sed -i "s|@PANEL_USER@|$panel_user|g" "$PANEL_SERVICE_PATH"
-sed -i "s|@PANEL_BACKEND_SCRIPT_PATH@|$PANEL_BACKEND_FILE|g" "$PANEL_SERVICE_PATH"
-
-# 权限修正
-chown -R "$panel_user:$panel_user" "$PANEL_DIR"
-chown "$panel_user:$panel_user" "$WSS_LOG_FILE"
+[Install]
+WantedBy=multi-user.target
+EOF
 
 systemctl daemon-reload
-systemctl enable wss_panel
-systemctl start wss_panel
-systemctl enable wss
-systemctl start wss
-systemctl enable udpgw
-systemctl start udpgw
+systemctl enable udp_server # [AXIOM V5.0] 启用新服务
+systemctl restart udp_server # [AXIOM V5.0] 启动新服务
 echo "----------------------------------"
 
 # =============================
-# IPTABLES & SSHD (保持不变)
+# IPTABLES & Systemd
 # =============================
-echo "==== 配置 IPTABLES & SSHD ===="
-# IPTABLES
+echo "==== 配置 IPTABLES ===="
 BLOCK_CHAIN="WSS_IP_BLOCK"
 iptables -F $BLOCK_CHAIN 2>/dev/null || true
 iptables -X $BLOCK_CHAIN 2>/dev/null || true
@@ -399,8 +387,37 @@ if command -v netfilter-persistent >/dev/null; then
     systemctl enable netfilter-persistent || true
     systemctl start netfilter-persistent || true
 fi
+echo "----------------------------------"
 
-# SSHD
+echo "==== 部署 Systemd 服务 ===="
+WSS_SERVICE_PATH="/etc/systemd/system/wss.service"
+WSS_TEMPLATE="$REPO_ROOT/wss.service.template"
+cp "$WSS_TEMPLATE" "$WSS_SERVICE_PATH"
+sed -i "s|@WSS_LOG_FILE_PATH@|$WSS_LOG_FILE|g" "$WSS_SERVICE_PATH"
+sed -i "s|@WSS_PROXY_SCRIPT_PATH@|$WSS_PROXY_PATH|g" "$WSS_SERVICE_PATH"
+
+PANEL_SERVICE_PATH="/etc/systemd/system/wss_panel.service"
+PANEL_TEMPLATE="$REPO_ROOT/wss_panel.service.template"
+cp "$PANEL_TEMPLATE" "$PANEL_SERVICE_PATH"
+sed -i "s|@PANEL_DIR@|$PANEL_DIR|g" "$PANEL_SERVICE_PATH"
+sed -i "s|@PANEL_USER@|$panel_user|g" "$PANEL_SERVICE_PATH"
+sed -i "s|@PANEL_BACKEND_SCRIPT_PATH@|$PANEL_BACKEND_FILE|g" "$PANEL_SERVICE_PATH"
+
+chown -R "$panel_user:$panel_user" "$PANEL_DIR"
+chown "$panel_user:$panel_user" "$WSS_LOG_FILE"
+chown "$panel_user:$panel_user" "$CONFIG_PATH"
+chmod 600 "$CONFIG_PATH"
+
+systemctl daemon-reload
+systemctl enable wss_panel
+systemctl start wss_panel
+systemctl enable wss
+systemctl start wss
+echo "----------------------------------"
+
+# =============================
+# SSHD 配置
+# =============================
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_SERVICE=$(systemctl list-units --full -all | grep -q "sshd.service" && echo "sshd" || echo "ssh")
 sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
@@ -456,11 +473,8 @@ systemctl enable sshd_stunnel
 systemctl restart sshd_stunnel
 
 # Final Restart
-systemctl restart stunnel4
-systemctl restart udpgw
-systemctl restart wss_panel
-systemctl restart wss
+systemctl restart stunnel4 udp_server wss_panel wss # [AXIOM V5.0] 更改服务名
 
 echo "=================================================="
-echo "✅ 部署完成！(Axiom V5.0 - Native UDPGW & Smart Push)"
+echo "✅ 部署完成！(Axiom V5.0 - Native UDPGW)"
 echo "=================================================="
