@@ -1,7 +1,7 @@
 {
   "name": "wss-panel-node",
-  "version": "8.2.0",
-  "description": "WSS Tunnel User Management Panel (Axiom Refactor)",
+  "version": "9.0.0",
+  "description": "WSS Tunnel User Management Panel (Axiom V5.0)",
   "main": "wss_panel.js",
   "scripts": {
     "start": "node wss_panel.js"
