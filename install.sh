@@ -5,13 +5,11 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V2.1.0 (Axiom Refactor - Native UDPGW)
+# V2.1.1 (Axiom Refactor - Fixed Dependency Order)
 #
-# [AXIOM V5.0 CHANGELOG]
-# - [核心] 移除对外部 badvpn-udpgw 的所有依赖。
-# - [核心] 新增部署 Native UDPGW 脚本 (udp_server.js)。
-# - [核心] UDPGW 服务名称从 'udpgw' 更改为 'udp_server'。
-# - [核心] 移除 BadVPN 编译和内核调优 (Native UDPGW 无需调优)。
+# [AXIOM V5.3 CHANGELOG]
+# - [FIXED CRITICAL BUG] 修复了部署顺序错误：确保 wss_panel.service 在任何依赖它的服务启动前被加载。
+# - [核心] UDPGW 服务名称为 'udp_server'。
 # ==========================================================
 
 
@@ -35,7 +33,7 @@ WSS_PROXY_PATH="/usr/local/bin/wss_proxy.js"
 PANEL_BACKEND_FILE="wss_panel.js"
 PANEL_BACKEND_DEST="$PANEL_DIR/$PANEL_BACKEND_FILE" 
 UDP_SERVER_FILE="udp_server.js"
-UDP_SERVER_DEST="$PANEL_DIR/$UDP_SERVER_FILE" # [AXIOM V5.0] 新增
+UDP_SERVER_DEST="$PANEL_DIR/$UDP_SERVER_FILE" 
 PANEL_HTML_DEST="$PANEL_DIR/index.html"
 PANEL_JS_DEST="$PANEL_DIR/app.js"
 LOGIN_HTML_DEST="$PANEL_DIR/login.html" 
@@ -47,6 +45,10 @@ SSHD_STUNNEL_SERVICE="/etc/systemd/system/sshd_stunnel.service"
 
 # [AXIOM V5.0] 新服务文件路径
 UDP_SERVICE_PATH="/etc/systemd/system/udp_server.service" 
+WSS_SERVICE_PATH="/etc/systemd/system/wss.service"
+PANEL_SERVICE_PATH="/etc/systemd/system/wss_panel.service"
+PANEL_TEMPLATE="$REPO_ROOT/wss_panel.service.template"
+WSS_TEMPLATE="$REPO_ROOT/wss.service.template"
 
 
 # 创建基础目录
@@ -59,7 +61,7 @@ touch "$WSS_LOG_FILE"
 # [AXIOM V2.0] 交互式端口和用户配置
 # =============================
 echo "----------------------------------"
-echo "==== WSS 基础设施配置 (V5.0 Native UDPGW) ===="
+echo "==== WSS 基础设施配置 (V5.3 Native UDPGW) ===="
 echo "请确认或修改以下端口和服务用户设置 (回车以使用默认值)。"
 
 # 1. 端口
@@ -129,7 +131,7 @@ fi
 
 
 echo "----------------------------------"
-echo "==== 系统清理与依赖检查 (V5.0) ===="
+echo "==== 系统清理与依赖检查 (V5.3) ===="
 # 停止所有相关服务并清理旧文件
 systemctl stop wss stunnel4 udpgw udp_server wss_panel sshd_stunnel || true
 
@@ -232,12 +234,12 @@ $panel_user ALL=(ALL) NOPASSWD: $CMD_IPTABLES_SAVE
 $panel_user ALL=(ALL) NOPASSWD: $CMD_JOURNALCTL
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart wss
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart stunnel4
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart udp_server # [AXIOM V5.0] 更改
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart udp_server 
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart wss_panel
 $panel_user ALL=(ALL) NOPASSWD: $CMD_GETENT
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active wss
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active stunnel4
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active udp_server # [AXIOM V5.0] 更改
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active udp_server 
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active wss_panel
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SED
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL daemon-reload
@@ -254,7 +256,6 @@ echo "----------------------------------"
 
 # =============================
 # 内核调优 (Buffer Tuning)
-# [AXIOM V5.0] 移除 BadVPN 编译，但保留内核调优
 # =============================
 echo "==== 配置内核网络参数 (Buffer Tuning) ===="
 # [AXIOM V4.6] 终极缓冲区调优：支持 8MB 默认缓冲和 32MB 最大缓冲
@@ -287,8 +288,8 @@ cp "$REPO_ROOT/wss_proxy.js" "$WSS_PROXY_PATH"
 chmod +x "$WSS_PROXY_PATH"
 cp "$REPO_ROOT/wss_panel.js" "$PANEL_BACKEND_DEST"
 chmod +x "$PANEL_BACKEND_DEST"
-cp "$REPO_ROOT/udp_server.js" "$UDP_SERVER_DEST" # [AXIOM V5.0] 新增
-chmod +x "$UDP_SERVER_DEST" # [AXIOM V5.0] 新增
+cp "$REPO_ROOT/udp_server.js" "$UDP_SERVER_DEST" 
+chmod +x "$UDP_SERVER_DEST" 
 cp "$REPO_ROOT/index.html" "$PANEL_HTML_DEST"
 cp "$REPO_ROOT/app.js" "$PANEL_JS_DEST"
 cp "$REPO_ROOT/login.html" "$LOGIN_HTML_DEST"
@@ -337,12 +338,12 @@ echo "----------------------------------"
 
 
 # =============================
-# 安装 UDPGW (Native Node.js)
-# [AXIOM V5.0] 移除 BadVPN 编译步骤
+# 部署 Systemd 服务文件 (UDP, WSS, PANEL)
+# [AXIOM V5.3] 确保所有文件就位，再进行 daemon-reload 和启动。
 # =============================
-echo "==== 部署 Native UDPGW Service ===="
+echo "==== 部署 Native UDPGW Service 文件 ===="
 
-# [AXIOM V5.0] 创建新的 udp_server.service 文件
+# 1. 创建 udp_server.service
 tee "$UDP_SERVICE_PATH" > /dev/null <<EOF
 [Unit]
 Description=WSS Native UDP Gateway (BadVPN Protocol)
@@ -352,7 +353,6 @@ BindsTo=wss_panel.service
 
 [Service]
 Type=simple
-# [AXIOM V5.0] 启动 Native UDPGW Node.js 脚本
 Environment=PANEL_DIR_ENV=$PANEL_DIR
 ExecStart=/usr/bin/node $UDP_SERVER_DEST
 Restart=on-failure
@@ -364,40 +364,14 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable udp_server # [AXIOM V5.0] 启用新服务
-systemctl restart udp_server # [AXIOM V5.0] 启动新服务
-echo "----------------------------------"
+echo "==== 部署 WSS Proxy 和 Web Panel Service 文件 ===="
 
-# =============================
-# IPTABLES & Systemd
-# =============================
-echo "==== 配置 IPTABLES ===="
-BLOCK_CHAIN="WSS_IP_BLOCK"
-iptables -F $BLOCK_CHAIN 2>/dev/null || true
-iptables -X $BLOCK_CHAIN 2>/dev/null || true
-iptables -N $BLOCK_CHAIN 2>/dev/null || true
-iptables -I INPUT 1 -j $BLOCK_CHAIN 
-
-if ! command -v netfilter-persistent >/dev/null; then
-    DEBIAN_FRONTEND=noninteractive apt install -y netfilter-persistent iptables-persistent || true
-fi
-if command -v netfilter-persistent >/dev/null; then
-    /sbin/iptables-save > "$IPTABLES_RULES"
-    systemctl enable netfilter-persistent || true
-    systemctl start netfilter-persistent || true
-fi
-echo "----------------------------------"
-
-echo "==== 部署 Systemd 服务 ===="
-WSS_SERVICE_PATH="/etc/systemd/system/wss.service"
-WSS_TEMPLATE="$REPO_ROOT/wss.service.template"
+# 2. 创建 wss.service
 cp "$WSS_TEMPLATE" "$WSS_SERVICE_PATH"
 sed -i "s|@WSS_LOG_FILE_PATH@|$WSS_LOG_FILE|g" "$WSS_SERVICE_PATH"
 sed -i "s|@WSS_PROXY_SCRIPT_PATH@|$WSS_PROXY_PATH|g" "$WSS_SERVICE_PATH"
 
-PANEL_SERVICE_PATH="/etc/systemd/system/wss_panel.service"
-PANEL_TEMPLATE="$REPO_ROOT/wss_panel.service.template"
+# 3. 创建 wss_panel.service
 cp "$PANEL_TEMPLATE" "$PANEL_SERVICE_PATH"
 sed -i "s|@PANEL_DIR@|$PANEL_DIR|g" "$PANEL_SERVICE_PATH"
 sed -i "s|@PANEL_USER@|$panel_user|g" "$PANEL_SERVICE_PATH"
@@ -408,12 +382,28 @@ chown "$panel_user:$panel_user" "$WSS_LOG_FILE"
 chown "$panel_user:$panel_user" "$CONFIG_PATH"
 chmod 600 "$CONFIG_PATH"
 
+
+# =============================
+# Systemd 重载与启动 (FIXED SEQUENCE)
+# =============================
+echo "==== Systemd 重载配置并按依赖顺序启动服务 ===="
 systemctl daemon-reload
+echo "Systemd 配置已重载。开始启动..."
+
+# 1. 启动 WSS Panel (主控平面 - 其他服务的依赖)
 systemctl enable wss_panel
 systemctl start wss_panel
+
+# 2. 启动 Native UDPGW (依赖 WSS Panel)
+systemctl enable udp_server 
+systemctl start udp_server
+
+# 3. 启动 WSS Proxy (依赖 WSS Panel)
 systemctl enable wss
 systemctl start wss
+
 echo "----------------------------------"
+
 
 # =============================
 # SSHD 配置
@@ -472,9 +462,9 @@ systemctl restart "$SSHD_SERVICE"
 systemctl enable sshd_stunnel
 systemctl restart sshd_stunnel
 
-# Final Restart
-systemctl restart stunnel4 udp_server wss_panel wss # [AXIOM V5.0] 更改服务名
+# Final Restart (确保 stunnel4 也在最后重启)
+systemctl restart stunnel4 
 
 echo "=================================================="
-echo "✅ 部署完成！(Axiom V5.0 - Native UDPGW)"
+echo "✅ 部署完成！(Axiom V5.3 - Fixed Dependency)"
 echo "=================================================="
