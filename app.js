@@ -1,17 +1,14 @@
 /**
- * WSS Panel Frontend (Axiom Refactor V5.0 - Layered Push UI/UX)
+ * WSS Panel Frontend (Axiom Refactor V5.2 - Live Connection Metadata)
  *
- * [AXIOM V5.0 CHANGELOG]
- * - [架构] 分层推送兼容:
- * - `ws.onmessage` 处理器现在区分接收到的 `live_update` (1s) 和 `system_update` (3s) 消息。
- * - [性能] 细粒度系统更新:
- * - 新增 `handleSystemStatusSilentUpdate(data)`，专门用于 3 秒推送的系统状态数据，
- * 仅修改 DOM 文本，避免重绘整个卡片。
- * - [性能] 实时图表更新:
- * - `updateRealtimeTrafficChart` 现在由 1 秒的 `live_update` 驱动。
- * - [兼容性] CORE_SERVICES 更新:
- * - 更改了 `fetchServiceLogs` 和 `renderSystemStatus` 中的 CORE_SERVICES 映射，以兼容新的 `udp_server` 服务名。
- * - [UX] 统一的系统状态更新逻辑。
+ * [AXIOM V5.2 CHANGELOG]
+ * - [功能新增] 实现 `openConnectionDetailsModal(username)` 函数。
+ * - 实现 `renderConnectionList(connections)` 函数来渲染模态框内容。
+ * - 在 `renderUserList` 中添加 “连接详情” 按钮的调用。
+ *
+ * [AXIOM V5.1.1 BUGFIX]
+ * - [CRITICAL] 修复 ReferenceError: Cannot set properties of null (setting 'textContent') 错误。
+ * - 修复方案：确保所有 DOM ID 引用在渲染时都是有效的。
  */
 
 // --- 全局配置 (将由 initializeApp 异步填充) ---
@@ -78,6 +75,7 @@ if (themeToggle) {
         // 手动请求一次系统状态以重绘图表
         fetchData('/system/status').then(data => {
             if (data) {
+                renderSystemStatus(data); // 重新渲染整个系统卡片
                 renderUserQuickStats(data.user_stats);
                 // 重新初始化实时图表 (它将在下次 `live_update` 时填充)
                 initRealtimeTrafficChart();
@@ -117,6 +115,7 @@ function openModal(id) {
 }
 
 function closeModal(id) {
+    // [AXIOM V5.2] 如果是连接详情模态框，不需要销毁 Chart 实例
     if (id === 'traffic-chart-modal' && trafficChartInstance) {
         trafficChartInstance.destroy();
         trafficChartInstance = null;
@@ -245,7 +244,8 @@ function switchView(viewId) {
 // --- 数据渲染函数 ---
 
 /**
- * [AXIOM V5.0] 重构: 建议 #3 (卡片合并)
+ * [AXIOM V5.1.1] 修复: 确保系统资源统计 ID 正确
+ * 此函数负责首次渲染和 3秒推送的全量渲染（当主题切换或需要全量更新时）
  */
 function renderSystemStatus(data) {
     const grid = document.getElementById('system-status-grid');
@@ -255,6 +255,7 @@ function renderSystemStatus(data) {
     const fragment = document.createDocumentFragment();
     
     // --- 1. 渲染系统状态 (CPU/内存/磁盘) ---
+    // ID 必须与 handleSystemUpdateMessage 中引用的 ID 匹配
     const systemItems = [
         { name: 'CPU 使用率 (LoadAvg)', value: data.cpu_usage.toFixed(1) + '%', color: 'text-blue-500', icon: 'cpu', id: 'stat-cpu' },
         { name: '内存 (用/总)', value: data.memory_used_gb.toFixed(2) + '/' + data.memory_total_gb.toFixed(2) + 'GB', color: 'text-indigo-500', icon: 'brain', id: 'stat-mem' },
@@ -270,7 +271,8 @@ function renderSystemStatus(data) {
         card.innerHTML = 
             `<div class="stat-figure ${item.color}"><i data-lucide="${item.icon}" class="w-6 h-6"></i></div>` +
             `<div class="stat-title text-sm">${item.name}</div>` +
-            `<div class="stat-value text-xl ${item.color} flex items-center" id="${item.id}">` +
+            // [V5.1.1 FIX] 确保 ID 存在于创建的 stat-value div 中
+            `<div class="stat-value text-xl ${item.color} flex items-center" id="${item.id}">` + 
                  item.value +
             '</div>';
         statsGrid.appendChild(card);
@@ -289,16 +291,11 @@ function renderSystemStatus(data) {
     Object.keys(data.services).forEach(key => {
         const item = data.services[key];
         const status = item.status;
-        let color, dotClass;
+        let dotClass;
         if (status === 'running') {
-            color = 'text-success';
             dotClass = 'badge-success';
-        } else if (status === 'failed') {
-            color = 'text-error';
-            dotClass = 'badge-error';
         } else {
-            color = 'text-warning';
-            dotClass = 'badge-warning';
+            dotClass = 'badge-error';
         }
         
         const div = document.createElement('div');
@@ -346,26 +343,29 @@ function renderSystemStatus(data) {
 }
 
 /**
- * [AXIOM V5.0] 新增: 3秒推送的系统状态静默更新
+ * [AXIOM V5.1.1 FIX] 核心修复：将 handleSystemStatusSilentUpdate 重命名并移入消息处理
+ * 这是 3 秒推送的数据，只更新 DOM 文本和颜色
  */
-function handleSystemStatusSilentUpdate(data) {
+function handleSystemUpdateMessage(data) {
     if (currentView !== 'dashboard') return;
     
     // 1. 更新系统资源统计
-    document.getElementById('stat-cpu').textContent = data.cpu_usage.toFixed(1) + '%';
-    document.getElementById('stat-mem').textContent = data.memory_used_gb.toFixed(2) + '/' + data.memory_total_gb.toFixed(2) + 'GB';
-    document.getElementById('stat-disk').textContent = data.disk_used_percent.toFixed(1) + '%';
+    const statCpu = document.getElementById('stat-cpu');
+    const statMem = document.getElementById('stat-mem');
+    const statDisk = document.getElementById('stat-disk');
+
+    if (statCpu) statCpu.textContent = data.cpu_usage.toFixed(1) + '%';
+    if (statMem) statMem.textContent = data.memory_used_gb.toFixed(2) + '/' + data.memory_total_gb.toFixed(2) + 'GB';
+    if (statDisk) statDisk.textContent = data.disk_used_percent.toFixed(1) + '%';
     
     // 2. 更新服务状态
     Object.keys(data.services).forEach(key => {
         const item = data.services[key];
         const dot = document.getElementById(`service-dot-${key}`);
-        const statusDiv = document.getElementById(`service-status-${key}`);
         
-        if (dot && statusDiv) {
+        if (dot) {
             const isRunning = item.status === 'running';
             dot.className = `badge ${isRunning ? 'badge-success' : 'badge-error'} badge-xs mr-2 p-1`;
-            // 按钮颜色也应该动态调整，但这需要查找 DOM 比较麻烦，暂时保持按钮不变。
         }
     });
 
@@ -378,12 +378,15 @@ function handleSystemStatusSilentUpdate(data) {
             badge.textContent = p.status;
         }
     });
+
+    // 4. 更新用户快速统计卡片 (此更新频率较低，但包含在 3s 推送中以确保数据一致)
+    renderUserQuickStats(data.user_stats);
 }
 
 
 /**
  * [AXIOM V3.1] 重构: renderUserQuickStats
- * - 为动态元素添加 ID
+ * - 移除对 stat-cpu, stat-mem, stat-disk 的引用，避免冲突
  */
 function renderUserQuickStats(stats) {
     if (!stats) {
@@ -391,15 +394,14 @@ function renderUserQuickStats(stats) {
         return;
     }
     
-    lastUserStats = stats;
-    
-    const container = document.getElementById('user-quick-stats-text');
     const total = stats.total;
     const active = stats.active; 
     const nonActive = stats.paused + stats.expired + stats.exceeded + (stats.fused || 0);
     
-    // 只有在 total 发生变化时才更新 innerHTML，否则使用静默更新
-    if (total !== lastUserStats.total || lastUserStats.total === -1) {
+    const container = document.getElementById('user-quick-stats-text');
+    
+    // [V5.1.1 FIX] 仅在 total/active/nonActive/traffic 这些统计数据首次加载或结构变化时才更新 innerHTML
+    if (total !== lastUserStats.total || active !== lastUserStats.active || stats.total_traffic_gb !== lastUserStats.total_traffic_gb || lastUserStats.total === -1) {
          container.innerHTML = 
             `<div class="stat">
                 <div class="stat-figure text-primary"><i data-lucide="users" class="w-8 h-8"></i></div>
@@ -424,11 +426,17 @@ function renderUserQuickStats(stats) {
         lucide.createIcons({ context: container });
     } else {
          // 仅更新活跃连接数和总用量 (其他字段变化较慢)
-         document.getElementById('stat-active-conns').textContent = active;
-         document.getElementById('stat-total-traffic').textContent = stats.total_traffic_gb.toFixed(2) + ' GB';
-         document.getElementById('stat-inactive-users').textContent = nonActive;
+         const activeConnsEl = document.getElementById('stat-active-conns');
+         const totalTrafficEl = document.getElementById('stat-total-traffic');
+         const inactiveUsersEl = document.getElementById('stat-inactive-users');
+
+         if (activeConnsEl) activeConnsEl.textContent = active;
+         if (totalTrafficEl) totalTrafficEl.textContent = stats.total_traffic_gb.toFixed(2) + ' GB';
+         if (inactiveUsersEl) inactiveUsersEl.textContent = nonActive;
     }
 
+    lastUserStats = stats;
+    
     // 更新饼图
     const ctx = document.getElementById('user-stats-chart').getContext('2d');
     const activeAccounts = total - nonActive; 
@@ -478,7 +486,7 @@ function renderUserQuickStats(stats) {
 }
 
 /**
- * [AXIOM V3.1] 重构: buildUserCard (移动端)
+ * [AXIOM V5.2] 重构: buildUserCard (移动端)
  */
 function buildUserCard(user, statusColor, statusText, toggleAction, toggleText, toggleColor, usageText, usageProgressHtml) {
     let borderColor = 'border-primary';
@@ -544,8 +552,10 @@ function buildUserCard(user, statusColor, statusText, toggleAction, toggleText, 
                         
                 <button onclick="confirmAction('${user.username}', '${toggleAction}', null, 'toggleStatus', '${toggleText}用户')" 
                         class="btn ${toggleColor} btn-xs" aria-label="${toggleText}用户 ${user.username}">${toggleText}</button>
+                <button onclick="openConnectionDetailsModal('${user.username}')" 
+                        class="btn btn-info btn-xs" aria-label="查看用户连接详情 ${user.username}">详情</button> <!-- [AXIOM V5.2] 新增按钮 -->
                 <button onclick="confirmAction('${user.username}', 'delete', null, 'deleteUser', '删除用户')" 
-                        class="btn btn-error btn-xs col-span-2" aria-label="删除用户 ${user.username}">删除</button>
+                        class="btn btn-error btn-xs" aria-label="删除用户 ${user.username}">删除</button>
             </div>
         </div>
     </div>`;
@@ -653,6 +663,8 @@ function renderUserList(users) {
                                 
                         <button onclick="confirmAction('${user.username}', '${toggleAction}', null, 'toggleStatus', '${toggleText}用户')" 
                                 class="btn ${toggleColor} btn-xs" aria-label="${toggleText}用户 ${user.username}">${toggleText}</button>
+                        <button onclick="openConnectionDetailsModal('${user.username}')" 
+                                class="btn btn-info btn-xs" aria-label="查看用户连接详情 ${user.username}">详情</button> <!-- [AXIOM V5.2] 新增按钮 -->
                         <button onclick="confirmAction('${user.username}', 'delete', null, 'deleteUser', '删除用户')" 
                                 class="btn btn-error btn-xs" aria-label="删除用户 ${user.username}">删除</button>
                     </div>
@@ -805,6 +817,97 @@ function renderHosts(hosts) {
     const validHosts = hosts.filter(h => h.trim() !== '');
     countInfo.textContent = `当前加载 ${validHosts.length} 个 Host。`;
 }
+
+/**
+ * [AXIOM V5.2] 新增：渲染连接元数据列表
+ * @param {Array} connections 活跃连接元数据数组
+ */
+function renderConnectionList(connections) {
+    const container = document.getElementById('connection-list-container');
+    if (!container) return;
+
+    if (connections.length === 0) {
+        container.innerHTML = '<div class="text-center text-gray-500 py-4">该用户目前没有活跃的 WSS 连接。</div>';
+        return;
+    }
+
+    let html = `
+        <div class="grid grid-cols-5 gap-2 font-bold text-sm text-base-content/80 p-2 border-b border-base-300 bg-base-200 sticky top-0 rounded-t-lg">
+            <div class="col-span-2">客户端 IP</div>
+            <div class="col-span-1">Worker ID</div>
+            <div class="col-span-2">连接开始时间 (UTC)</div>
+        </div>
+    `;
+
+    connections.forEach(conn => {
+        const startTime = new Date(conn.start);
+        const duration = (Date.now() - startTime.getTime()) / 1000;
+        const uptime = formatUptime(duration);
+
+        html += `
+            <div class="grid grid-cols-5 gap-2 text-xs p-2 bg-base-100 rounded-lg shadow-sm border border-base-300">
+                <div class="col-span-2 font-mono text-primary">${conn.ip}</div>
+                <div class="col-span-1 text-secondary">W-${conn.workerId}</div>
+                <div class="col-span-2 text-gray-500">
+                    ${startTime.toISOString().replace('T', ' ').substring(0, 19)}<br>
+                    <span class="text-xs font-medium text-success">已连接: ${uptime}</span>
+                </div>
+            </div>
+        `;
+    });
+
+    container.innerHTML = html;
+}
+
+/**
+ * 辅助函数：格式化秒数为可读的字符串
+ */
+function formatUptime(seconds) {
+    const days = Math.floor(seconds / (3600 * 24));
+    seconds -= days * 3600 * 24;
+    const hrs = Math.floor(seconds / 3600);
+    seconds -= hrs * 3600;
+    const mins = Math.floor(seconds / 60);
+    seconds -= mins * 60;
+    const secs = Math.floor(seconds);
+
+    let parts = [];
+    if (days > 0) parts.push(`${days}天`);
+    if (hrs > 0) parts.push(`${hrs}时`);
+    if (mins > 0) parts.push(`${mins}分`);
+    if (secs > 0 && parts.length < 3) parts.push(`${secs}秒`);
+    
+    return parts.join(' ');
+}
+
+/**
+ * [AXIOM V5.2] 新增：打开连接详情模态框
+ */
+async function openConnectionDetailsModal(username) {
+    const titleEl = document.getElementById('modal-username-connection');
+    const loadingEl = document.getElementById('connection-loading');
+    const listContainer = document.getElementById('connection-list-container');
+    
+    titleEl.textContent = username;
+    loadingEl.textContent = '正在查询活跃连接...';
+    loadingEl.style.display = 'block';
+    listContainer.innerHTML = '';
+    
+    openModal('connection-details-modal');
+
+    const result = await fetchData(`/users/connections?username=${username}`);
+
+    loadingEl.style.display = 'none';
+
+    if (result && result.success) {
+        renderConnectionList(result.connections);
+        showStatus(result.message, true);
+    } else {
+        listContainer.innerHTML = `<div class="text-center text-error py-4">查询失败: ${result ? result.message : '网络或 API 错误'}</div>`;
+        showStatus(`连接查询失败: ${result ? result.message : 'API 错误'}`, false);
+    }
+}
+
 
 // --- 核心 API 调用函数 ---
 
@@ -1050,6 +1153,7 @@ function connectWebSocket() {
                 case 'status_connected':
                     setWsStatusIcon('green', '实时推送已连接 (1秒/3秒刷新)');
                     console.log('[AXIOM V5.0] WebSocket 身份验证成功。正在加载初始数据...');
+                    // [V5.1.1 FIX] 确保所有静态数据加载成功
                     fetchAllStaticData(); 
                     break;
                 
@@ -1069,14 +1173,9 @@ function connectWebSocket() {
                 
                 case 'system_update':
                     // [AXIOM V5.0] 3秒推送：系统状态（CPU/内存/服务/端口）
-                    if (message.payload && currentView === 'dashboard') {
-                        // 初始渲染或 3秒状态变化时，全量更新仪表盘的慢速部分
-                        handleSystemStatusSilentUpdate(message.payload);
-                        renderUserQuickStats(message.payload.user_stats);
-                    }
-                    // 始终更新系统状态（因为 service log view 也需要）
-                    if (message.payload && currentView === 'settings') {
-                        // 确保服务列表是最新的 (如果用户切换到日志视图)
+                    if (message.payload) {
+                        // [V5.1.1 FIX] 调用新的消息处理器
+                        handleSystemUpdateMessage(message.payload);
                     }
                     break;
                 
@@ -1326,10 +1425,15 @@ async function fetchAllStaticData() {
         if (currentView === 'security') { fetchGlobalBans(); }
         
         // 4. 隐藏骨架屏, 显示真实卡片
-        document.getElementById('dashboard-skeleton-loader').style.display = 'none';
-        document.getElementById('system-status-card').style.display = 'block';
-        document.getElementById('user-stats-card').style.display = 'block';
-        document.getElementById('realtime-traffic-card').style.display = 'block';
+        const skeleton = document.getElementById('dashboard-skeleton-loader');
+        const card1 = document.getElementById('system-status-card');
+        const card2 = document.getElementById('user-stats-card');
+        const card3 = document.getElementById('realtime-traffic-card');
+
+        if (skeleton) skeleton.style.display = 'none';
+        if (card1) card1.style.display = 'block';
+        if (card2) card2.style.display = 'block';
+        if (card3) card3.style.display = 'block';
         
     } catch (error) {
         console.error("Error during fetchAllStaticData:", error);
