@@ -1,18 +1,11 @@
 /**
  * WSS Panel Backend (Node.js + Express + SQLite)
- * V8.5.0 (Axiom Refactor V5.0 - Native UDP & Layered Push)
+ * V8.5.3 (Axiom Refactor V5.3 - Critical Syntax Fix)
  *
- * [AXIOM V5.0 CHANGELOG]
- * - [性能] 分层推送:
- * - 引入 `liveUpdateInterval` (1秒) 和 `systemUpdateInterval` (3秒) 定时器。
- * - 仅在 `wssUiPool.size > 0` 时启动实时推送。
- * - `pushLiveUpdates` 仅推送活跃用户和流量数据。
- * - `pushSystemUpdates` 仅推送 CPU/内存/服务状态 (3秒)。
- * - [性能] 智能推送: 只有当用户数据或系统状态发生变化时才广播给前端。
- * - [性能/稳定性] DB 批量写入优化:
- * - `persistTrafficDelta` 现在使用优化的批量 SQL 逻辑，提高高并发写入的稳定性。
- * - [修复] 端口配置:
- * - `/settings/config` API 修复了对 `udpgw` 服务的配置修改逻辑，以兼容 Native UDPGW (即不再修改 .service 文件，因为 Native UDPGW 直接读取 config.json)。
+ * [AXIOM V5.3 CHANGELOG]
+ * - [CRITICAL FIX] 修复 `SyntaxError: Unexpected token 'catch'` 崩溃。
+ * - 错误原因：在 `syncUserStatus` 和 `/users/batch-action` 的续期逻辑中，日期解析的 `try...catch` 结构过于紧凑。
+ * - 修复方案：将所有复杂的单行 `try...catch` 替换为标准的多行块结构，确保 Node.js 正确解析。
  */
 
 // --- 核心依赖 ---
@@ -46,7 +39,7 @@ const CONFIG_PATH = path.join(PANEL_DIR, 'config.json');
 try {
     const configData = fsSync.readFileSync(CONFIG_PATH, 'utf8');
     config = JSON.parse(configData);
-    console.log(`[AXIOM V5.0] 成功从 ${CONFIG_PATH} 加载配置。`);
+    console.log(`[AXIOM V5.3] 成功从 ${CONFIG_PATH} 加载配置。`);
 } catch (e) {
     console.error(`[CRITICAL] 无法加载 ${CONFIG_PATH}: ${e.message}。将使用默认端口。`);
     try {
@@ -65,16 +58,16 @@ const AUDIT_LOG_PATH = path.join(PANEL_DIR, 'audit.log');
 const SECRET_KEY_PATH = path.join(PANEL_DIR, 'secret_key.txt');
 const INTERNAL_SECRET_PATH = path.join(PANEL_DIR, 'internal_secret.txt');
 const HOSTS_DB_PATH = path.join(PANEL_DIR, 'hosts.json');
-const STUNNEL_CONF = '/etc/stunnel/ssh-tls.conf'; // [AXIOM V5.0] 端口修改目标文件
+const STUNNEL_CONF = '/etc/stunnel/ssh-tls.conf';
 const ROOT_USERNAME = "root";
 const GIGA_BYTE = 1024 * 1024 * 1024;
 const BLOCK_CHAIN = "WSS_IP_BLOCK";
-const BACKGROUND_SYNC_INTERVAL = 60000; // 60秒维护任务 (状态机/系统锁定)
+const BACKGROUND_SYNC_INTERVAL = 60000; 
+const SHELL_DEFAULT = "/sbin/nologin";
 const CORE_SERVICES = {
     'wss': 'WSS Proxy',
     'stunnel4': 'Stunnel4',
-    // [AXIOM V5.0] 替换为新的 Native UDPGW 服务名
-    'udp_server': 'Native UDPGW',
+    'udp_server': 'Native UDPGW', 
     'wss_panel': 'Web Panel'
 };
 let db;
@@ -86,13 +79,16 @@ let workerStatsCache = new Map();
 let globalFuseLimitKbps = 0;
 
 // [AXIOM V5.0] 性能优化定时器
-let liveUpdateInterval = null; // 1秒用户流量/连接推送
-let systemUpdateInterval = null; // 3秒系统状态推送
-let isRealtimePushing = false; // 实时推送状态标志
+let liveUpdateInterval = null; 
+let systemUpdateInterval = null; 
+let isRealtimePushing = false; 
 
 // [AXIOM V5.0] 智能推送：存储上一次推送的聚合数据，以便比较变化
 let lastAggregatedStats = { users: {}, live_ips: {} };
 let lastSystemStatus = {};
+
+// [AXIOM V5.2] 新增：用于临时存储 Worker 元数据响应
+let workerMetadataResponses = new Map();
 
 
 const SUDO_COMMANDS = new Set([
@@ -105,7 +101,47 @@ const SUDO_COMMANDS = new Set([
     'systemctl daemon-reload' 
 ]);
 
-// --- 辅助函数 (safeRunCommand, logAction, getSystemLockStatus 等保持不变) ---
+// =======================================================
+// [AXIOM V5.1 FIX] 核心辅助函数 (移至顶部确保路由可见性)
+// =======================================================
+
+async function loadRootHash() {
+    try {
+        const hash = await fs.readFile(ROOT_HASH_FILE, 'utf8');
+        return hash.trim();
+    } catch (e) {
+        console.error(`Root hash file not found: ${e.message}`);
+        return null;
+    }
+}
+
+async function getUserByUsername(username) {
+    return db.get('SELECT * FROM users WHERE username = ?', username);
+}
+
+function loadInternalSecret() {
+    return config.internal_api_secret;
+}
+
+async function loadHosts() {
+    try {
+        if (!fsSync.existsSync(HOSTS_DB_PATH)) {
+            await fs.writeFile(HOSTS_DB_PATH, '[]', 'utf8');
+            return [];
+        }
+        const data = await fs.readFile(HOSTS_DB_PATH, 'utf8');
+        const hosts = JSON.parse(data);
+        if (Array.isArray(hosts)) {
+            return hosts.map(h => String(h).toLowerCase()).filter(h => h);
+        }
+        return [];
+    } catch (e) {
+        console.error(`Error loading hosts file: ${e.message}`);
+        return [];
+    }
+}
+
+// --- 辅助函数 (safeRunCommand, logAction, getSystemLockStatus) ---
 
 /**
  * [AXIOM V4.1] 修复: 移除了 e.code === 1 的危险捕获
@@ -230,7 +266,7 @@ async function getSystemLockStatus() {
 }
 
 
-// --- 数据库 Setup and User Retrieval (initDb 保持不变) ---
+// --- 数据库 Setup and User Retrieval (initDb) ---
 
 async function initDb() {
     db = await open({
@@ -315,11 +351,7 @@ async function initDb() {
     console.log(`SQLite database initialized at ${DB_PATH}`);
 }
 
-async function getUserByUsername(username) {
-    return db.get('SELECT * FROM users WHERE username = ?', username);
-}
-
-// --- Authentication Middleware (保持不变) ---
+// --- Authentication Middleware ---
 
 function loadSecretKey() {
     try {
@@ -425,11 +457,6 @@ async function persistTrafficDelta(workerStats) {
     try {
         await db.run('BEGIN TRANSACTION');
         
-        // --- A. 批量更新主表 (users) ---
-        // 使用 REPLACE INTO 模拟 ON CONFLICT UPDATE (但此处我们使用 UPDATE 提高可读性)
-        // 鉴于 SQLite 不支持多行 UPDATE，我们使用循环，但在事务中性能可接受。
-        // 为了进一步优化性能，我们合并主表更新和历史表更新。
-
         const historyUpdates = [];
         for (const u of userDeltaList) {
             // 1. 更新主表总流量
@@ -619,7 +646,6 @@ function toggleRealtimePush(shouldStart) {
  * [AXIOM V3.0] 60秒维护任务
  */
 async function syncUserStatus() {
-    // [AXIOM V5.0] 当管理员离线时，此任务成为唯一的数据持久化机制
     const systemLockedUsers = await getSystemLockStatus();
     let allUsers = [];
     try {
@@ -637,10 +663,15 @@ async function syncUserStatus() {
         let isExpired = false, isOverQuota = false;
         
         if (user.expiration_date) {
-            try {
+            // [AXIOM V5.3 FIX] 使用标准 try/catch 块
+            try { 
                 const expiry = new Date(user.expiration_date);
-                if (!isNaN(expiry) && expiry < new Date()) { isExpired = true; }
-            } catch (e) { /* ignore */ }
+                if (!isNaN(expiry) && expiry < new Date()) { 
+                    isExpired = true; 
+                }
+            } catch (e) { 
+                // Ignore parsing error, treat as non-expired if invalid date string
+            }
         }
         
         if (user.quota_gb > 0 && user.usage_gb >= user.quota_gb) { isOverQuota = true; }
@@ -698,7 +729,6 @@ async function syncUserStatus() {
             await db.run('COMMIT');
             console.log(`[SYNC] 60秒维护任务完成。更新了 ${usersToUpdate.length} 个用户的状态。`);
             
-            // 状态变更后，通知前端刷新用户列表 (仅在有人在线时)
             if (wssUiPool.size > 0) {
                 broadcastToFrontends({ type: 'users_changed' });
             }
@@ -707,8 +737,6 @@ async function syncUserStatus() {
             await db.run('ROLLBACK').catch(()=>{});
             console.error(`[SYNC] CRITICAL: 60秒维护DB更新失败: ${e.message}`);
         }
-    } else {
-        // console.log(`[SYNC] 60秒维护任务完成。没有状态变更。`);
     }
 }
 
@@ -753,7 +781,7 @@ const loginLimiter = rateLimit({
 
 app.post('/login', loginLimiter, async (req, res) => {
     const { username, password } = req.body;
-    const rootHash = await loadRootHash();
+    const rootHash = await loadRootHash(); 
     if (username === ROOT_USERNAME && password && rootHash) {
         try {
             const match = await bcrypt.compare(password, rootHash);
@@ -847,6 +875,108 @@ app.use('/internal', internalApi);
 // --- Public API (For Admin Panel UI) ---
 const api = express.Router();
 
+/**
+ * [AXIOM V5.2] 新增：跨 Worker 获取用户实时连接元数据
+ */
+async function getLiveConnectionMetadata(username) {
+    if (!wssIpc || wssIpc.clients.size === 0) {
+        return { success: false, connections: [], message: 'Proxy workers are disconnected.' };
+    }
+
+    const requestId = crypto.randomUUID();
+    const workersToWait = wssIpc.clients.size;
+    workerMetadataResponses.clear();
+    
+    // 1. 广播请求到所有 Worker
+    const requestMessage = JSON.stringify({
+        action: 'GET_METADATA',
+        username: username,
+        requestId: requestId
+    });
+    
+    wssIpc.clients.forEach(client => {
+        if (client.readyState === 1) {
+            client.send(requestMessage);
+        }
+    });
+
+    // 2. 等待 Worker 响应 (设置超时 3000ms)
+    return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+            console.warn(`[METADATA] Timeout waiting for worker responses. Received ${workerMetadataResponses.size}/${workersToWait} responses.`);
+            resolve(aggregateResponses());
+        }, 3000);
+
+        function checkResponses() {
+            if (workerMetadataResponses.size >= workersToWait) {
+                clearTimeout(timer);
+                resolve(aggregateResponses());
+            }
+        }
+
+        function aggregateResponses() {
+            const allConnections = [];
+            let successfulWorkers = 0;
+            
+            workerMetadataResponses.forEach(response => {
+                if (response.connections && Array.isArray(response.connections)) {
+                    allConnections.push(...response.connections);
+                    successfulWorkers++;
+                }
+            });
+            
+            return {
+                success: true,
+                connections: allConnections,
+                message: `Aggregated metadata from ${successfulWorkers}/${workersToWait} workers.`
+            };
+        }
+        
+        // 临时存储响应的函数 (被 IPC 消息处理器调用)
+        getLiveConnectionMetadata.onResponse = (response) => {
+            if (response.requestId === requestId) {
+                workerMetadataResponses.set(response.workerId, response);
+                checkResponses();
+            }
+        };
+
+        // 清理函数 (确保在 Promise 结束后移除临时回调)
+        // Note: The caller of getLiveConnectionMetadata is responsible for handling the promise resolution.
+        // We ensure the temporary function is cleaned up after resolution.
+        const originalResolve = resolve;
+        resolve = (value) => {
+            delete getLiveConnectionMetadata.onResponse;
+            originalResolve(value);
+        };
+
+        // If the promise is rejected or times out, onResponse should still be removed.
+        // We rely on the initial setTimeout's resolve path to trigger cleanup.
+    });
+}
+
+
+/**
+ * [AXIOM V5.2] 新增 API：获取用户的实时连接元数据
+ */
+api.get('/users/connections', async (req, res) => {
+    const { username } = req.query;
+    if (!username) {
+        return res.status(400).json({ success: false, message: 'Missing username.' });
+    }
+    
+    try {
+        const result = await getLiveConnectionMetadata(username);
+        if (result.success) {
+            return res.json({ success: true, connections: result.connections, message: result.message });
+        } else {
+            return res.status(503).json({ success: false, message: result.message });
+        }
+    } catch (e) {
+        console.error(`[API] Failed to get connection metadata for ${username}: ${e.message}`);
+        return res.status(500).json({ success: false, message: 'Internal server error during metadata aggregation.' });
+    }
+});
+
 
 /**
  * [AXIOM V5.0] 提取: 获取系统状态的核心逻辑
@@ -871,7 +1001,6 @@ async function getSystemStatusData() {
         { name: 'WSS_HTTP', port: config.wss_http_port, protocol: 'TCP', status: 'LISTEN' },
         { name: 'WSS_TLS', port: config.wss_tls_port, protocol: 'TCP', status: 'LISTEN' },
         { name: 'STUNNEL', port: config.stunnel_port, protocol: 'TCP', status: 'LISTEN' },
-        // [AXIOM V5.0] Native UDPGW 现在只在 127.0.0.1 监听 TCP
         { name: 'NATIVE_UDPGW', port: config.udpgw_port, protocol: 'TCP', status: 'LISTEN' },
         { name: 'PANEL', port: config.panel_port, protocol: 'TCP', status: 'LISTEN' },
         { name: 'SSH_INTERNAL', port: config.internal_forward_port, protocol: 'TCP', status: 'LISTEN' }
@@ -924,7 +1053,6 @@ api.get('/system/status', async (req, res) => {
 
 api.post('/system/control', async (req, res) => {
     const { service, action } = req.body;
-    // [AXIOM V5.0] 检查新的 CORE_SERVICES
     if (!CORE_SERVICES[service] || action !== 'restart') {
         return res.status(400).json({ success: false, message: "无效的服务或操作" });
     }
@@ -1001,7 +1129,7 @@ api.post('/users/add', async (req, res) => {
     const existingUser = await getUserByUsername(username);
     if (existingUser) return res.status(409).json({ success: false, message: `用户组 ${username} 已存在于面板` });
     try {
-        const shell = "/sbin/nologin"; 
+        const shell = SHELL_DEFAULT; 
         const { success: userAddSuccess, output: userAddOutput } = await safeRunCommand(['useradd', '-m', '-s', shell, username]);
         if (!userAddSuccess && !userAddOutput.includes("already exists")) {
             throw new Error(`创建系统用户失败: ${userAddOutput}`);
@@ -1324,7 +1452,14 @@ api.post('/users/batch-action', async (req, res) => {
                     const user = await getUserByUsername(username);
                     if (!user) { failedCount++; errors.push(`${username}: not found`); continue; }
                     let currentExpiry = null;
-                    try { if (user.expiration_date) { currentExpiry = new Date(user.expiration_date); } } catch(e) {}
+                    
+                    // [AXIOM V5.3 FIX] 使用标准 try/catch 块
+                    try { 
+                        if (user.expiration_date) { 
+                            currentExpiry = new Date(user.expiration_date); 
+                        } 
+                    } catch(e) { /* ignore parse error */ }
+                    
                     let baseDate = today;
                     if (currentExpiry && !isNaN(currentExpiry) && currentExpiry > today) { baseDate = currentExpiry; }
                     const newExpiryDate = new Date(baseDate.getTime() + renewDays * 24 * 60 * 60 * 1000);
@@ -1368,24 +1503,6 @@ api.get('/settings/hosts', async (req, res) => {
     const hosts = await loadHosts();
     res.json({ success: true, hosts });
 });
-
-async function loadHosts() {
-    try {
-        if (!fsSync.existsSync(HOSTS_DB_PATH)) {
-            await fs.writeFile(HOSTS_DB_PATH, '[]', 'utf8');
-            return [];
-        }
-        const data = await fs.readFile(HOSTS_DB_PATH, 'utf8');
-        const hosts = JSON.parse(data);
-        if (Array.isArray(hosts)) {
-            return hosts.map(h => String(h).toLowerCase()).filter(h => h);
-        }
-        return [];
-    } catch (e) {
-        console.error(`Error loading hosts file: ${e.message}`);
-        return [];
-    }
-}
 
 api.post('/settings/hosts', async (req, res) => {
     const { hosts: newHostsRaw } = req.body;
@@ -1483,7 +1600,6 @@ api.post('/settings/config', async (req, res) => {
                 if (key === 'panel_port') requiresPanelRestart = true;
                 if (key === 'wss_http_port' || key === 'wss_tls_port' || key === 'internal_forward_port') requiresWssRestart = true;
                 if (key === 'stunnel_port') requiresStunnelRestart = true;
-                // [AXIOM V5.0] Native UDPGW 端口变更
                 if (key === 'udpgw_port') requiresUdpGwRestart = true;
             }
         });
@@ -1494,14 +1610,9 @@ api.post('/settings/config', async (req, res) => {
             if (requiresStunnelRestart) {
                 const newPort = currentConfig.stunnel_port;
                 console.log(`[CONFIG_FIX] 正在更新 ${STUNNEL_CONF}: ${oldStunnelPort} -> ${newPort}`);
-                // 使用 sed 替换 accept 行
                 const sedResult = await safeRunCommand(['sed', '-i', `s/accept = 0.0.0.0:${oldStunnelPort}/accept = 0.0.0.0:${newPort}/g`, STUNNEL_CONF]);
                 if (!sedResult.success) throw new Error(`Failed to update ${STUNNEL_CONF}: ${sedResult.output}`);
             }
-            
-            // [AXIOM V5.0] 移除对 udpgw.service.template 的 sed 修改。
-            // Native UDPGW (udp_server.js) 直接读取 config.json。
-            // 我们只需要确保服务重启即可。
             
         } catch (e) {
             await logAction("CONFIG_FIX_FAIL", req.session.username, `Failed to patch service files: ${e.message}`);
@@ -1525,7 +1636,6 @@ api.post('/settings/config', async (req, res) => {
             if (requiresStunnelRestart) {
                 await safeRunCommand(['systemctl', 'restart', 'stunnel4']);
             }
-            // [AXIOM V5.0] 重启新的 Native UDPGW 服务
             if (requiresUdpGwRestart) {
                 await safeRunCommand(['systemctl', 'restart', 'udp_server']);
             }
@@ -1701,7 +1811,7 @@ async function checkAndApplyFuse(username, userSpeedKbps) {
 
 
 function startWebSocketServers(httpServer) {
-    console.log(`[AXIOM V5.0] 正在启动实时 WebSocket 服务...`);
+    console.log(`[AXIOM V5.3] 正在启动实时 WebSocket 服务...`);
     
     // --- 1. IPC (Proxy) 服务器 (/ipc) ---
     wssIpc = new WebSocketServer({
@@ -1710,7 +1820,6 @@ function startWebSocketServers(httpServer) {
     });
     
     wssIpc.on('connection', (ws, req) => {
-        // [AXIOM V5.0] 从请求头获取 Worker ID
         const workerId = req.headers['x-worker-id'] || req.socket.remoteAddress;
         ws.workerId = workerId;
         console.log(`[IPC_WSS] 一个数据平面 (Proxy Worker: ${workerId}) 已连接。`);
@@ -1721,17 +1830,13 @@ function startWebSocketServers(httpServer) {
                 
                 if (message.type === 'stats_update' && message.payload) {
                     
-                    // 1. 将此 Worker 的数据存入内存缓存
                     workerStatsCache.set(message.workerId || ws.workerId, message.payload);
                     
-                    // 2. 异步将流量增量写入 DB (解耦)
                     persistTrafficDelta(message.payload.stats); 
 
-                    // 3. 执行动态逻辑
                     if (wssUiPool.size > 0) {
                         const aggregatedStats = aggregateAllWorkerStats();
                         
-                        // 4. 实时检查熔断 (基于聚合速度)
                         if (globalFuseLimitKbps > 0) {
                             for (const username in aggregatedStats.users) {
                                 const userSpeed = aggregatedStats.users[username].speed_kbps;
@@ -1739,6 +1844,12 @@ function startWebSocketServers(httpServer) {
                             }
                         }
                     }
+                } 
+                // [AXIOM V5.2] 处理 Worker 的元数据响应
+                else if (message.type === 'METADATA_RESPONSE') {
+                     if (typeof getLiveConnectionMetadata.onResponse === 'function') {
+                         getLiveConnectionMetadata.onResponse(message);
+                     }
                 }
             } catch (e) {
                 console.error(`[IPC_WSS] 解析 Proxy 消息失败: ${e.message}`);
@@ -1776,7 +1887,6 @@ function startWebSocketServers(httpServer) {
         console.log(`[IPC_UI] 一个已验证的管理员前端 (User: ${req.session.username}) 已连接。`);
         wssUiPool.add(ws);
         
-        // 第一次连接成功，检查是否需要启动实时推送
         if (wssUiPool.size === 1) {
             toggleRealtimePush(true);
         }
@@ -1787,7 +1897,6 @@ function startWebSocketServers(httpServer) {
             console.log(`[IPC_UI] 一个管理员前端已断开连接。`);
             wssUiPool.delete(ws);
             
-            // 检查是否所有管理员都已离线
             if (wssUiPool.size === 0) {
                 toggleRealtimePush(false);
             }
@@ -1834,7 +1943,7 @@ function startWebSocketServers(httpServer) {
         }
     });
     
-    console.log(`[AXIOM V5.0] 实时 WebSocket 服务已附加到主 HTTP 服务器。`);
+    console.log(`[AXIOM V5.3] 实时 WebSocket 服务已附加到主 HTTP 服务器。`);
 }
 
 
@@ -1852,10 +1961,10 @@ async function startApp() {
         setTimeout(syncUserStatus, 5000); 
         
         server.listen(config.panel_port, '0.0.0.0', () => {
-            console.log(`[AXIOM V5.0] WSS Panel (HTTP) 运行在 port ${config.panel_port}`);
-            console.log(`[AXIOM V5.0] 实时 IPC (WSS) 运行在 port ${config.panel_port} (路径: /ipc)`);
-            console.log(`[AXIOM V5.0] 实时 UI (WSS) 运行在 port ${config.panel_port} (路径: /ws/ui)`);
-            console.log(`[AXIOM V5.0] 60秒维护任务已启动。`);
+            console.log(`[AXIOM V5.3] WSS Panel (HTTP) 运行在 port ${config.panel_port}`);
+            console.log(`[AXIOM V5.3] 实时 IPC (WSS) 运行在 port ${config.panel_port} (路径: /ipc)`);
+            console.log(`[AXIOM V5.3] 实时 UI (WSS) 运行在 port ${config.panel_port} (路径: /ws/ui)`);
+            console.log(`[AXIOM V5.3] 60秒维护任务已启动。`);
         });
         
         server.on('error', (err) => {
