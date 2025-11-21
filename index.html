@@ -1,19 +1,9 @@
 <!DOCTYPE html>
 <!-- 
-  V8.3.1 (Axiom Refactor V3.1 - UI/UX)
-  - [AXIOM V3.1] 建议 #4 (骨架屏):
-    - `view-dashboard` 现在硬编码了 DaisyUI `skeleton` 占位符
-      (id="dashboard-skeleton-loader")，以防止内容闪烁。
-  - [AXIOM V3.1] 建议 #1 (网格布局):
-    - `view-dashboard` 现在使用 `grid grid-cols-1 lg:grid-cols-3 gap-6`
-      以提高信息密度。
-  - [AXIOM V3.1] 建议 #2 (实时图表):
-    - 新增了卡片和 `<canvas id="realtime-traffic-chart">`
-      用于 1 秒实时流量“心电图”。
-  - [AXIOM V3.1] 建议 #3 (卡片合并):
-    - 移除了旧的“服务端口与控制”卡片。
-    - “核心基础设施”卡片 (id="system-status-card") 现在将
-      同时容纳状态、端口和重启按钮 (由 app.js 填充)。
+  V8.3.1 (Axiom Refactor V5.2 - Live Connection Metadata UI)
+  - [AXIOM V5.2] 新增连接详情模态框 (connection-details-modal)。
+  - 在用户列表的操作列中新增“连接详情”按钮。
+  - 更新了日志按钮中的服务名称，以匹配新的 'udp_server'。
 -->
 <html lang="zh-CN" data-theme="light">
 <head>
@@ -194,7 +184,7 @@
                             <h2 class="card-title text-xl font-semibold text-base-content border-b border-base-300 pb-3">
                                 <i data-lucide="activity" class="w-5 h-5 mr-1 text-success"></i>
                                 全局实时流量 (1秒刷新)
-                            </h2>
+                            </h2 >
                             <div class="h-64 w-full">
                                 <canvas id="realtime-traffic-chart"></canvas>
                             </div>
@@ -237,7 +227,7 @@
                                     <span class="btn btn-square bg-base-200 border border-base-300">
                                         <i data-lucide="search" class="w-5 h-5"></i>
                                     </span>
-                                </div>
+                                </div >
                             </div>
                             <div class="hidden md:block overflow-x-auto border border-base-300 rounded-lg">
                                 <table class="table w-full" role="table">
@@ -258,7 +248,7 @@
                                     </thead>
                                     <tbody id="user-list-tbody" class="bg-base-100 divide-y divide-base-300">
                                         <tr><td colspan="9" class="px-6 py-4 text-center text-gray-500">正在加载用户数据...</td></tr>
-                                    </tbody>
+                                    </tbody >
                                 </table>
                             </div>
                             <div id="user-list-mobile" class="space-y-4 md:hidden">
@@ -363,7 +353,7 @@
                                         <select id="payload-inject-method" class="select select-bordered w-full" disabled>
                                             <option value="back">Back Inject (默认)</option>
                                         </select>
-                                    </div>
+                                    </div >
                                 </div>
                                 <div class="form-control">
                                     <label class="label" for="payload-split-method"><span class="label-text">拆分方法 (使用 [split])</span></label>
@@ -394,16 +384,16 @@
                                             <input type="checkbox" id="payload-header-online-host" class="checkbox checkbox-sm" checked>
                                             <span class="label-text">X-Online-Host</span>
                                         </label>
-                                    </div>
+                                    </div >
                                 </div>
-                            </div>
-                        </div>
+                            </div >
+                        </div >
                         <div class="card bg-base-100 shadow-xl lg:col-span-1">
                             <div class="card-body p-6">
                                 <h3 class="card-title text-xl font-semibold text-base-content border-b border-base-300 pb-3">
                                     <i data-lucide="search" class="w-5 h-5 mr-1 text-accent"></i>
                                     SNI 查找器
-                                </h3>
+                                </h3 >
                                 <p class="text-xs text-base-content/70 mb-2">
                                     输入一个已知的运营商域名 (例如充值网站)，以发现其 SSL 证书上绑定的其他可用 SNI 域名。
                                 </p>
@@ -414,23 +404,23 @@
                                         <button id="sni-finder-btn" onclick="runSniFinder()" class="btn btn-accent btn-square">
                                             <i data-lucide="search" class="w-5 h-5"></i>
                                         </button>
-                                    </div>
-                                </div>
+                                    </div >
+                                </div >
                                 <div class="form-control mt-2">
                                     <label class="label"><span class="label-text">查询结果:</span></label>
                                     <div class="mockup-code bg-base-200 text-xs max-h-48 overflow-y-auto">
                                         <pre id="sni-finder-results" class="p-4">等待查询...</pre>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
+                                    </div >
+                                </div >
+                            </div >
+                        </div >
                         <div class="space-y-6"> 
                             <div class="card bg-base-100 shadow-xl">
                                 <div class="card-body p-6">
                                     <h3 class="card-title text-xl font-semibold text-base-content border-b border-base-300 pb-3">
                                         <i data-lucide="key" class="w-5 h-5 mr-1 text-success"></i>
                                         服务器认证 (WSS Panel)
-                                    </h3>
+                                    </h3 >
                                     <div class="form-control">
                                         <label class="label" for="payload-auth-mode"><span class="label-text">认证模式 (Axiom 智能注入)</span></label>
                                         <select id="payload-auth-mode" class="select select-bordered w-full">
@@ -438,41 +428,41 @@
                                             <option value="uri">免认证头 (URI 注入)</option>
                                             <option value="none">不注入 (原始载荷)</option>
                                         </select>
-                                    </div>
+                                    </div >
                                     <div class="form-control">
                                         <label class="label" for="payload-user-select"><span class="label-text">从列表选择用户 (可选)</span></label>
                                         <select id="payload-user-select" class="select select-bordered w-full">
                                             <option value="">-- 手动输入 --</option>
                                         </select>
-                                    </div>
+                                    </div >
                                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                                         <div class="form-control">
                                             <label class="label" for="payload-username"><span class="label-text">用户名</span></label>
                                             <input type="text" id="payload-username" placeholder="输入用户名" class="input input-bordered w-full">
-                                        </div>
+                                        </div >
                                         <div class="form-control">
                                             <label class="label" for="payload-password"><span class="label-text">密码</span></label>
                                             <input type="password" id="payload-password" placeholder="输入密码" class="input input-bordered w-full">
-                                        </div>
-                                    </div>
+                                        </div >
+                                    </div >
                                     <div class="form-control">
                                         <label class="label"><span class="label-text">Base64 令牌 (自动生成)</span></label>
                                         <div class="token-input-group">
                                             <input type="text" id="payload-auth-token" readonly class="input input-bordered w-full font-mono text-sm bg-base-200" value="[在此输入用户名和密码]">
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
+                                        </div >
+                                    </div >
+                                </div >
+                            </div >
                             <div class="card bg-base-100 shadow-xl">
                                 <div class="card-body p-6">
                                     <h3 class="card-title text-xl font-semibold text-base-content border-b border-base-300 pb-3">
                                         <i data-lucide="file-output" class="w-5 h-5 mr-1 text-primary"></i>
                                         生成结果
-                                    </h3>
+                                    </h3 >
                                     <div class="form-control">
                                         <label class="label" for="payload-output"><span class="label-text">自定义载荷 (Payload)</span></label>
                                         <textarea id="payload-output" class="textarea textarea-bordered w-full font-mono text-xs" rows="8" placeholder="点击 [生成载荷] 按钮..."></textarea>
-                                    </div>
+                                    </div >
                                     <div class="card-actions mt-4 grid grid-cols-2 gap-4">
                                         <button onclick="generatePayload()" class="btn btn-primary">
                                             <i data-lucide="play" class="w-4 h-4"></i> 生成载荷
@@ -480,12 +470,12 @@
                                         <button onclick="copyToClipboard('payload-output', '载荷已复制')" class="btn btn-ghost">
                                             <i data-lucide="copy" class="w-4 h-4"></i> 复制
                                         </button>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
+                                    </div >
+                                </div >
+                            </div >
+                        </div >
+                    </div >
+                </div >
 
 
                 <!-- 5. 系统配置/日志视图 (无布局变化) -->
@@ -498,7 +488,7 @@
                                 <h3 class="card-title text-xl font-semibold text-base-content border-b border-base-300 pb-3">
                                     <i data-lucide="zap" class="w-5 h-5 mr-1 text-warning"></i>
                                     全局安全设置
-                                </h3>
+                                </h3 >
                                 <div class="form-control">
                                     <label class="label" for="global-fuse-threshold">
                                         <span class="label-text">自动速率熔断阈值 (KB/s)</span>
@@ -507,36 +497,36 @@
                                     <label class="label">
                                         <span class="label-text-alt">当单个用户实时速率超过此值, 将被自动暂停。 (0 = 不启用)</span>
                                     </label>
-                                </div>
+                                </div >
                                 <div class="card-actions mt-2">
                                     <button type="submit" class="btn btn-primary w-full">
                                         <i data-lucide="save" class="w-4 h-4"></i> 保存全局设置
                                     </button>
-                                </div>
+                                </div >
                             </form>
-                        </div>
+                        </div >
                         <div class="card bg-base-100 shadow-xl">
                             <form id="change-password-form" class="card-body p-6">
                                 <h3 class="card-title text-xl font-semibold text-base-content border-b border-base-300 pb-3">面板安全</h3>
                                 <div class="form-control">
                                     <label class="label" for="old-password"><span class="label-text">当前密码</span></label>
                                     <input type="password" id="old-password" required class="input input-bordered w-full">
-                                </div>
+                                </div >
                                 <div class="form-control">
                                     <label class="label" for="admin-new-password"><span class="label-text">新密码 (至少6位)</span></label>
                                     <input type="password" id="admin-new-password" required minlength="6" class="input input-bordered w-full">
-                                </div>
+                                </div >
                                 <div class="form-control">
                                     <label class="label" for="admin-confirm-new-password"><span class="label-text">确认新密码</span></label>
                                     <input type="password" id="admin-confirm-new-password" required minlength="6" class="input input-bordered w-full">
-                                </div>
+                                </div >
                                 <div class="card-actions mt-2">
                                     <button type="submit" class="btn btn-primary w-full">
                                         <i data-lucide="key" class="w-4 h-4"></i> 修改管理员密码
                                     </button>
-                                </div>
+                                </div >
                             </form>
-                        </div>
+                        </div >
                         <div class="card bg-base-100 shadow-xl">
                             <div class="card-body p-6">
                                 <h3 class="card-title text-xl font-semibold text-base-content border-b border-base-300 pb-3">核心服务日志 (最新 50 行)</h3>
@@ -544,25 +534,25 @@
                                     <div class="btn-group flex-wrap gap-1">
                                         <button onclick="fetchServiceLogs('wss')" class="btn btn-ghost btn-sm">WSS Proxy</button>
                                         <button onclick="fetchServiceLogs('stunnel4')" class="btn btn-ghost btn-sm">Stunnel4</button>
-                                        <button onclick="fetchServiceLogs('udpgw')" class="btn btn-ghost btn-sm">UDPGW</button>
+                                        <button onclick="fetchServiceLogs('udp_server')" class="btn btn-ghost btn-sm">Native UDPGW</button> <!-- V5.1.1 FIX -->
                                         <button onclick="fetchServiceLogs('wss_panel')" class="btn btn-ghost btn-sm">Web Panel</button>
-                                    </div>
+                                    </div >
                                     <div class="mockup-code bg-gray-800 text-gray-200 text-xs">
                                         <pre id="service-log-content" class="log-pre p-4">请选择服务加载日志...</pre>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
+                                    </div >
+                                </div >
+                            </div >
+                        </div >
                         <div class="card bg-base-100 shadow-xl md:col-span-2">
                             <div class="card-body p-6">
                                 <h3 class="card-title text-xl font-semibold text-base-content border-b border-base-300 pb-3">管理员审计日志 (最新活动)</h3>
                                 <div class="bg-base-200 p-3 rounded-lg max-h-[300px] overflow-y-auto border border-base-300">
                                      <div id="audit-log-content" class="text-xs text-gray-700 space-y-1">正在加载审计日志...</div>
-                                </div>
-                            </div>
-                        </div>
+                                </div >
+                            </div >
+                        </div >
                     </section>
-                </div>
+                </div >
                 
                 <!-- 6. 安全/IP 封禁列表视图 (无布局变化) -->
                 <div id="view-security" class="hidden">
@@ -573,8 +563,8 @@
                             <h3 class="card-title text-xl font-semibold text-base-content border-b border-base-300 pb-3">IPTables 全局封禁 IP 列表</h3>
                             <div id="global-ban-list" class="space-y-3 max-h-96 overflow-y-auto p-3 bg-base-200 rounded-lg border border-base-300">
                                 <p class="text-gray-500">正在加载全局 IP 封禁列表...</p>
-                            </div>
-                        </div>
+                            </div >
+                        </div >
                     </section>
                     <section class="card bg-base-100 shadow-xl">
                         <div class="card-body p-6">
@@ -586,9 +576,9 @@
                                     <i data-lucide="ban" class="w-4 h-4"></i> 全局封禁
                                 </button>
                             </form>
-                        </div>
+                        </div >
                     </section>
-                </div>
+                </div >
                 
                 <!-- 8. 端口配置视图 (无布局变化) -->
                 <div id="view-port-config" class="hidden">
@@ -609,32 +599,32 @@
                                             <span class="label-text">Web 面板端口 (HTTP)</span>
                                         </label>
                                         <input type="number" id="config-panel-port" min="1" max="65535" required class="input input-bordered w-full">
-                                    </div>
+                                    </div >
                                     <div class="form-control">
                                         <label class="label" for="config-wss-http-port">
                                             <span class="label-text">WSS 代理端口 (HTTP)</span>
                                         </label>
                                         <input type="number" id="config-wss-http-port" min="1" max="65535" required class="input input-bordered w-full">
-                                    </div>
+                                    </div >
                                     <div class="form-control">
                                         <label class="label" for="config-wss-tls-port">
                                             <span class="label-text">WSS 代理端口 (TLS/SSL)</span>
                                         </label>
                                         <input type="number" id="config-wss-tls-port" min="1" max="65535" required class="input input-bordered w-full">
-                                    </div>
+                                    </div >
                                     <div class="form-control">
                                         <label class="label" for="config-stunnel-port">
                                             <span class="label-text">Stunnel (SSH/TLS) 端口</span>
                                         </label>
                                         <input type="number" id="config-stunnel-port" min="1" max="65535" required class="input input-bordered w-full">
-                                    </div>
+                                    </div >
                                     <div class="form-control">
                                         <label class="label" for="config-udpgw-port">
-                                            <span class="label-text">UDPGW (Badvpn) 端口</span>
+                                            <span class="label-text">Native UDPGW (BadVPN) 端口</span>
                                         </label>
                                         <input type="number" id="config-udpgw-port" min="1" max="65535" required class="input input-bordered w-full">
-                                    </div>
-                                </div>
+                                    </div >
+                                </div >
                                 <div class="space-y-4 p-4 bg-base-200 rounded-lg border border-base-300">
                                     <h4 class="font-semibold text-lg text-base-content">内部端口 (仅 127.0.0.1)</h4>
                                     <div class="form-control">
@@ -645,7 +635,7 @@
                                         <label class="label">
                                             <span class="label-text-alt">WSS 代理将流量转发到此端口 (通常是 22)。</span>
                                         </label>
-                                    </div>
+                                    </div >
                                     <div class="form-control">
                                         <label class="label" for="config-internal-api-port">
                                             <span class="label-text">内部 API 端口 (Proxy -> Panel)</span>
@@ -654,21 +644,21 @@
                                         <label class="label">
                                             <span class="label-text-alt">此端口 (54322) 不可修改，用于统计。</span>
                                         </label>
-                                    </div>
-                                </div>
-                            </div>
+                                    </div >
+                                </div >
+                            </div >
                             <div class="card-actions mt-6">
                                 <button type="submit" class="btn btn-primary w-full sm:w-auto flex-shrink-0">
                                     <i data-lucide="save" class="w-4 h-4"></i> 保存并重启相关服务
                                 </button>
-                            </div>
+                            </div >
                         </form>
                     </section>
-                </div>
+                </div >
 
 
             </main>
-        </div> 
+        </div > 
 
         <!-- 侧边栏 (Drawer Side) -->
         <aside class="drawer-side z-40">
@@ -678,51 +668,71 @@
                 <li class="mt-4">
                     <a onclick="switchView('dashboard')" class="nav-link text-base active" data-view="dashboard" id="nav-dashboard">
                         <i data-lucide="layout-dashboard" class="w-4 h-4"></i> 仪表盘
-                    </a>
-                </li>
-                <li>
+                    </a >
+                </li >
+                <li >
                     <a onclick="switchView('users')" class="nav-link text-base" data-view="users" id="nav-users">
                         <i data-lucide="users" class="w-4 h-4"></i> 用户管理
-                    </a>
-                </li>
-                <li class="menu-title"><span class="text-base-content/60">隧道管理</span></li>
-                <li>
+                    </a >
+                </li >
+                <li class="menu-title"><span class="text-base-content/60">隧道管理</span></li >
+                <li >
                     <a onclick="switchView('live-ips')" class="nav-link text-base" data-view="live-ips" id="nav-live-ips">
                         <i data-lucide="activity" class="w-4 h-4"></i> 实时连接 IP
-                    </a>
-                </li>
-                <li>
+                    </a >
+                </li >
+                <li >
                     <a onclick="switchView('payload-gen')" class="nav-link text-base" data-view="payload-gen" id="nav-payload-gen">
                         <i data-lucide="flask-conical" class="w-4 h-4"></i> 载荷生成器
-                    </a>
-                </li>
-                <li>
+                    </a >
+                </li >
+                <li >
                     <a onclick="switchView('hosts')" class="nav-link text-base" data-view="hosts" id="nav-hosts">
                         <i data-lucide="globe" class="w-4 h-4"></i> Host 白名单
-                    </a>
-                </li>
-                <li class="menu-title"><span class="text-base-content/60">系统与安全</span></li>
-                 <li>
+                    </a >
+                </li >
+                <li class="menu-title"><span class="text-base-content/60">系统与安全</span></li >
+                 <li >
                     <a onclick="switchView('port-config')" class="nav-link text-base" data-view="port-config" id="nav-port-config">
                         <i data-lucide="plug-zap" class="w-4 h-4"></i> 端口配置
-                    </a>
-                </li>
-                <li>
+                    </a >
+                </li >
+                <li >
                     <a onclick="switchView('security')" class="nav-link text-base" data-view="security" id="nav-security">
                         <i data-lucide="shield-alert" class="w-4 h-4"></i> 全局 IP 封禁
-                    </a>
-                </li>
-                <li>
+                    </a >
+                </li >
+                <li >
                     <a onclick="switchView('settings')" class="nav-link text-base" data-view="settings" id="nav-settings">
                         <i data-lucide="settings" class="w-4 h-4"></i> 系统配置/日志
-                    </a>
-                </li>
+                    </a >
+                </li >
             </ul>
         </aside>
-    </div>
+    </div >
 
-    <!-- MODALS (无变化) -->
+    <!-- MODALS (新增连接详情模态框) -->
     
+    <!-- "连接详情" 模态框 [AXIOM V5.2] -->
+    <dialog id="connection-details-modal" class="modal">
+        <div class="modal-box max-w-3xl">
+            <h3 class="text-xl font-bold mb-4 border-b pb-2">实时连接详情：<span id="modal-username-connection" class="text-primary"></span></h3>
+            <p id="connection-loading" class="text-gray-500 mb-4">正在查询活跃连接...</p>
+            
+            <div id="connection-list-container" class="space-y-3 max-h-[50vh] overflow-y-auto">
+                <!-- JS 将在此处填充连接列表 -->
+            </div>
+
+            <div class="modal-action mt-6">
+                <button type="button" onclick="closeModal('connection-details-modal')" class="btn btn-ghost">关闭</button>
+            </div>
+        </div>
+        <form method="dialog" class="modal-backdrop">
+            <button>close</button>
+        </form>
+    </dialog>
+
+
     <!-- "添加用户" 模态框 -->
     <dialog id="add-user-modal" class="modal">
         <!-- ... [保留的 "添加用户" 模态框] ... -->
@@ -733,27 +743,27 @@
                     <div class="form-control md:col-span-2">
                         <label class="label" for="new-username"><span class="label-text">用户名 (Username)</span></label>
                         <input type="text" id="new-username" placeholder="用户名 (Username)" required class="input input-bordered w-full">
-                    </div>
+                    </div >
                     <div class="form-control md:col-span-2">
                         <label class="label" for="new-password"><span class="label-text">密码 (Password)</span></label>
                         <input type="password" id="new-password" placeholder="密码 (Password)" required class="input input-bordered w-full">
-                    </div>
+                    </div >
                     <div class="form-control md:col-span-1">
                         <label class="label" for="expiration-days"><span class="label-text">有效期 (天)</span></label>
                         <input type="number" id="expiration-days" value="365" min="1" required class="input input-bordered w-full" aria-label="用户有效期，单位天">
-                    </div>
+                    </div >
                     <div class="form-control md:col-span-1">
                         <label class="label" for="quota-gb"><span class="label-text">配额 (GB, 0=∞)</span></label>
                         <input type="number" id="quota-gb" value="0" min="0" required class="input input-bordered w-full" aria-label="用户流量配额，单位GB">
-                    </div>
+                    </div >
                     <div class="form-control md:col-span-2">
                         <label class="label" for="rate-kbps"><span class="label-text">限速 (KB/s, 0=∞)</span></label>
                         <input type="number" id="rate-kbps" value="0" min="0" required class="input input-bordered w-full" aria-label="用户最大速度，单位KB/秒">
-                    </div>
+                    </div >
                     <div class="form-control md:col-span-2">
                         <label class="label" for="new-max-connections"><span class="label-text">并发连接数 (0=∞)</span></label>
                         <input type="number" id="new-max-connections" value="2" min="0" required class="input input-bordered w-full" aria-label="并发连接数限制">
-                    </div>
+                    </div >
                     <div class="form-control md:col-span-2">
                         <label class="label" for="new-connect-token"><span class="label-text">Base64 连接令牌</span></label>
                         <div class="token-input-group">
@@ -761,29 +771,29 @@
                             <button type="button" onclick="copyToClipboard('new-connect-token', '连接令牌已复制')" class="btn btn-primary btn-square btn-sm flex-shrink-0" aria-label="复制连接令牌">
                                 <i data-lucide="copy" class="w-4 h-4"></i>
                             </button>
-                        </div>
-                    </div>
+                        </div >
+                    </div >
                     <div class="form-control md:col-span-1 md:self-center">
                         <label class="label cursor-pointer" for="new-require-auth">
                             <span class="label-text">需要认证头</span>
                         </label>
                         <input type="checkbox" id="new-require-auth" class="toggle toggle-primary toggle-sm" checked>
-                    </div>
+                    </div >
                     <div class="form-control md:col-span-1 md:self-center">
                         <label class="label cursor-pointer" for="new-allow-shell">
                             <span class="label-text">允许 Shell (444)</span>
                         </label>
                         <input type="checkbox" id="new-allow-shell" class="toggle toggle-secondary toggle-sm">
-                    </div>
-                </div>
+                    </div >
+                </div >
                 <div class="modal-action mt-6">
                     <button type="button" onclick="closeModal('add-user-modal')" class="btn btn-ghost">取消</button>
                     <button type="submit" class="btn btn-success">
                         <i data-lucide="user-plus" class="w-4 h-4"></i> 创建用户
                     </button>
-                </div>
+                </div >
             </form>
-        </div>
+        </div >
         <form method="dialog" class="modal-backdrop">
             <button>close</button>
         </form>
@@ -800,21 +810,21 @@
                     <div class="form-control">
                         <label class="label" for="modal-expiry-date"><span class="label-text">到期日期 (YYYY-MM-DD, 永不留空)</span></label>
                         <input type="date" id="modal-expiry-date" class="input input-bordered w-full">
-                    </div>
+                    </div >
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div class="form-control">
                             <label class="label" for="modal-quota-gb"><span class="label-text">流量限额 (GB, 0=无限制)</span></label>
                             <input type="number" id="modal-quota-gb" min="0" required class="input input-bordered w-full">
-                        </div>
+                        </div >
                         <div class="form-control">
                             <label class="label" for="modal-rate-kbps"><span class="label-text">最大速度 (KB/s, 0=无限制)</span></label>
                             <input type="number" id="modal-rate-kbps" min="0" required class="input input-bordered w-full">
-                        </div>
-                    </div>
+                        </div >
+                    </div >
                     <div class="form-control">
                         <label class="label" for="modal-max-connections"><span class="label-text">并发连接数 (0=无限制)</span></label>
                         <input type="number" id="modal-max-connections" value="2" min="0" required class="input input-bordered w-full" aria-label="并发连接数限制">
-                    </div>
+                    </div >
                     <div class="form-control">
                         <label class="label cursor-pointer">
                             <span class="label-text">需要 Proxy-Authorization 认证</span>
@@ -823,7 +833,7 @@
                         <label class="label">
                             <span class="label-text-alt text-gray-500">禁用后，客户端可通过 URI 参数 `/?user=<username>` 连接。</span>
                         </label>
-                    </div>
+                    </div >
                     <div class="form-control">
                         <label class="label cursor-pointer">
                             <span class="label-text">允许 Shell 访问 (用于 444 Stunnel)</span>
@@ -832,7 +842,7 @@
                         <label class="label">
                             <span class="label-text-alt text-gray-500">启用后，此用户将获得系统 Shell 权限。</span>
                         </label>
-                    </div>
+                    </div >
                     <div class="border-t pt-4">
                         <h4 class="font-bold mb-2">连接信息与密码</h4>
                         <div class="form-control mb-4">
@@ -842,20 +852,20 @@
                                 <button type="button" onclick="copyToClipboard('modal-connect-token', '连接令牌已复制')" class="btn btn-primary btn-square btn-sm flex-shrink-0" aria-label="复制连接令牌">
                                     <i data-lucide="copy" class="w-4 h-4"></i>
                                 </button>
-                            </div>
+                            </div >
                             <label class="label">
                                 <span class="label-text-alt text-gray-500 mt-1">格式: `username:password` 的 Base64 编码。修改下方密码时自动生成。</span>
                             </label>
-                        </div>
+                        </div >
                         <div class="form-control">
                             <label class="label" for="modal-new-password"><span class="label-text">修改密码 (选填)</span></label>
                             <input type="password" id="modal-new-password" placeholder="留空则不修改" class="input input-bordered w-full">
                             <label class="label">
                                 <span class="label-text-alt text-gray-500 mt-1">注意：修改密码后，所有该用户当前活跃的连接将被强制断开。</span>
                             </label>
-                        </div>
-                    </div>
-                </div>
+                        </div >
+                    </div >
+                </div >
                 <div class="modal-action mt-6 flex flex-col sm:flex-row justify-between w-full gap-3">
                     <button type="button" onclick="confirmAction(document.getElementById('modal-username-setting').value, null, null, 'resetTraffic', '重置流量')" 
                             class="btn btn-warning w-full sm:w-auto">
@@ -866,10 +876,10 @@
                         <button type="submit" class="btn btn-primary">
                             <i data-lucide="save" class="w-4 h-4"></i> 保存设置
                         </button>
-                    </div>
-                </div>
+                    </div >
+                </div >
             </form>
-        </div>
+        </div >
         <form method="dialog" class="modal-backdrop">
             <button>close</button>
         </form>
@@ -881,12 +891,12 @@
             <h3 class="text-xl font-bold mb-4 border-b pb-2">用户 <span id="traffic-chart-username-title" class="text-primary"></span> 的30天流量历史</h3>
             <div class="relative h-64 md:h-96">
                 <canvas id="trafficChartCanvas"></canvas>
-            </div>
+            </div >
             <p id="traffic-chart-loading" class="text-center text-gray-500 mt-4">正在加载流量数据...</p>
             <div class="modal-action mt-6">
                 <button type="button" onclick="closeModal('traffic-chart-modal')" class="btn btn-ghost">关闭</button>
-            </div>
-        </div>
+            </div >
+        </div >
         <form method="dialog" class="modal-backdrop">
             <button>close</button>
         </form>
@@ -900,12 +910,12 @@
             <div class="modal-action">
                 <button type="button" onclick="closeModal('confirm-modal')" class="btn btn-ghost">取消</button>
                 <button type="button" id="confirm-action-btn" class="btn btn-error">确认</button>
-            </div>
+            </div >
             <input type="hidden" id="confirm-param1">
             <input type="hidden" id="confirm-param2">
             <input type="hidden" id="confirm-param3">
             <input type="hidden" id="confirm-type">
-        </div>
+        </div >
         <form method="dialog" class="modal-backdrop">
             <button>close</button>
         </form>
@@ -913,5 +923,5 @@
     
     <script src="app.js" defer></script>
 
-</body>
-</html>
+</body >
+</html >
