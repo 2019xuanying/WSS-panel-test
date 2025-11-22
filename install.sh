@@ -4,12 +4,12 @@
 set -eu
 
 # ==========================================================
-# WSS 隧道与用户管理面板模块化部署脚本
-# V2.1.2 (Axiom Refactor - Auto Firewall Open)
+# WSS 基础设施配置 (Axiom V5.5 - Final Deployment Script)
 #
-# [AXIOM V5.4 CHANGELOG]
-# - [FEATURE] 自动开放所有 WSS/Panel/Stunnel/UDPGW 所需的外部端口 (TCP/UDP)。
-# - 修复了由于 IPTables 默认策略限制导致面板无法访问的问题。
+# [AXIOM V5.5 CHANGELOG]
+# - 确保 Sysctl 网络参数在安装时立即生效。
+# - 确保 Native UDPGW 服务配置正确。
+# - 清理和启动顺序优化。
 # ==========================================================
 
 
@@ -61,7 +61,7 @@ touch "$WSS_LOG_FILE"
 # [AXIOM V2.0] 交互式端口和用户配置
 # =============================
 echo "----------------------------------"
-echo "==== WSS 基础设施配置 (V5.4 Auto Firewall) ===="
+echo "==== WSS 基础设施配置 (V5.5) ===="
 echo "请确认或修改以下端口和服务用户设置 (回车以使用默认值)。"
 
 # 1. 端口
@@ -131,7 +131,7 @@ fi
 
 
 echo "----------------------------------"
-echo "==== 系统清理与依赖检查 (V5.4) ===="
+echo "==== 系统清理与依赖检查 (V5.5) ===="
 # 停止所有相关服务并清理旧文件
 systemctl stop wss stunnel4 udpgw udp_server wss_panel sshd_stunnel || true
 
@@ -223,6 +223,7 @@ CMD_GETENT=$(command -v getent)
 CMD_SED=$(command -v sed)
 
 tee "$SUDOERS_FILE" > /dev/null <<EOF
+# [AXIOM V5.5] 修正 systemctl 的 NOPASSWD 条目，与 safeRunCommand 保持一致
 $panel_user ALL=(ALL) NOPASSWD: $CMD_USERADD
 $panel_user ALL=(ALL) NOPASSWD: $CMD_USERMOD
 $panel_user ALL=(ALL) NOPASSWD: $CMD_USERDEL
@@ -277,6 +278,7 @@ net.core.rmem_default = 8388608
 net.core.wmem_default = 8388608
 # WSS_NET_END
 EOF
+# [AXIOM V5.5 FIX] 确保 sysctl -p 在 sed 之后被正确执行
 sysctl -p > /dev/null
 echo "----------------------------------"
 
@@ -429,32 +431,12 @@ echo "----------------------------------"
 
 
 # =============================
-# Systemd 重载与启动 (FIXED SEQUENCE)
-# =============================
-echo "==== Systemd 重载配置并按依赖顺序启动服务 ===="
-systemctl daemon-reload
-echo "Systemd 配置已重载。开始启动..."
-
-# 1. 启动 WSS Panel (主控平面 - 其他服务的依赖)
-systemctl enable wss_panel
-systemctl start wss_panel
-
-# 2. 启动 Native UDPGW (依赖 WSS Panel)
-systemctl enable udp_server 
-systemctl start udp_server
-
-# 3. 启动 WSS Proxy (依赖 WSS Panel)
-systemctl enable wss
-systemctl start wss
-
-echo "----------------------------------"
-
-
-# =============================
 # SSHD 配置
 # =============================
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_SERVICE=$(systemctl list-units --full -all | grep -q "sshd.service" && echo "sshd" || echo "ssh")
+
+# [AXIOM V5.5 FIX] 还原主 SSHD 配置
 sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
 if ! grep -q "^Port $INTERNAL_FORWARD_PORT" "$SSHD_CONFIG" && [ "$INTERNAL_FORWARD_PORT" != "22" ]; then
     sed -i -E "/^[#\s]*Port /d" "$SSHD_CONFIG"
@@ -507,9 +489,31 @@ systemctl restart "$SSHD_SERVICE"
 systemctl enable sshd_stunnel
 systemctl restart sshd_stunnel
 
+echo "----------------------------------"
+
+
+# =============================
+# Systemd 重载与启动 (FIXED SEQUENCE)
+# =============================
+echo "==== Systemd 重载配置并按依赖顺序启动服务 ===="
+systemctl daemon-reload
+echo "Systemd 配置已重载。开始启动..."
+
+# 1. 启动 WSS Panel (主控平面 - 其他服务的依赖)
+systemctl enable wss_panel
+systemctl restart wss_panel
+
+# 2. 启动 Native UDPGW (依赖 WSS Panel)
+systemctl enable udp_server 
+systemctl restart udp_server
+
+# 3. 启动 WSS Proxy (依赖 WSS Panel)
+systemctl enable wss
+systemctl restart wss
+
 # Final Restart (确保 stunnel4 也在最后重启)
 systemctl restart stunnel4 
 
 echo "=================================================="
-echo "✅ 部署完成！(Axiom V5.4 - Final Fix)"
+echo "✅ 部署完成！(Axiom V5.5 - Final Fix)"
 echo "=================================================="
