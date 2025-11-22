@@ -1,0 +1,23 @@
+[Unit]
+Description=Xray Core (VLESS/VMess over WS+TLS)
+After=network.target
+
+[Service]
+Type=simple
+# [V6.0] Xray Core 二进制文件通常安装在 /usr/local/bin 或 /usr/bin，但在安装脚本中会进行定义。
+# 假设 Xray 的配置文件位于 /etc/wss-panel/xray_config.json
+ExecStart=/usr/local/bin/xray run -c /etc/wss-panel/xray_config.json
+
+# 确保在配置文件中设置了日志路径
+ExecStartPre=/bin/bash -c "mkdir -p /var/log/xray && touch /var/log/xray/access.log && touch /var/log/xray/error.log"
+
+# Xray 最好以非root用户运行，但为简化部署，我们使用root。建议根据实际环境调整。
+User=root
+Group=root
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
