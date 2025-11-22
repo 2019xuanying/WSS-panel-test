@@ -1,0 +1,19 @@
+[Unit]
+Description=WSS SSH-UDP Service (Public Auth UDPGW)
+After=network.target wss_panel.service
+
+[Service]
+Type=simple
+# SSH-UDP (ssh_udp.js) 监听在 0.0.0.0 公网端口，通过配置的 ssh_udp_port 运行
+Environment=PANEL_DIR_ENV=/etc/wss-panel
+Environment=NODE_PATH=/usr/lib/node_modules:/usr/local/lib/node_modules:/etc/wss-panel/node_modules
+ExecStart=/usr/bin/node /etc/wss-panel/ssh_udp.js
+
+# Restart policy
+Restart=always
+RestartSec=3
+# 使用 root 启动以便绑定低端口，但建议在生产环境中改为非 root 用户（或使用 setcap）
+User=root
+
+[Install]
+WantedBy=multi-user.target
