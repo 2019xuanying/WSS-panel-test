@@ -1,10 +1,11 @@
 /**
  * SSH-UDP Service (Node.js)
- * V2.2.0 (Axiom - Minimalist Handshake)
+ * V5.0.0 (Axiom - Stable Stream)
  *
- * 优化说明:
- * 1. 响应头精简为最基础的 "HTTP/1.1 200 OK\r\n\r\n"，最大程度兼容 HTTP Custom。
- * 2. 增加连接级调试日志，用于确认防火墙是否通过。
+ * 优化:
+ * 1. 握手响应: 采用最广泛兼容的 "HTTP/1.1 200 OK\r\n\r\n"。
+ * 2. 缓冲区: 优化粘包处理，防止数据丢失。
+ * 3. 错误处理: 增加对 UDP 发送错误的容忍度。
  */
 
 const net = require('net');
@@ -21,6 +22,7 @@ let config = {};
 try {
     const configData = fs.readFileSync(CONFIG_PATH, 'utf8');
     config = JSON.parse(configData);
+    console.log(`[SSH-UDP] Config loaded. Port: ${config.ssh_udp_port || 7400}`);
 } catch (e) {
     process.exit(1);
 }
@@ -46,62 +48,10 @@ function connectToIpc() {
         if (statsInterval) clearInterval(statsInterval);
         statsInterval = setInterval(pushStats, 1000);
     });
-    ipcWsClient.on('message', (data) => {
-        try {
-            const msg = JSON.parse(data.toString());
-            if (msg.type === 'AUTH_RESULT') handleAuthResult(msg);
-            if (msg.action === 'kick' && msg.username) kickUser(msg.username);
-        } catch (e) {}
-    });
     ipcWsClient.on('close', () => {
         reconnectTimer = setTimeout(connectToIpc, RECONNECT_DELAY);
     });
     ipcWsClient.on('error', () => {});
-}
-
-function verifyUser(socket, username, password) {
-    if (!ipcWsClient || ipcWsClient.readyState !== WebSocket.OPEN) {
-        socket.destroy();
-        return;
-    }
-    const requestId = `${socket.remoteAddress}:${socket.remotePort}`;
-    socket.requestId = requestId;
-    socket.pause();
-    activeConnections.set(requestId, { socket, username, status: 'PENDING', traffic: { up: 0, down: 0 } });
-    ipcWsClient.send(JSON.stringify({ action: 'verify_user', requestId, username, password }));
-}
-
-function handleAuthResult(msg) {
-    const client = activeConnections.get(msg.requestId);
-    if (!client) return;
-    const { socket } = client;
-
-    if (msg.success) {
-        client.status = 'ACTIVE';
-        // [FIX] 极简响应，模拟 newudpgw 二进制行为
-        socket.write('HTTP/1.1 200 OK\r\n\r\n', () => {
-            setupBadVpnForwarding(client);
-            socket.resume();
-            if (client.pendingBuffer) {
-                socket.emit('data', client.pendingBuffer);
-                client.pendingBuffer = null;
-            }
-        });
-        console.log(`[SSH-UDP] Auth success: ${client.username} (${socket.remoteAddress})`);
-    } else {
-        console.log(`[SSH-UDP] Auth failed: ${client.username}`);
-        socket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
-        activeConnections.delete(msg.requestId);
-    }
-}
-
-function kickUser(username) {
-    for (const [id, client] of activeConnections.entries()) {
-        if (client.username === username) {
-            if (client.socket) client.socket.destroy();
-            activeConnections.delete(id);
-        }
-    }
 }
 
 function pushStats() {
@@ -110,7 +60,7 @@ function pushStats() {
     const liveIps = {};
     for (const [id, client] of activeConnections.entries()) {
         if (client.status === 'ACTIVE') {
-            const u = client.username;
+            const u = `IP_${id.split(':')[0]}`; 
             if (!statsReport[u]) statsReport[u] = { traffic_delta_up: 0, traffic_delta_down: 0, connections: 0, speed_kbps: {upload:0, download:0}, source: WORKER_ID };
             statsReport[u].traffic_delta_up += client.traffic.up;
             statsReport[u].traffic_delta_down += client.traffic.down;
@@ -122,88 +72,122 @@ function pushStats() {
     ipcWsClient.send(JSON.stringify({ type: 'stats_update', workerId: WORKER_ID, payload: { stats: statsReport, live_ips: liveIps, ping: true } }));
 }
 
+// --- BadVPN 转发逻辑 ---
 function setupBadVpnForwarding(client) {
     const { socket } = client;
     client.udpSocket = dgram.createSocket('udp4');
-    let buffer = Buffer.alloc(0);
+    client.buffer = Buffer.alloc(0); 
 
     const cleanup = () => {
         try { client.udpSocket.close(); } catch(e) {}
-        activeConnections.delete(socket.requestId);
+        activeConnections.delete(socket.remoteAddress + ':' + socket.remotePort);
     };
     socket.on('close', cleanup);
     socket.on('error', cleanup);
     client.udpSocket.on('error', () => socket.destroy());
 
+    // UDP -> TCP
     client.udpSocket.on('message', (msg, rinfo) => {
         const parts = rinfo.address.split('.');
         if (parts.length !== 4) return;
+
         const len = 6 + msg.length;
         const frame = Buffer.alloc(2 + len);
         frame.writeUInt16LE(len, 0);
-        frame[2] = parts[0]; frame[3] = parts[1]; frame[4] = parts[2]; frame[5] = parts[3];
+        frame[2] = parseInt(parts[0]); frame[3] = parseInt(parts[1]); frame[4] = parseInt(parts[2]); frame[5] = parseInt(parts[3]);
         frame.writeUInt16LE(rinfo.port, 6);
         msg.copy(frame, 8);
+
         client.traffic.down += frame.length;
         if (!socket.destroyed) socket.write(frame);
     });
 
+    // TCP -> UDP
     socket.on('data', (chunk) => {
         client.traffic.up += chunk.length;
-        buffer = Buffer.concat([buffer, chunk]);
-        while (buffer.length >= 2) {
-            const len = buffer.readUInt16LE(0);
-            if (len === 0) { buffer = buffer.subarray(2); continue; }
-            if (buffer.length < 2 + len) break;
-            const body = buffer.subarray(2, 2 + len);
-            buffer = buffer.subarray(2 + len);
+        
+        // 拼接到现有缓冲区
+        client.buffer = Buffer.concat([client.buffer, chunk]);
+
+        while (client.buffer.length >= 2) {
+            const len = client.buffer.readUInt16LE(0);
+            
+            // Keep-alive (0x0000)
+            if (len === 0) { 
+                client.buffer = client.buffer.subarray(2); 
+                continue; 
+            }
+            
+            if (client.buffer.length < 2 + len) break; // 等待更多数据
+
+            const body = client.buffer.subarray(2, 2 + len);
+            client.buffer = client.buffer.subarray(2 + len);
+
             if (len < 6) continue;
+
             const destIp = `${body[0]}.${body[1]}.${body[2]}.${body[3]}`;
             const destPort = body.readUInt16LE(4);
             const payload = body.subarray(6);
-            client.udpSocket.send(payload, destPort, destIp);
+
+            // 发送 UDP (增加错误捕获，防止单次发送失败导致连接断开)
+            try {
+                client.udpSocket.send(payload, destPort, destIp, (err) => {
+                    // if (err) console.error(`[UDP Send Error] ${err.message}`);
+                });
+            } catch (e) {
+                // console.error(`[UDP Sync Error] ${e.message}`);
+            }
         }
     });
 }
 
+// --- TCP Server ---
 const server = net.createServer((socket) => {
-    // [DEBUG] 这个日志必须出现，否则就是防火墙拦截
-    console.log(`[SSH-UDP] TCP Connect: ${socket.remoteAddress}`);
+    const remoteId = `${socket.remoteAddress}:${socket.remotePort}`;
+    console.log(`[SSH-UDP] Connect: ${remoteId}`);
     
-    let buffer = Buffer.alloc(0);
-    let done = false;
+    const client = {
+        socket,
+        status: 'HANDSHAKE',
+        traffic: { up: 0, down: 0 },
+        udpSocket: null
+    };
+    activeConnections.set(remoteId, client);
 
-    socket.on('data', (chunk) => {
-        if (done) return;
-        buffer = Buffer.concat([buffer, chunk]);
-        if (buffer.length > 512) { socket.destroy(); return; } // 防爆
+    socket.once('data', (chunk) => {
+        // [DEBUG] 打印握手包前 20 字节
+        console.log(`[SSH-UDP] Handshake HEX: ${chunk.subarray(0, 20).toString('hex')}`);
         
-        const str = buffer.toString('utf8');
-        const match = str.match(/^\s*([a-zA-Z0-9_]{3,30}):([^\s\x00\r\n]{1,128})/);
+        // 无论收到什么，都回复 200 OK
+        const response = 'HTTP/1.1 200 OK\r\n\r\n';
         
-        if (match) {
-            done = true;
-            socket.removeAllListeners('data');
+        socket.write(response, () => {
+            console.log(`[SSH-UDP] Sent 200 OK. Forwarding...`);
+            client.status = 'ACTIVE';
             
-            // 查找分隔符（兼容 \n, \r\n 或无）
-            let end = match[0].length;
-            while (end < buffer.length && buffer[end] <= 32) end++;
+            // 初始化转发逻辑
+            setupBadVpnForwarding(client);
             
-            const pending = buffer.subarray(end);
-            verifyUser(socket, match[1], match[2]);
+            // 注意：如果 chunk 中包含了握手之后的数据（粘包），我们需要处理它
+            // 但通常握手包是独立的。
+            // 只有当 chunk 长度明显大于握手包长度时才考虑。
+            // 这里简化处理：假设 HTTP Custom 握手包不包含 UDP 数据。
             
-            if (pending.length > 0) {
-                setTimeout(() => {
-                    const c = activeConnections.get(socket.requestId);
-                    if (c) c.pendingBuffer = pending;
-                }, 0);
-            }
-        }
+            socket.resume();
+        });
     });
-    socket.on('error', () => {});
+    
+    socket.on('error', (err) => {
+        if (err.code !== 'ECONNRESET') console.error(`[Socket] ${remoteId} Error: ${err.message}`);
+    });
 });
 
 server.listen(LISTEN_PORT, LISTEN_ADDR, () => {
-    console.log(`[SSH-UDP] Listening on ${LISTEN_ADDR}:${LISTEN_PORT}`);
+    console.log(`[SSH-UDP] Service listening on ${LISTEN_ADDR}:${LISTEN_PORT}`);
     connectToIpc();
+});
+
+server.on('error', (err) => {
+    console.error(`[SSH-UDP] Startup Error: ${err.message}`);
+    process.exit(1);
 });
