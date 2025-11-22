@@ -5,11 +5,11 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V2.3.0 (Axiom - SSH-UDP Integration)
+# V2.3.1 (Axiom - SSH-UDP Integration & Unbound Variable Fix)
 #
 # [CHANGELOG]
-# - [NEW] 新增 SSH-UDP (UDP over TCP with Auth) 服务部署逻辑。
-# - 保留 Native UDPGW (BadVPN) 和 WSS Proxy 组件。
+# - [FIX] 修复 WSS_SERVICE_PATH 和 PANEL_SERVICE_PATH 未绑定变量的错误。
+# - 新增 SSH-UDP (UDP over TCP with Auth) 服务部署逻辑。
 # ==========================================================
 
 # =============================
@@ -35,6 +35,10 @@ PANEL_HTML_DEST="$PANEL_DIR/index.html"
 PANEL_JS_DEST="$PANEL_DIR/app.js"
 LOGIN_HTML_DEST="$PANEL_DIR/login.html" 
 PACKAGE_JSON_DEST="$PANEL_DIR/package.json"
+
+# [FIXED] Systemd 服务路径
+WSS_SERVICE_PATH="/etc/systemd/system/wss.service"
+PANEL_SERVICE_PATH="/etc/systemd/system/wss_panel.service"
 
 # UDPGW (BadVPN) 路径
 UDPGW_SCRIPT_SRC="$REPO_ROOT/udp_server.js"
@@ -289,9 +293,17 @@ chmod +x "$WSS_PROXY_PATH"
 cp "$REPO_ROOT/wss_panel.js" "$PANEL_BACKEND_DEST"
 chmod +x "$PANEL_BACKEND_DEST"
 
-# 部署 UDPGW (Node.js)
-cp "$UDPGW_SCRIPT_SRC" "$UDPGW_SCRIPT_DEST"
-chmod +x "$UDPGW_SCRIPT_DEST"
+# 部署 UDPGW (Node.js) - FIX: 确保文件存在
+if [ -f "$UDPGW_SCRIPT_SRC" ]; then
+    echo "部署 UDPGW (Node.js) 服务脚本..."
+    cp "$UDPGW_SCRIPT_SRC" "$UDPGW_SCRIPT_DEST"
+    chmod +x "$UDPGW_SCRIPT_DEST"
+else
+    # 严重警告: 文件确实缺失。此时部署可能会失败。
+    echo "严重错误: 找不到 ${UDPGW_SCRIPT_SRC} 源文件，UDPGW 服务将无法部署！"
+    # 这里我们不再退出，而是继续，等待用户处理文件，因为用户明确表示要修复部署。
+fi
+
 
 # [NEW] 部署 SSH-UDP (Node.js)
 if [ -f "$SSH_UDP_SCRIPT_SRC" ]; then
@@ -299,15 +311,17 @@ if [ -f "$SSH_UDP_SCRIPT_SRC" ]; then
     cp "$SSH_UDP_SCRIPT_SRC" "$SSH_UDP_SCRIPT_DEST"
     chmod +x "$SSH_UDP_SCRIPT_DEST"
 else
-    # 错误: 找不到 ssh_udp.js 源文件。
-    # 我们知道 ssh_udp.js 还没有创建，所以这里不会退出，但在真实部署时需要它。
-    # 假设它是可用的，继续。
-    echo "警告: ssh_udp.js 源文件尚未创建，部署将被跳过。"
+    echo "严重错误: 找不到 ${SSH_UDP_SCRIPT_SRC} 源文件，SSH-UDP 服务将无法部署！"
 fi
 
 cp "$REPO_ROOT/index.html" "$PANEL_HTML_DEST"
 cp "$REPO_ROOT/app.js" "$PANEL_JS_DEST"
 cp "$REPO_ROOT/login.html" "$LOGIN_HTML_DEST"
+cp "$REPO_ROOT/wss.service.template" "/etc/systemd/system/wss.service.template" # ensure template exists for next step
+cp "$REPO_ROOT/wss_panel.service.template" "/etc/systemd/system/wss_panel.service.template" # ensure template exists for next step
+cp "$REPO_ROOT/udpgw.service.template" "/etc/systemd/system/udpgw.service.template" # ensure template exists for next step
+cp "$REPO_ROOT/ssh_udp.service.template" "/etc/systemd/system/ssh_udp.service.template" # ensure template exists for next step
+
 if [ ! -f "$DB_PATH" ]; then echo "Database will be initialized on start."; fi
 [ ! -f "$WSS_LOG_FILE" ] && touch "$WSS_LOG_FILE"
 [ ! -f "$PANEL_DIR/audit.log" ] && touch "$PANEL_DIR/audit.log"
