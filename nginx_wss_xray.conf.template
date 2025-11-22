@@ -1,5 +1,5 @@
 # ==========================================================
-# Nginx WSS/Xray 反向代理配置模板 (Axiom V6.0)
+# Nginx WSS/Xray 反向代理配置模板 (Axiom V6.1)
 # 职责: 接管 443 端口，根据 path 将流量分发到 WSS Proxy 或 Xray Core
 # ==========================================================
 
@@ -7,8 +7,8 @@ server {
     listen @NGINX_EXTERNAL_PORT@ ssl http2;
     listen [::]:@NGINX_EXTERNAL_PORT@ ssl http2;
 
-    # 替换为您的域名
-    server_name _; 
+    # [V6.1 Fix] 使用安装时输入的域名进行 SNI 匹配
+    server_name @SERVER_DOMAIN@; 
 
     # --- SSL/TLS 配置 ---
     # 假设 SSL 证书由安装脚本 (install.sh) 生成或放置在以下路径
@@ -28,7 +28,6 @@ server {
     # 1. WSS Proxy 转发 (用于 SSH 隧道)
     # 路径: /wss/
     location /wss/ {
-        # proxy_pass http://127.0.0.1:@INTERNAL_WSS_PORT@;
         proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -64,6 +63,6 @@ server {
     location / {
         # 这是一个伪装/回退网站的配置，您可以替换为实际的静态文件服务
         default_type text/html;
-        return 200 '<html><head><title>Welcome</title></head><body><h1>Welcome!</h1><p>The web server is running.</p></body></html>';
+        return 200 '<html><head><title>Welcome</title></head><body><h1>Welcome!</h1><p>The web server is running on @SERVER_DOMAIN@.</p></body></html>';
     }
 }
