@@ -1,8 +1,7 @@
 <!DOCTYPE html>
 <!-- 
-  V9.0.0 (Axiom Refactor V6.0 - Xray/Nginx Integration UI)
-  - [NEW] 新增端口配置视图，包含 Nginx/Xray 内部端口和 Nginx 启用开关。
-  - [FIX] 更新系统配置视图，包含 Nginx 启用开关。
+  V9.0.1 (Axiom Refactor V6.1 - Xray Node Output)
+  - [NEW] 在 Payload 视图中添加 Xray 节点信息按钮和模态框。
 -->
 <html lang="zh-CN" data-theme="light">
 <head>
@@ -56,10 +55,9 @@
         <!-- ======================= -->
         <div class="drawer-content flex flex-col">
             
-            <!-- Header / 导航栏 (DaisyUI Navbar) -->
+            <!-- Header / 导航栏 (Navbar) -->
             <header class="navbar bg-base-100/80 backdrop-blur-md sticky top-0 z-30 shadow-sm border-b border-base-300/50">
-                <!-- ... [Header 内容] ... -->
-                 <div class="flex-none lg:hidden">
+                <div class="flex-none lg:hidden">
                     <label for="my-drawer-2" class="btn btn-ghost btn-square drawer-button">
                         <i data-lucide="menu" class="w-6 h-6"></i>
                     </label>
@@ -287,7 +285,26 @@
                 
                 <!-- 7. 载荷生成器 -->
                 <div id="view-payload-gen" class="hidden">
-                    <h2 class="text-2xl font-bold text-base-content mb-6">🧬 载荷 (Payload) 生成器</h2>
+                    <h2 class="text-2xl font-bold text-base-content mb-6">🧬 节点信息输出与载荷生成器</h2>
+                    
+                    <section class="mb-6 grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div class="card bg-base-100 shadow-xl p-4">
+                             <h3 class="font-bold text-lg mb-2">Xray VLESS 节点 (混淆模式)</h3>
+                             <p class="text-xs text-gray-500 mb-3">Nginx/Xray 部署成功后，点击此处获取 VLESS-WS-TLS 连接信息。</p>
+                             <button onclick="showXrayModal()" class="btn btn-accent w-full">
+                                 <i data-lucide="package" class="w-4 h-4"></i> 查看 VLESS 节点配置
+                             </button>
+                        </div>
+                        <div class="card bg-base-100 shadow-xl p-4">
+                             <h3 class="font-bold text-lg mb-2">SSH 隧道配置 (直连模式)</h3>
+                             <p class="text-xs text-gray-500 mb-3">适用于 HTTP Injector / KPN Tunnel 等客户端。</p>
+                             <button onclick="switchView('payload-gen')" class="btn btn-secondary w-full">
+                                 <i data-lucide="chevron-right" class="w-4 h-4"></i> 继续生成 SSH 载荷
+                             </button>
+                        </div>
+                    </section>
+                    
+                    <!-- 原始的 Payload Gen 区域 -->
                     <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
                         <div class="card bg-base-100 shadow-xl">
                             <div class="card-body p-6">
@@ -351,7 +368,7 @@
                                     <select id="payload-split-method" class="select select-bordered w-full" disabled>
                                         <option value="normal">正常 (R1 [split] R2)</option>
                                     </select>
-                                </div>
+                                </div >
                                 <div class="form-control">
                                     <label class="label"><span class="label-text">Request 2 额外的头</span></label>
                                     <div class="grid grid-cols-2 gap-x-4 gap-y-2">
@@ -465,8 +482,8 @@
                                 </div >
                             </div >
                         </div >
-                    </div >
-                </div >
+                    </div>
+                </div>
 
 
                 <!-- 5. 系统配置/日志视图 -->
@@ -925,6 +942,38 @@
                 <button type="button" onclick="closeModal('traffic-chart-modal')" class="btn btn-ghost">关闭</button>
             </div >
         </div >
+        <form method="dialog" class="modal-backdrop">
+            <button>close</button>
+        </form>
+    </dialog>
+
+    <!-- Xray VLESS 配置模态框 [V6.1 New] -->
+    <dialog id="xray-config-modal" class="modal">
+        <div class="modal-box max-w-3xl">
+            <h3 class="text-xl font-bold mb-4 border-b pb-2">Xray VLESS (WS + TLS) 节点信息</h3>
+            <p class="text-sm text-warning mb-4">
+                注意：Xray 模式下，所有用户共用一个 VLESS UUID。请使用客户端支持的方式复制。
+            </p>
+            
+            <div class="form-control mb-4">
+                <label class="label" for="xray-link-output"><span class="label-text font-bold">VLESS URI 链接 (推荐)</span></label>
+                <div class="token-input-group">
+                    <input type="text" id="xray-link-output" readonly class="input input-bordered w-full font-mono text-sm bg-base-200">
+                    <button type="button" onclick="copyToClipboard('xray-link-output', 'VLESS 链接已复制')" class="btn btn-primary btn-square btn-sm flex-shrink-0" aria-label="复制 VLESS 链接">
+                        <i data-lucide="copy" class="w-4 h-4"></i>
+                    </button>
+                </div>
+            </div>
+            
+            <div class="form-control">
+                <label class="label" for="xray-details-output"><span class="label-text font-bold">详细配置 (JSON 格式)</span></label>
+                <textarea id="xray-details-output" readonly class="textarea textarea-bordered w-full font-mono text-xs" rows="10"></textarea>
+            </div>
+
+            <div class="modal-action mt-6">
+                <button type="button" onclick="closeModal('xray-config-modal')" class="btn btn-ghost">关闭</button>
+            </div>
+        </div>
         <form method="dialog" class="modal-backdrop">
             <button>close</button>
         </form>
