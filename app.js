@@ -1,10 +1,9 @@
 /**
- * WSS Panel Frontend (Axiom Refactor V6.0 - Realtime Push Optimization)
+ * WSS Panel Frontend (Axiom Refactor V6.2 - Button Fix & Scroll)
  *
- * [AXIOM V6.0 CHANGELOG]
- * - OPTIMIZE: 强化 handleSilentUpdate，通过直接操作 DOM 元素（而不是重绘整个列表）来最小化 CPU 使用率。
- * - NEW: CORE_SERVICES_MAP 增加 'xray' 服务。
- * - PREP: 在配置中增加 internal_wss_port, xray_internal_port, nginx_enabled 字段，以支持后续的 Xray/Nginx 集成。
+ * [AXIOM V6.2 CHANGELOG]
+ * - FIX: 修复 showXrayModal 函数内部可能存在的配置未加载导致的异常。
+ * - FIX: 修复 switchView('payload-gen') 按钮点击无反应的问题，现在可以平滑滚动到载荷区域。
  */
 
 // --- 全局配置 (将由 initializeApp 异步填充) ---
@@ -16,10 +15,12 @@ let FLASK_CONFIG = {
     STUNNEL_PORT: "...",
     UDPGW_PORT: "...",
     SSH_UDP_PORT: "...",
-    INTERNAL_WSS_PORT: "...", // [NEW V6.0]
-    XRAY_INTERNAL_PORT: "...", // [NEW V6.0]
+    INTERNAL_WSS_PORT: "...", 
+    XRAY_INTERNAL_PORT: "...", 
     PANEL_PORT: "...",
-    NGINX_ENABLED: 0 // [NEW V6.0]
+    NGINX_ENABLED: 0,
+    SERVER_DOMAIN: "example.com", // [V6.1] 新增
+    XRAY_UUID: "..." // [V6.1] 新增
 };
 
 // --- 全局变量 ---
@@ -203,6 +204,12 @@ function switchView(viewId) {
     
     // 按需加载数据
     if (viewId === 'payload-gen') {
+        // [V6.2 FIX] 切换到 payload-gen 视图后，滚动到载荷生成区域，以解决按钮无反应的错觉
+        const payloadSection = document.querySelector('#view-payload-gen .grid.grid-cols-1.lg\\:grid-cols-3');
+        if (payloadSection) {
+            payloadSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+        
         if (allUsersCache.length > 0) {
             populatePayloadUserSelect();
         } else {
@@ -495,7 +502,9 @@ async function fetchAllStaticData() {
                 SSH_UDP_PORT: data.config.ssh_udp_port,
                 INTERNAL_WSS_PORT: data.config.internal_wss_port, // [NEW V6.0] Load new port
                 XRAY_INTERNAL_PORT: data.config.xray_internal_port, // [NEW V6.0] Load new port
-                PANEL_PORT: data.config.panel_port
+                PANEL_PORT: data.config.panel_port,
+                SERVER_DOMAIN: data.config.server_domain, // [V6.1] Load new field
+                XRAY_UUID: data.config.xray_uuid // [V6.1] Load new field
             };
         }
         
@@ -1457,6 +1466,61 @@ function generateBase64Token(username, password) {
     }
 }
 
+/**
+ * [V6.1 NEW] 显示 Xray VLESS 节点配置
+ */
+async function showXrayModal() {
+    
+    // [V6.2 FIX] 增加健壮性检查
+    if (!FLASK_CONFIG.SERVER_DOMAIN || !FLASK_CONFIG.XRAY_UUID) {
+        showStatus('配置数据未加载或缺失 (域名/UUID)。请确保安装完成并刷新页面。', false);
+        return;
+    }
+    if (FLASK_CONFIG.NGINX_ENABLED !== 1) {
+        showStatus('Nginx/Xray 混淆模式未启用，请先在“系统配置/日志”中启用。', false);
+        return;
+    }
+
+    try {
+        // 1. 获取最新配置，确保 UUID 和 DOMAIN 是最新的
+        const configData = await fetchData('/settings/config');
+        if (!configData || !configData.config || !configData.config.xray_uuid || !configData.config.server_domain) {
+            throw new Error('Xray 核心配置缺失。');
+        }
+        
+        const { xray_uuid, server_domain, nginx_external_port } = configData.config;
+        
+        // 2. 构造 VLESS URI
+        // 格式: vless://UUID@DOMAIN:PORT?security=tls&type=ws&path=/xray/
+        const vless_link = `vless://${xray_uuid}@${server_domain}:${nginx_external_port}?security=tls&type=ws&path=%2Fxray%2F`;
+
+        // 3. 构造详细配置 (JSON 格式，便于客户端导入)
+        const json_details = {
+            v: "2",
+            ps: `Xray VLESS (${server_domain})`,
+            add: server_domain,
+            port: nginx_external_port,
+            id: xray_uuid,
+            aid: 0,
+            net: "ws",
+            type: "none",
+            host: server_domain, // SNI/Host
+            path: "/xray/",
+            tls: "tls",
+            allowInsecure: false
+        };
+
+        document.getElementById('xray-link-output').value = vless_link;
+        document.getElementById('xray-details-output').value = JSON.stringify(json_details, null, 2);
+        
+        openModal('xray-config-modal');
+        
+    } catch (e) {
+        showStatus('生成 Xray 配置失败: ' + e.message, false);
+    }
+}
+
+
 document.getElementById('add-user-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const username = document.getElementById('new-username').value;
@@ -1777,7 +1841,9 @@ async function initializeApp() {
                 SSH_UDP_PORT: data.config.ssh_udp_port,
                 INTERNAL_WSS_PORT: data.config.internal_wss_port,
                 XRAY_INTERNAL_PORT: data.config.xray_internal_port,
-                PANEL_PORT: data.config.panel_port
+                PANEL_PORT: data.config.panel_port,
+                SERVER_DOMAIN: data.config.server_domain, // [V6.1] Load new field
+                XRAY_UUID: data.config.xray_uuid // [V6.1] Load new field
             };
         } else {
              showStatus("无法加载核心配置，请刷新。", false);
