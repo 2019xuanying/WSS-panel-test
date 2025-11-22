@@ -1,0 +1,69 @@
+# ==========================================================
+# Nginx WSS/Xray 反向代理配置模板 (Axiom V6.0)
+# 职责: 接管 443 端口，根据 path 将流量分发到 WSS Proxy 或 Xray Core
+# ==========================================================
+
+server {
+    listen @NGINX_EXTERNAL_PORT@ ssl http2;
+    listen [::]:@NGINX_EXTERNAL_PORT@ ssl http2;
+
+    # 替换为您的域名
+    server_name _; 
+
+    # --- SSL/TLS 配置 ---
+    # 假设 SSL 证书由安装脚本 (install.sh) 生成或放置在以下路径
+    ssl_certificate /etc/stunnel/certs/stunnel.crt;
+    ssl_certificate_key /etc/stunnel/certs/stunnel.key;
+    
+    # 推荐的 TLS 1.3/1.2 配置
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384';
+    ssl_prefer_server_ciphers on;
+    
+    # --- 流量分发逻辑 ---
+
+    # 1. WSS Proxy 转发 (用于 SSH 隧道)
+    # 路径: /wss/
+    location /wss/ {
+        # proxy_pass http://127.0.0.1:@INTERNAL_WSS_PORT@;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        # WSS Proxy 内部监听地址和端口
+        proxy_pass http://127.0.0.1:@INTERNAL_WSS_PORT@;
+        
+        # WebSocket 支持
+        proxy_http_version 1.1;
+        proxy_read_timeout 86400s; # 24小时，以支持长连接
+    }
+
+    # 2. Xray Core 转发 (用于 VLESS/VMess)
+    # 路径: /xray/
+    location /xray/ {
+        # Xray Core 内部监听地址和端口
+        proxy_pass http://127.0.0.1:@XRAY_INTERNAL_PORT@; 
+        
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # VLESS/VMess over WebSocket 需要以下设置
+        proxy_http_version 1.1;
+        proxy_read_timeout 300s; 
+    }
+
+    # 3. 根目录或默认流量处理 (伪装网站)
+    location / {
+        # 这是一个伪装/回退网站的配置，您可以替换为实际的静态文件服务
+        default_type text/html;
+        return 200 '<html><head><title>Welcome</title></head><body><h1>Welcome!</h1><p>The web server is running.</p></body></html>';
+    }
+}
