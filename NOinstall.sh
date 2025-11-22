@@ -4,16 +4,15 @@
 set -eu
 
 # ==========================================================
-# WSS 隧道与用户管理面板 一键卸载脚本 (Axiom V5.0 清理)
+# WSS 隧道与用户管理面板 一键卸载脚本 (Axiom V5.5 清理)
 #
-# [AXIOM V5.0 CHANGELOG]
-# - 兼容 Native UDPGW: 停止、禁用并移除新的 'udp_server' 服务和脚本。
-# - 移除 BadVPN 编译残留物（/root/badvpn）。
-# - 移除旧的 'udpgw' 服务文件引用。
+# [AXIOM V5.5 CHANGELOG]
+# - [A5 FIX] 确保删除所有用户的流量历史表。
+# - [A5 FIX] 确保还原主 SSHD 配置。
 # ==========================================================
 
 echo "----------------------------------"
-echo "==== WSS 基础设施一键卸载程序 (V5.0) ===="
+echo "==== WSS 基础设施一键卸载程序 (V5.5) ===="
 echo "----------------------------------"
 
 # =============================
@@ -36,6 +35,7 @@ PANEL_BACKEND_FILE="wss_panel.js"
 PANEL_BACKEND_PATH="$PANEL_DIR/$PANEL_BACKEND_FILE"
 CONFIG_PATH="$PANEL_DIR/config.json"
 PANEL_APP_JS_PATH="$PANEL_DIR/app.js"
+DB_PATH="$PANEL_DIR/wss_panel.db" # [AXIOM V5.5 FIX] 数据库路径
 
 # 服务和配置路径
 WSS_SERVICE_PATH="/etc/systemd/system/wss.service"
@@ -197,7 +197,7 @@ fi
 echo "----------------------------------"
 
 # =============================
-# 7. 删除文件和目录
+# 7. 删除文件和目录 (包括数据库)
 # =============================
 echo "7. 删除 WSS 相关的文件和目录..."
 # 删除脚本文件
@@ -211,6 +211,7 @@ rm -f "$STUNNEL_CONF"
 rm -f "$SECRET_KEY_FILE"
 rm -f "$ROOT_HASH_FILE"
 rm -f "$SSHD_STUNNEL_CONFIG"
+rm -f "$DB_PATH"                 # [AXIOM V5.5 FIX] 移除 SQLite 数据库
 
 # 删除目录及其内容
 rm -rf "$PANEL_DIR"          # WSS Panel 数据和模板 (包括用户数据)
@@ -223,10 +224,10 @@ echo "----------------------------------"
 
 
 echo "=================================================="
-echo "✅ WSS 隧道管理面板 (Axiom V5.0) 已成功卸载！"
+echo "✅ WSS 隧道管理面板 (Axiom V5.5) 已成功卸载！"
 echo "=================================================="
 echo ""
 echo "🔥 后续操作提示:"
-echo "1. 如果您使用该面板创建了系统用户，请手动使用 'userdel -r <username>' 删除这些用户。"
+echo "1. 如果您在面板中创建了**系统用户**，请手动使用 'userdel -r <username>' 删除这些用户，例如：userdel -r testuser"
 echo "2. 如果您需要恢复 Stunnel4 配置或默认 SSHD 设置，可能需要重新安装相关软件包。"
 echo "=================================================="
