@@ -1,14 +1,11 @@
 /**
  * WSS Panel Backend (Node.js + Express + SQLite)
- * V9.0.0 (Axiom Refactor V5.5 - Central Concurrency, Async Fuse & UDPGW)
+ * V9.1.0 (Axiom Refactor V5.6 - BadVPN Service Integration Fix)
  *
- * [AXIOM V5.5 CHANGELOG]
- * - [A1 FIX] 实现 /internal/auth/check-conn API，用于中央集群并发控制。
- * - [A2/B2 FIX] 流量聚合：aggregateAllWorkerStats 和 persistTrafficDelta 兼容 WSS 和 UDPGW 流量源。
- * - [A3 FIX] 异步熔断：checkAndApplyFuse 改为异步，并在 IPC 处理器中异步执行，防止阻塞。
- * - [A4 FIX] 日期解析：syncUserStatus 和 batch-action 修复日期解析的健壮性。
- * - [A7 FIX] Sudoers：safeRunCommand 增强对多参数 systemctl 命令的解析。
- * - [僵尸清理 FIX] 完善 WorkerStatsCache 清理逻辑。
+ * [AXIOM V5.6 CHANGELOG]
+ * - [CRITICAL FIX] 将核心服务映射从已弃用的 'udp_server' (Node.js) 迁移至 'udpgw' (BadVPN C++)。
+ * - 修复了面板无法获取 UDPGW 真实状态和日志的问题。
+ * - 确保 safeRunCommand 兼容 udpgw 服务的控制指令。
  */
 
 // --- 核心依赖 ---
@@ -42,7 +39,7 @@ const CONFIG_PATH = path.join(PANEL_DIR, 'config.json');
 try {
     const configData = fsSync.readFileSync(CONFIG_PATH, 'utf8');
     config = JSON.parse(configData);
-    console.log(`[AXIOM V5.5] 成功从 ${CONFIG_PATH} 加载配置。`);
+    console.log(`[AXIOM V5.6] 成功从 ${CONFIG_PATH} 加载配置。`);
 } catch (e) {
     console.error(`[CRITICAL] 无法加载 ${CONFIG_PATH}: ${e.message}。将使用默认端口。`);
     try {
@@ -67,10 +64,12 @@ const GIGA_BYTE = 1024 * 1024 * 1024;
 const BLOCK_CHAIN = "WSS_IP_BLOCK";
 const BACKGROUND_SYNC_INTERVAL = 60000; 
 const SHELL_DEFAULT = "/sbin/nologin";
+
+// [AXIOM V5.6 FIX] 更新服务映射以匹配 install.sh 中的 Systemd 服务名
 const CORE_SERVICES = {
     'wss': 'WSS Proxy',
     'stunnel4': 'Stunnel4',
-    'udp_server': 'Native UDPGW', 
+    'udpgw': 'BadVPN UDPGW', // 已更新：指向 C++ BadVPN 服务
     'wss_panel': 'Web Panel'
 };
 let db;
@@ -1043,8 +1042,6 @@ async function getLiveConnectionMetadata(username) {
         };
 
         // 清理函数 (确保在 Promise 结束后移除临时回调)
-        // Note: The caller of getLiveConnectionMetadata is responsible for handling the promise resolution.
-        // We ensure the temporary function is cleaned up after resolution.
         const originalResolve = resolve;
         resolve = (value) => {
             delete getLiveConnectionMetadata.onResponse;
@@ -1739,8 +1736,9 @@ api.post('/settings/config', async (req, res) => {
             if (requiresStunnelRestart) {
                 await safeRunCommand(['systemctl', 'restart', 'stunnel4']);
             }
+            // [AXIOM V5.6 FIX] 使用正确的服务名 udpgw
             if (requiresUdpGwRestart) {
-                await safeRunCommand(['systemctl', 'restart', 'udp_server']);
+                await safeRunCommand(['systemctl', 'restart', 'udpgw']);
             }
             if (requiresPanelRestart) {
                 setTimeout(async () => {
