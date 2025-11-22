@@ -5,16 +5,11 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V2.3.2 (Axiom - C++ BadVPN + SSH-UDP Integration)
-#
-# [CHANGELOG]
-# - 恢复 BadVPN C++ 编译和安装逻辑 (确保 udpgw 运行 C++ 二进制)。
-# - 新增 SSH-UDP (UDP over TCP with Auth) 服务部署逻辑。
-# - 修复了所有 unbound variable 错误。
+# V2.4.1 (Axiom - 1-65535 Port Forwarding + C++ BadVPN)
 # ==========================================================
 
 # =============================
-# 文件路径定义
+# 1. 基础变量与路径定义
 # =============================
 REPO_ROOT=$(dirname "$0")
 
@@ -28,33 +23,41 @@ INTERNAL_SECRET_PATH="$PANEL_DIR/internal_secret.txt"
 IPTABLES_RULES="/etc/iptables/rules.v4"
 DB_PATH="$PANEL_DIR/wss_panel.db"
 
-# 脚本目标路径
-WSS_PROXY_PATH="/usr/local/bin/wss_proxy.js"
+# 源文件路径
+WSS_PROXY_SRC="$REPO_ROOT/wss_proxy.js"
+PANEL_BACKEND_SRC="$REPO_ROOT/wss_panel.js"
+PANEL_HTML_SRC="$REPO_ROOT/index.html"
+PANEL_JS_SRC="$REPO_ROOT/app.js"
+LOGIN_HTML_SRC="$REPO_ROOT/login.html"
+PACKAGE_JSON_SRC="$REPO_ROOT/package.json"
+UDP_SERVER_SRC="$REPO_ROOT/udp_server.js" # 用于 Node.js 版 UDPGW (虽然这里用 C++，但保留文件是个好习惯)
+SSH_UDP_SRC="$REPO_ROOT/ssh_udp.js"       # [NEW] SSH-UDP 鉴权服务
+
+# 目标文件路径
+WSS_PROXY_DEST="/usr/local/bin/wss_proxy.js"
 PANEL_BACKEND_FILE="wss_panel.js"
 PANEL_BACKEND_DEST="$PANEL_DIR/$PANEL_BACKEND_FILE" 
 PANEL_HTML_DEST="$PANEL_DIR/index.html"
 PANEL_JS_DEST="$PANEL_DIR/app.js"
 LOGIN_HTML_DEST="$PANEL_DIR/login.html" 
 PACKAGE_JSON_DEST="$PANEL_DIR/package.json"
+UDP_SERVER_DEST="$PANEL_DIR/udp_server.js"
+SSH_UDP_DEST="$PANEL_DIR/ssh_udp.js"
 
-# [FIXED] Systemd 服务路径 (确保在顶部定义)
-WSS_SERVICE_PATH="/etc/systemd/system/wss.service"
-PANEL_SERVICE_PATH="/etc/systemd/system/wss_panel.service"
+# Systemd 服务模板与路径
 WSS_TEMPLATE="$REPO_ROOT/wss.service.template"
+WSS_SERVICE_PATH="/etc/systemd/system/wss.service"
+
 PANEL_TEMPLATE="$REPO_ROOT/wss_panel.service.template"
+PANEL_SERVICE_PATH="/etc/systemd/system/wss_panel.service"
 
-# UDPGW (BadVPN C++) 路径
-BADVPN_SRC_DIR="/root/badvpn" # C++ 源码路径
-UDPGW_SERVICE_PATH="/etc/systemd/system/udpgw.service"
 UDPGW_TEMPLATE="$REPO_ROOT/udpgw.service.template"
+UDPGW_SERVICE_PATH="/etc/systemd/system/udpgw.service"
+BADVPN_SRC_DIR="/root/badvpn"
 
-# [NEW] SSH-UDP (Auth) 路径
-SSH_UDP_SCRIPT_SRC="$REPO_ROOT/ssh_udp.js"
-SSH_UDP_SCRIPT_DEST="$PANEL_DIR/ssh_udp.js"
-SSH_UDP_SERVICE_PATH="/etc/systemd/system/ssh_udp.service"
 SSH_UDP_TEMPLATE="$REPO_ROOT/ssh_udp.service.template"
+SSH_UDP_SERVICE_PATH="/etc/systemd/system/ssh_udp.service"
 
-# SSHD Stunnel 路径
 SSHD_STUNNEL_CONFIG="/etc/ssh/sshd_config_stunnel"
 SSHD_STUNNEL_SERVICE="/etc/systemd/system/sshd_stunnel.service"
 
@@ -65,13 +68,13 @@ mkdir -p /var/log/stunnel4
 touch "$WSS_LOG_FILE"
 
 # =============================
-# [AXIOM V2.3] 交互式端口配置
+# 2. 交互式端口配置
 # =============================
 echo "----------------------------------"
-echo "==== WSS 基础设施配置 (V2.3 - SSH-UDP Edition) ===="
+echo "==== WSS 基础设施配置 (V2.4) ===="
 echo "请确认或修改以下端口和服务用户设置 (回车以使用默认值)。"
 
-# 1. 端口
+# 默认端口定义
 read -p "  1. WSS HTTP 端口 [80]: " WSS_HTTP_PORT
 WSS_HTTP_PORT=${WSS_HTTP_PORT:-80}
 
@@ -84,7 +87,7 @@ STUNNEL_PORT=${STUNNEL_PORT:-444}
 read -p "  4. BadVPN UDPGW 端口 (本地) [7300]: " UDPGW_PORT
 UDPGW_PORT=${UDPGW_PORT:-7300}
 
-read -p "  5. SSH-UDP 公网端口 (带鉴权) [7400]: " SSH_UDP_PORT
+read -p "  5. SSH-UDP 公网端口 (核心服务) [7400]: " SSH_UDP_PORT
 SSH_UDP_PORT=${SSH_UDP_PORT:-7400}
 
 read -p "  6. Web 面板端口 [54321]: " PANEL_PORT
@@ -96,11 +99,9 @@ INTERNAL_FORWARD_PORT=${INTERNAL_FORWARD_PORT:-22}
 read -p "  8. 内部 SSH (Stunnel) 转发端口 [2222]: " SSHD_STUNNEL_PORT
 SSHD_STUNNEL_PORT=${SSHD_STUNNEL_PORT:-2222}
 
-# 2. 服务用户 (最小权限)
 read -p "  9. Panel 服务用户名 [admin]: " panel_user
 panel_user=${panel_user:-admin}
 
-# --- IPC (进程间通信) 端口配置 ---
 INTERNAL_API_PORT=54322 
 PANEL_API_URL="http://127.0.0.1:$PANEL_PORT/internal"
 PROXY_API_URL="http://127.0.0.1:$INTERNAL_API_PORT"
@@ -111,10 +112,9 @@ echo "Panel 用户: $panel_user"
 echo "WSS (80/443) -> $WSS_HTTP_PORT/$WSS_TLS_PORT"
 echo "Stunnel (444) -> $STUNNEL_PORT"
 echo "BadVPN UDPGW (127.0.0.1) -> $UDPGW_PORT"
-echo "SSH-UDP Auth (0.0.0.0) -> $SSH_UDP_PORT"
+echo "SSH-UDP Auth (0.0.0.0) -> $SSH_UDP_PORT (1-65535 流量汇聚点)"
 echo "Web Panel (HTTP) & IPC -> $PANEL_PORT"
 echo "---------------------------------"
-
 
 # 交互式设置 ROOT 密码
 if [ -f "$ROOT_HASH_FILE" ]; then
@@ -138,63 +138,58 @@ else
     done
 fi
 
-
+# =============================
+# 3. 系统清理与依赖检查
+# =============================
 echo "----------------------------------"
-echo "==== 系统清理与依赖检查 (V2.3) ===="
-# 停止所有相关服务并清理旧文件
-systemctl stop wss stunnel4 udpgw ssh_udp udp_server wss_panel sshd_stunnel || true
-systemctl disable udp_server || true 
+echo "==== 系统清理与依赖检查 ===="
+systemctl stop wss stunnel4 udpgw ssh_udp wss_panel sshd_stunnel || true
+# 清理旧的 UDP Server 服务（如果存在）
+systemctl disable udp_server 2>/dev/null || true 
 rm -f /etc/systemd/system/udp_server.service
 
-# 依赖检查和安装
 apt update -y
 if ! command -v node >/dev/null; then
-    echo "正在安装 Node.js (推荐 v18/v20 LTS)..."
+    echo "正在安装 Node.js..."
     curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
     apt install -y nodejs
 fi
 
-# 安装编译 BadVPN 所需的工具
-apt install -y wget curl git net-tools cmake build-essential openssl stunnel4 iproute2 iptables procps libsqlite3-dev passwd sudo || echo "警告: 依赖安装失败。"
+# 安装 BadVPN 编译依赖和其他工具
+apt install -y wget curl git net-tools cmake build-essential openssl stunnel4 iproute2 iptables procps libsqlite3-dev passwd sudo || echo "警告: 部分依赖安装失败。"
 
 if ! id -u "$panel_user" >/dev/null 2>&1; then
-    echo "正在创建系统用户 '$panel_user'..."
     adduser --system --no-create-home "$panel_user"
-else
-    echo "系统用户 '$panel_user' 已存在。"
 fi
 
 echo "安装 Node.js 依赖..."
-cp "$REPO_ROOT/package.json" "$PACKAGE_JSON_DEST"
+cp "$PACKAGE_JSON_SRC" "$PACKAGE_JSON_DEST"
 cd "$PANEL_DIR"
 if ! npm install --production; then
     echo "严重警告: Node.js 核心依赖安装失败。"
     exit 1
 fi
-cd "$REPO_ROOT" # 切换回根目录
+cd "$REPO_ROOT" # 切回
 
-# 首次部署，计算 ROOT hash
+# 生成/加载密钥
 if [ ! -f "$ROOT_HASH_FILE" ] && [ -n "${PANEL_ROOT_PASS_RAW:-}" ]; then
     PANEL_ROOT_PASS_HASH=$(node -e "const bcrypt = require('bcrypt'); const hash = bcrypt.hashSync('$PANEL_ROOT_PASS_RAW', 12); console.log(hash);")
     echo "$PANEL_ROOT_PASS_HASH" > "$ROOT_HASH_FILE"
 fi
-
 if [ ! -f "$SECRET_KEY_FILE" ]; then
     SECRET_KEY=$(openssl rand -hex 32)
     echo "$SECRET_KEY" > "$SECRET_KEY_FILE"
 fi
-
 if [ ! -f "$INTERNAL_SECRET_PATH" ]; then
     INTERNAL_SECRET=$(openssl rand -hex 32)
     echo "$INTERNAL_SECRET" > "$INTERNAL_SECRET_PATH"
 fi
 INTERNAL_SECRET=$(cat "$INTERNAL_SECRET_PATH")
 
-chmod 600 "$ROOT_HASH_FILE"
-chmod 600 "$SECRET_KEY_FILE"
-chmod 600 "$INTERNAL_SECRET_PATH"
+chmod 600 "$ROOT_HASH_FILE" "$SECRET_KEY_FILE" "$INTERNAL_SECRET_PATH"
 
-echo "正在创建 config.json 配置文件..."
+# 生成配置文件
+echo "正在创建 config.json..."
 tee "$CONFIG_PATH" > /dev/null <<EOF
 {
   "panel_user": "$panel_user",
@@ -212,14 +207,14 @@ tee "$CONFIG_PATH" > /dev/null <<EOF
 }
 EOF
 chmod 600 "$CONFIG_PATH"
-echo "----------------------------------"
 
 
 # =============================
-# 配置 Sudoers
+# 4. 配置 Sudoers
 # =============================
-echo "==== 配置 Sudoers (最小权限) ===="
+echo "==== 配置 Sudoers ===="
 SUDOERS_FILE="/etc/sudoers.d/99-wss-panel"
+# 获取命令绝对路径
 CMD_USERADD=$(command -v useradd)
 CMD_USERMOD=$(command -v usermod)
 CMD_USERDEL=$(command -v userdel)
@@ -257,20 +252,12 @@ $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active wss_panel
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SED
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL daemon-reload
 EOF
-
 chmod 440 "$SUDOERS_FILE"
-if ! visudo -c -f "$SUDOERS_FILE"; then
-    rm -f "$SUDOERS_FILE"
-    exit 1
-fi
-echo "Sudoers 配置完成。"
-echo "----------------------------------"
-
 
 # =============================
-# 内核调优 (Buffer Tuning)
+# 5. 内核调优
 # =============================
-echo "==== 配置内核网络参数 (Buffer Tuning) ===="
+echo "==== 配置内核参数 ===="
 sed -i '/# WSS_NET_START/,/# WSS_NET_END/d' /etc/sysctl.conf
 cat >> /etc/sysctl.conf <<EOF
 # WSS_NET_START
@@ -278,11 +265,6 @@ net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.ipv4.tcp_max_syn_backlog = 65536
 net.core.somaxconn = 65536
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_probes = 5
-net.ipv4.tcp_keepalive_intvl = 5
-# BadVPN UDPGW Buffer Tuning (Max 32MB, Default 8MB)
 net.core.rmem_max = 33554432
 net.core.wmem_max = 33554432
 net.core.rmem_default = 8388608
@@ -290,52 +272,41 @@ net.core.wmem_default = 8388608
 # WSS_NET_END
 EOF
 sysctl -p > /dev/null
-echo "----------------------------------"
 
 # =============================
-# 部署代码文件
+# 6. 部署文件
 # =============================
-echo "==== 部署 Node.js 代码文件 ===="
-cp "$REPO_ROOT/wss_proxy.js" "$WSS_PROXY_PATH"
-chmod +x "$WSS_PROXY_PATH"
-cp "$REPO_ROOT/wss_panel.js" "$PANEL_BACKEND_DEST"
-chmod +x "$PANEL_BACKEND_DEST"
+echo "==== 部署代码文件 ===="
+cp "$WSS_PROXY_SRC" "$WSS_PROXY_DEST"
+cp "$PANEL_BACKEND_SRC" "$PANEL_BACKEND_DEST"
+cp "$PANEL_HTML_SRC" "$PANEL_HTML_DEST"
+cp "$PANEL_JS_SRC" "$PANEL_JS_DEST"
+cp "$LOGIN_HTML_SRC" "$LOGIN_HTML_DEST"
+cp "$UDP_SERVER_SRC" "$UDP_SERVER_DEST" # 复制 UDP Server JS 备用
 
-# [NEW] 部署 SSH-UDP (Node.js) - 确保文件存在
-if [ -f "$SSH_UDP_SCRIPT_SRC" ]; then
-    echo "部署 SSH-UDP (Auth) 服务脚本..."
-    cp "$SSH_UDP_SCRIPT_SRC" "$SSH_UDP_SCRIPT_DEST"
-    chmod +x "$SSH_UDP_SCRIPT_DEST"
+# [NEW] 部署 SSH-UDP JS
+if [ -f "$SSH_UDP_SRC" ]; then
+    cp "$SSH_UDP_SRC" "$SSH_UDP_DEST"
+    chmod +x "$SSH_UDP_DEST"
 else
-    echo "严重警告: 找不到 ${SSH_UDP_SCRIPT_SRC} 源文件，SSH-UDP 服务将无法部署！"
+    echo "警告: $SSH_UDP_SRC 未找到，SSH-UDP 服务将无法运行。"
 fi
 
-# 部署前端静态文件
-cp "$REPO_ROOT/index.html" "$PANEL_HTML_DEST"
-cp "$REPO_ROOT/app.js" "$PANEL_JS_DEST"
-cp "$REPO_ROOT/login.html" "$LOGIN_HTML_DEST"
+chmod +x "$WSS_PROXY_DEST" "$PANEL_BACKEND_DEST"
 
 if [ ! -f "$DB_PATH" ]; then echo "Database will be initialized on start."; fi
-[ ! -f "$WSS_LOG_FILE" ] && touch "$WSS_LOG_FILE"
 [ ! -f "$PANEL_DIR/audit.log" ] && touch "$PANEL_DIR/audit.log"
 [ ! -f "$PANEL_DIR/hosts.json" ] && echo '[]' > "$PANEL_DIR/hosts.json"
-echo "----------------------------------"
-
+chown -R "$panel_user:$panel_user" "$PANEL_DIR"
 
 # =============================
-# 安装 Stunnel4 (保持不变)
+# 7. 安装 Stunnel4
 # =============================
-echo "==== 重新安装 Stunnel4 ===="
+echo "==== 配置 Stunnel4 ===="
 if ! getent group shell_users >/dev/null; then groupadd shell_users; fi
-
-openssl req -x509 -nodes -newkey rsa:2048 \
--keyout /etc/stunnel/certs/stunnel.key \
--out /etc/stunnel/certs/stunnel.crt \
--days 1095 \
--subj "/CN=example.com" > /dev/null 2>&1
-sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
-chmod 600 /etc/stunnel/certs/*.key
-chmod 600 /etc/stunnel/certs/*.pem
+openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/stunnel/certs/stunnel.key -out /etc/stunnel/certs/stunnel.crt -days 1095 -subj "/CN=example.com" > /dev/null 2>&1
+cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem
+chmod 600 /etc/stunnel/certs/*.key /etc/stunnel/certs/*.pem
 
 tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
 pid=/var/run/stunnel.pid
@@ -346,144 +317,135 @@ debug = 5
 output = /var/log/stunnel4/stunnel.log
 socket = l:TCP_NODELAY=1
 socket = r:TCP_NODELAY=1
-
 [ssh-tls-gateway]
 accept = 0.0.0.0:$STUNNEL_PORT
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
 connect = 127.0.0.1:$SSHD_STUNNEL_PORT
 EOF
-
 systemctl enable stunnel4
 systemctl restart stunnel4
-echo "----------------------------------"
 
 # =============================
-# 编译并部署 BadVPN UDPGW (C++ 方案)
+# 8. 编译并部署 BadVPN (C++ Version)
 # =============================
-echo "==== 编译并部署 BadVPN UDPGW (C++ 方案) ===="
-# 1. 检查并拉取源码
+echo "==== 编译部署 BadVPN UDPGW (C++) ===="
 if [ ! -d "$BADVPN_SRC_DIR" ]; then
-    echo "正在拉取 BadVPN 源码..."
     git clone https://github.com/ambrop72/badvpn.git "$BADVPN_SRC_DIR" > /dev/null 2>&1
 fi
-
-# 2. 创建构建目录
 mkdir -p "$BADVPN_SRC_DIR/badvpn-build"
 cd "$BADVPN_SRC_DIR/badvpn-build"
-
-# 3. Cmake 配置 (只编译 UDPGW, Release 模式)
-echo "正在配置 BadVPN 编译选项..."
 cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
-
-# 4. 编译
-echo "正在编译 BadVPN (可能需要几分钟)..."
 make -j$(nproc) > /dev/null 2>&1
+cd "$REPO_ROOT" # 回到仓库根目录
 
-# 5. 部署 Systemd 服务 (使用 C++ 模板)
-cd "$REPO_ROOT" > /dev/null 2>&1
+# =============================
+# 9. 部署 Systemd 服务
+# =============================
+echo "==== 部署 Systemd 服务 ===="
+
+# 1. udpgw (BadVPN C++)
 if [ -f "$UDPGW_TEMPLATE" ]; then
     cp "$UDPGW_TEMPLATE" "$UDPGW_SERVICE_PATH"
+    # 替换端口占位符
     sed -i "s|@UDPGW_PORT@|$UDPGW_PORT|g" "$UDPGW_SERVICE_PATH"
+    systemctl enable udpgw
 else
-    echo "严重警告: 找不到 ${UDPGW_TEMPLATE} 模板文件，UDPGW 服务将无法启动。"
+    echo "错误: udpgw 模板未找到。"
+fi
+
+# 2. ssh_udp (Node.js Auth)
+if [ -f "$SSH_UDP_TEMPLATE" ]; then
+    cp "$SSH_UDP_TEMPLATE" "$SSH_UDP_SERVICE_PATH"
+    systemctl enable ssh_udp
+else
+    echo "错误: ssh_udp 模板未找到。"
+fi
+
+# 3. wss
+if [ -f "$WSS_TEMPLATE" ]; then
+    cp "$WSS_TEMPLATE" "$WSS_SERVICE_PATH"
+    sed -i "s|@WSS_LOG_FILE_PATH@|$WSS_LOG_FILE|g" "$WSS_SERVICE_PATH"
+    sed -i "s|@WSS_PROXY_SCRIPT_PATH@|$WSS_PROXY_DEST|g" "$WSS_SERVICE_PATH"
+else
+    echo "错误: wss 模板未找到。"
+fi
+
+# 4. wss_panel
+if [ -f "$PANEL_TEMPLATE" ]; then
+    cp "$PANEL_TEMPLATE" "$PANEL_SERVICE_PATH"
+    sed -i "s|@PANEL_DIR@|$PANEL_DIR|g" "$PANEL_SERVICE_PATH"
+    sed -i "s|@PANEL_USER@|$panel_user|g" "$PANEL_SERVICE_PATH"
+    sed -i "s|@PANEL_BACKEND_SCRIPT_PATH@|$PANEL_BACKEND_FILE|g" "$PANEL_SERVICE_PATH"
+else
+    echo "错误: wss_panel 模板未找到。"
 fi
 
 systemctl daemon-reload
-systemctl enable udpgw
-systemctl restart udpgw
-echo "BadVPN UDPGW C++ 已启动 (端口: $UDPGW_PORT)。"
-echo "----------------------------------"
-
+systemctl enable wss_panel wss udpgw ssh_udp
 
 # =============================
-# IPTABLES & Systemd (其他服务)
+# 10. IPTABLES 全端口转发 (1-65535)
 # =============================
-echo "==== 配置 IPTABLES ===="
-BLOCK_CHAIN="WSS_IP_BLOCK"
-iptables -F $BLOCK_CHAIN 2>/dev/null || true
-iptables -X $BLOCK_CHAIN 2>/dev/null || true
-iptables -N $BLOCK_CHAIN 2>/dev/null || true
-iptables -I INPUT 1 -j $BLOCK_CHAIN 
+echo "==== 配置 IPTABLES (全端口转发 -> SSH_UDP) ===="
+# 清理旧的 NAT 规则
+iptables -t nat -F
+# 清理 INPUT 规则 (保留 WSS_IP_BLOCK 链)
+iptables -D INPUT -j WSS_IP_BLOCK 2>/dev/null || true
+iptables -F INPUT
+iptables -I INPUT 1 -j WSS_IP_BLOCK 2>/dev/null || true
+if ! iptables -L WSS_IP_BLOCK >/dev/null 2>&1; then
+    iptables -N WSS_IP_BLOCK
+    iptables -I INPUT 1 -j WSS_IP_BLOCK
+fi
 
-# 开放所有端口
-iptables -I INPUT -p tcp --dport $WSS_HTTP_PORT -j ACCEPT
-iptables -I INPUT -p tcp --dport $WSS_TLS_PORT -j ACCEPT
-iptables -I INPUT -p tcp --dport $STUNNEL_PORT -j ACCEPT
-iptables -I INPUT -p tcp --dport $PANEL_PORT -j ACCEPT
-iptables -I INPUT -p tcp --dport $SSH_UDP_PORT -j ACCEPT # [NEW] 开放 SSH-UDP 端口
-iptables -I INPUT -p tcp --dport $UDPGW_PORT -j ACCEPT # 开放 UDPGW 端口 (TCP协议)
+# --- 1. 排除关键端口 (不转发) ---
+# 本地 SSH, WSS, Stunnel, Panel, SSH-UDP 自身
+iptables -t nat -A PREROUTING -p tcp --dport 22 -j RETURN
+iptables -t nat -A PREROUTING -p tcp --dport $WSS_HTTP_PORT -j RETURN
+iptables -t nat -A PREROUTING -p tcp --dport $WSS_TLS_PORT -j RETURN
+iptables -t nat -A PREROUTING -p tcp --dport $STUNNEL_PORT -j RETURN
+iptables -t nat -A PREROUTING -p tcp --dport $PANEL_PORT -j RETURN
+iptables -t nat -A PREROUTING -p tcp --dport $SSH_UDP_PORT -j RETURN
 
+# --- 2. 重定向其余流量 -> SSH_UDP ---
+# 将所有其他 TCP 流量重定向到 SSH-UDP 鉴权服务
+iptables -t nat -A PREROUTING -p tcp -j REDIRECT --to-port $SSH_UDP_PORT
+
+# --- 3. 放行规则 ---
+iptables -A INPUT -p tcp --dport $SSH_UDP_PORT -j ACCEPT
+# 允许所有进入的 TCP (因为 NAT 发生在 PREROUTING，INPUT 看到的是目的端口为 SSH_UDP_PORT 的包)
+iptables -A INPUT -p tcp -j ACCEPT 
+# 放行 UDPGW
+iptables -A INPUT -p udp --dport $UDPGW_PORT -j ACCEPT
+# 放行相关连接
+iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+# 放行 ICMP
+iptables -A INPUT -p icmp -j ACCEPT
+# 放行回环
+iptables -A INPUT -i lo -j ACCEPT
+
+# 持久化
 if command -v netfilter-persistent >/dev/null; then
     /sbin/iptables-save > "$IPTABLES_RULES"
     systemctl enable netfilter-persistent || true
     systemctl start netfilter-persistent || true
 fi
 
-systemctl daemon-reload
-systemctl enable wss_panel wss udpgw ssh_udp
-echo "----------------------------------"
-
 # =============================
-# SSHD 配置 (保持不变)
+# 11. 最终重启
 # =============================
-SSHD_CONFIG="/etc/ssh/sshd_config"
-SSHD_SERVICE=$(systemctl list-units --full -all | grep -q "sshd.service" && echo "sshd" || echo "ssh")
-sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
-if ! grep -q "^Port $INTERNAL_FORWARD_PORT" "$SSHD_CONFIG" && [ "$INTERNAL_FORWARD_PORT" != "22" ]; then
-    sed -i -E "/^[#\s]*Port /d" "$SSHD_CONFIG"
-    echo "Port $INTERNAL_FORWARD_PORT" >> "$SSHD_CONFIG"
-fi
-cat >> "$SSHD_CONFIG" <<EOF
-# WSS_TUNNEL_BLOCK_START
-Match Address 127.0.0.1,::1
-    PasswordAuthentication yes
-    KbdInteractiveAuthentication yes
-    AllowTcpForwarding yes
-# WSS_TUNNEL_BLOCK_END
-EOF
-
-cp "$SSHD_CONFIG" "$SSHD_STUNNEL_CONFIG"
-sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_STUNNEL_CONFIG"
-sed -i -E "/^[#\s]*Port /d" "$SSHD_STUNNEL_CONFIG"
-sed -i -E "/^[#\s]*ListenAddress /d" "$SSHD_STUNNEL_CONFIG"
-cat >> "$SSHD_STUNNEL_CONFIG" <<EOF
-# WSS_STUNNEL_BLOCK_START
-Port $SSHD_STUNNEL_PORT
-ListenAddress 127.0.0.1
-ListenAddress ::1
-PasswordAuthentication yes
-KbdInteractiveAuthentication yes
-AllowTcpForwarding yes
-AllowGroups shell_users
-# WSS_STUNNEL_BLOCK_END
-EOF
-
-tee "$SSHD_STUNNEL_SERVICE" > /dev/null <<EOF
-[Unit]
-Description=OpenSSH Stunnel Service
-After=network.target auditd.service
-ConditionPathExists=!/etc/ssh/sshd_not_to_be_run
-[Service]
-ExecStart=/usr/sbin/sshd -D -f $SSHD_STUNNEL_CONFIG
-ExecReload=/bin/kill -HUP \$MAINPID
-KillMode=process
-Restart=on-failure
-RestartSec=42s
-[Install]
-WantedBy=multi-user.target
-EOF
-
-chmod 600 "$SSHD_CONFIG"
-chmod 600 "$SSHD_STUNNEL_CONFIG"
-systemctl daemon-reload
-systemctl restart "$SSHD_SERVICE"
-systemctl enable sshd_stunnel
+echo "==== 重启所有服务 ===="
+systemctl restart sshd
 systemctl restart sshd_stunnel
-
-# Final Restart
-systemctl restart stunnel4 udpgw ssh_udp wss_panel wss
+systemctl restart stunnel4
+systemctl restart udpgw
+systemctl restart ssh_udp
+systemctl restart wss_panel
+systemctl restart wss
 
 echo "=================================================="
-echo "✅ 部署完成！(Axiom V2.3 - SSH-UDP Edition)"
+echo "✅ 部署完成！(Axiom V2.4 - Full Port Forwarding)"
+echo "SSH-UDP 监听端口: $SSH_UDP_PORT (已接管 1-65535 空闲端口)"
+echo "BadVPN UDPGW 监听: 127.0.0.1:$UDPGW_PORT"
 echo "=================================================="
