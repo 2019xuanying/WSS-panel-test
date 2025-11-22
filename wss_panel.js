@@ -1,11 +1,11 @@
 /**
  * WSS Panel Backend (Node.js + Express + SQLite)
- * V9.1.0 (Axiom Refactor V5.6 - BadVPN Service Integration Fix)
+ * V9.3.0 (Axiom Refactor V5.7 - SSH-UDP Auth Integration)
  *
- * [AXIOM V5.6 CHANGELOG]
- * - [CRITICAL FIX] 将核心服务映射从已弃用的 'udp_server' (Node.js) 迁移至 'udpgw' (BadVPN C++)。
- * - 修复了面板无法获取 UDPGW 真实状态和日志的问题。
- * - 确保 safeRunCommand 兼容 udpgw 服务的控制指令。
+ * [AXIOM V5.7 CHANGELOG]
+ * - [NEW] 实现 SSH-UDP 服务端鉴权接口 'verify_user'。
+ * - [NEW] 支持精确统计 SSH-UDP 来源的用户流量。
+ * - [CONFIG] 新增 SSH-UDP 服务监控。
  */
 
 // --- 核心依赖 ---
@@ -39,7 +39,7 @@ const CONFIG_PATH = path.join(PANEL_DIR, 'config.json');
 try {
     const configData = fsSync.readFileSync(CONFIG_PATH, 'utf8');
     config = JSON.parse(configData);
-    console.log(`[AXIOM V5.6] 成功从 ${CONFIG_PATH} 加载配置。`);
+    console.log(`[AXIOM V5.7] 成功从 ${CONFIG_PATH} 加载配置。`);
 } catch (e) {
     console.error(`[CRITICAL] 无法加载 ${CONFIG_PATH}: ${e.message}。将使用默认端口。`);
     try {
@@ -65,11 +65,12 @@ const BLOCK_CHAIN = "WSS_IP_BLOCK";
 const BACKGROUND_SYNC_INTERVAL = 60000; 
 const SHELL_DEFAULT = "/sbin/nologin";
 
-// [AXIOM V5.6 FIX] 更新服务映射以匹配 install.sh 中的 Systemd 服务名
+// [AXIOM V5.7 FIX] 注册新的 SSH-UDP 服务
 const CORE_SERVICES = {
     'wss': 'WSS Proxy',
     'stunnel4': 'Stunnel4',
-    'udpgw': 'BadVPN UDPGW', // 已更新：指向 C++ BadVPN 服务
+    'udpgw': 'BadVPN UDPGW', 
+    'ssh_udp': 'SSH-UDP Auth', // 新增服务
     'wss_panel': 'Web Panel'
 };
 let db;
@@ -77,7 +78,7 @@ let db;
 // --- [AXIOM V5.0] 实时推送状态管理 ---
 let wssIpc = null;
 let wssUiPool = new Set();
-let workerStatsCache = new Map(); // Key: Worker ID (e.g., 1, 2, 'udpgw'), Value: {stats: {}, live_ips: {}}
+let workerStatsCache = new Map(); 
 let globalFuseLimitKbps = 0;
 
 // [AXIOM V5.0] 性能优化定时器
@@ -85,18 +86,15 @@ let liveUpdateInterval = null;
 let systemUpdateInterval = null; 
 let isRealtimePushing = false; 
 
-// [AXIOM V5.0] 智能推送：存储上一次推送的聚合数据，以便比较变化
 let lastAggregatedStats = { users: {}, live_ips: {} };
 let lastSystemStatus = {};
-
-// [AXIOM V5.2] 新增：用于临时存储 Worker 元数据响应
 let workerMetadataResponses = new Map();
 
 
 const SUDO_COMMANDS = new Set([
     'useradd', 'usermod', 'userdel', 'gpasswd', 'chpasswd', 'pkill',
     'iptables', 'iptables-save', 'journalctl', 
-    'systemctl', // 广义 systemctl，需要特殊处理
+    'systemctl', 
     'getent', 
     'sed', 
     'systemctl daemon-reload',
@@ -110,10 +108,6 @@ const SUDO_COMMANDS = new Set([
 // =======================================================
 // [AXIOM V5.5 FIX A7] 核心辅助函数：安全执行系统命令
 // =======================================================
-
-/**
- * [AXIOM V5.5 FIX A7] 增强对多参数命令的解析和执行，确保只执行白名单中的命令。
- */
 async function safeRunCommand(command, inputData = null) {
     
     let fullCommand = [...command];
@@ -446,6 +440,7 @@ function broadcastToProxies(message) {
 
 
 async function kickUserFromProxy(username) {
+    // 广播踢人指令给所有 worker (WSS Proxy, SSH-UDP)
     broadcastToProxies({
         action: 'kick',
         username: username
@@ -516,7 +511,7 @@ function aggregateAllWorkerStats() {
         for (const username in workerData.stats) {
             const current = workerData.stats[username];
             
-            // [AXIOM V5.5 FIX] 兼容 UDPGW 和 WSS 的统计结构
+            // [AXIOM V5.7 FIX] 兼容 WSS, UDPGW 和 SSH-UDP 的统计结构
             if (!aggregatedStats[username]) {
                 aggregatedStats[username] = {
                     speed_kbps: { upload: 0, download: 0 },
@@ -526,7 +521,7 @@ function aggregateAllWorkerStats() {
             
             const existing = aggregatedStats[username];
             
-            // WSS 和 UDPGW Worker 都推送 speed_kbps 和 connections
+            // 聚合连接数和速度
             existing.connections += current.connections;
             existing.speed_kbps.upload += current.speed_kbps.upload;
             existing.speed_kbps.download += current.speed_kbps.download;
@@ -935,7 +930,6 @@ internalApi.get('/auth/user-settings', async (req, res) => {
 
 /**
  * [AXIOM V5.5 FIX A1] 中央并发检查 API
- * Proxy Worker 在建立连接前调用此 API 来获取中央授权。
  */
 internalApi.get('/auth/check-conn', async (req, res) => {
     const { username, worker_id } = req.query;
@@ -957,7 +951,6 @@ internalApi.get('/auth/check-conn', async (req, res) => {
         const aggregatedData = aggregateAllWorkerStats();
         const globalConnections = aggregatedData.users[username]?.connections || 0;
         
-        // 核心逻辑: 如果全局连接数小于最大限制，则允许连接。
         if (globalConnections < maxConnections) {
             return res.json({ success: true, allowed: true, message: `Allowed. Global connections: ${globalConnections}/${maxConnections}` });
         } else {
@@ -977,7 +970,7 @@ app.use('/internal', internalApi);
 const api = express.Router();
 
 /**
- * [AXIOM V5.2] 新增：跨 Worker 获取用户实时连接元数据
+ * [AXIOM V5.2] 新增 API：获取用户的实时连接元数据
  */
 async function getLiveConnectionMetadata(username) {
     if (!wssIpc || wssIpc.clients.size === 0) {
@@ -1051,9 +1044,6 @@ async function getLiveConnectionMetadata(username) {
 }
 
 
-/**
- * [AXIOM V5.2] 新增 API：获取用户的实时连接元数据
- */
 api.get('/users/connections', async (req, res) => {
     const { username } = req.query;
     if (!username) {
@@ -1099,6 +1089,7 @@ async function getSystemStatusData() {
         { name: 'WSS_TLS', port: config.wss_tls_port, protocol: 'TCP', status: 'LISTEN' },
         { name: 'STUNNEL', port: config.stunnel_port, protocol: 'TCP', status: 'LISTEN' },
         { name: 'NATIVE_UDPGW', port: config.udpgw_port, protocol: 'TCP', status: 'LISTEN' },
+        { name: 'SSH_UDP_AUTH', port: config.ssh_udp_port, protocol: 'TCP', status: 'LISTEN' }, // [NEW] SSH-UDP
         { name: 'PANEL', port: config.panel_port, protocol: 'TCP', status: 'LISTEN' },
         { name: 'SSH_INTERNAL', port: config.internal_forward_port, protocol: 'TCP', status: 'LISTEN' }
     ];
@@ -1150,7 +1141,7 @@ api.get('/system/status', async (req, res) => {
 
 api.post('/system/control', async (req, res) => {
     const { service, action } = req.body;
-    // [AXIOM V5.5 FIX A7] 使用 systemctl restart 作为完整参数传递
+    // [AXIOM V5.7 FIX] 包含新的 SSH-UDP 服务
     if (!CORE_SERVICES[service] || action !== 'restart') {
         return res.status(400).json({ success: false, message: "无效的服务或操作" });
     }
@@ -1680,13 +1671,14 @@ api.post('/settings/config', async (req, res) => {
         
         const fieldsToUpdate = [
             'panel_port', 'wss_http_port', 'wss_tls_port', 
-            'stunnel_port', 'udpgw_port', 'internal_forward_port'
+            'stunnel_port', 'udpgw_port', 'ssh_udp_port', 'internal_forward_port' // 增加 ssh_udp_port
         ];
         
         let requiresWssRestart = false;
         let requiresPanelRestart = false;
         let requiresStunnelRestart = false;
         let requiresUdpGwRestart = false;
+        let requiresSshUdpRestart = false; // 新增 SSH-UDP 重启标记
 
         fieldsToUpdate.forEach(key => {
             const newValue = parseInt(newConfigData[key]);
@@ -1699,6 +1691,7 @@ api.post('/settings/config', async (req, res) => {
                 if (key === 'wss_http_port' || key === 'wss_tls_port' || key === 'internal_forward_port') requiresWssRestart = true;
                 if (key === 'stunnel_port') requiresStunnelRestart = true;
                 if (key === 'udpgw_port') requiresUdpGwRestart = true;
+                if (key === 'ssh_udp_port') requiresSshUdpRestart = true; // 检查 SSH-UDP
             }
         });
         
@@ -1736,10 +1729,14 @@ api.post('/settings/config', async (req, res) => {
             if (requiresStunnelRestart) {
                 await safeRunCommand(['systemctl', 'restart', 'stunnel4']);
             }
-            // [AXIOM V5.6 FIX] 使用正确的服务名 udpgw
             if (requiresUdpGwRestart) {
                 await safeRunCommand(['systemctl', 'restart', 'udpgw']);
             }
+            // [NEW] 重启 SSH-UDP
+            if (requiresSshUdpRestart) {
+                await safeRunCommand(['systemctl', 'restart', 'ssh_udp']);
+            }
+            
             if (requiresPanelRestart) {
                 setTimeout(async () => {
                     await safeRunCommand(['systemctl', 'restart', 'wss_panel']);
@@ -1886,7 +1883,7 @@ app.use('/api', loginRequired, api);
 
 
 function startWebSocketServers(httpServer) {
-    console.log(`[AXIOM V5.5] 正在启动实时 WebSocket 服务...`);
+    console.log(`[AXIOM V5.7] 正在启动实时 WebSocket 服务...`);
     
     // --- 1. IPC (Proxy) 服务器 (/ipc) ---
     wssIpc = new WebSocketServer({
@@ -1897,31 +1894,27 @@ function startWebSocketServers(httpServer) {
     wssIpc.on('connection', (ws, req) => {
         const workerId = req.headers['x-worker-id'] || req.socket.remoteAddress;
         ws.workerId = workerId;
-        console.log(`[IPC_WSS] 一个数据平面 (Proxy Worker: ${workerId}) 已连接。`);
+        console.log(`[IPC_WSS] 一个数据平面 (Worker: ${workerId}) 已连接。`);
         
         ws.on('message', async (data) => {
             try {
                 const message = JSON.parse(data.toString());
                 
+                // 1. 流量上报 (来自 WSS, UDPGW, SSH-UDP)
                 if (message.type === 'stats_update' && message.payload) {
                     
-                    // [AXIOM V5.5 FIX A2/B2] 缓存 Worker 的原始统计数据
                     workerStatsCache.set(message.workerId || ws.workerId, message.payload);
                     
-                    // [AXIOM V5.5 FIX A3] 异步处理阻塞 I/O 和熔断检查
                     process.nextTick(async () => {
                         try {
-                            // 1. 批量持久化流量数据
                             await persistTrafficDelta(workerStatsCache); 
                             
                             if (wssUiPool.size > 0) {
-                                // 2. 聚合数据并检查熔断
                                 const aggregatedStats = aggregateAllWorkerStats();
                                 
                                 if (globalFuseLimitKbps > 0) {
                                     for (const username in aggregatedStats.users) {
                                         const userSpeed = aggregatedStats.users[username].speed_kbps;
-                                        // 异步执行熔断，防止阻塞
                                         await checkAndApplyFuse(username, userSpeed);
                                     }
                                 }
@@ -1932,30 +1925,72 @@ function startWebSocketServers(httpServer) {
                     });
 
                 } 
-                // [AXIOM V5.2] 处理 Worker 的元数据响应
+                
+                // 2. [NEW] SSH-UDP 鉴权请求
+                else if (message.action === 'verify_user') {
+                    const { requestId, username, password } = message;
+                    // 验证逻辑
+                    try {
+                        const user = await getUserByUsername(username);
+                        let success = false;
+                        let failReason = 'User not found';
+                        
+                        if (user) {
+                            if (user.status !== 'active') {
+                                failReason = `User status: ${user.status}`;
+                            } else {
+                                // 进行密码验证
+                                const match = await bcrypt.compare(password, user.password_hash);
+                                if (match) {
+                                    success = true;
+                                } else {
+                                    failReason = 'Password incorrect';
+                                }
+                            }
+                        }
+                        
+                        // 返回结果给 ssh_udp.js
+                        ws.send(JSON.stringify({
+                            type: 'AUTH_RESULT',
+                            requestId: requestId,
+                            success: success,
+                            message: success ? 'OK' : failReason,
+                            // 可选：如果未来需要限速，可以在这里返回 limits
+                            limits: success ? { rate_kbps: user.rate_kbps, max_connections: user.max_connections } : null
+                        }));
+                        
+                        if (success) {
+                            await logAction("SSH_UDP_AUTH_SUCCESS", username, `Authenticated via SSH-UDP from ${workerId}`);
+                        } else {
+                            await logAction("SSH_UDP_AUTH_FAIL", username, `Failed: ${failReason}`);
+                        }
+                        
+                    } catch(e) {
+                        console.error(`[IPC_AUTH] Error during verify_user: ${e.message}`);
+                        ws.send(JSON.stringify({ type: 'AUTH_RESULT', requestId, success: false, message: 'DB Error' }));
+                    }
+                }
+                
+                // 3. 元数据请求
                 else if (message.type === 'METADATA_RESPONSE') {
                      if (typeof getLiveConnectionMetadata.onResponse === 'function') {
                          getLiveConnectionMetadata.onResponse(message);
                      }
                 }
             } catch (e) {
-                console.error(`[IPC_WSS] 解析 Proxy 消息失败: ${e.message}`);
+                console.error(`[IPC_WSS] 解析 Worker 消息失败: ${e.message}`);
             }
         });
 
         ws.on('close', () => {
-            // [AXIOM V5.5 FIX 僵尸清理] Worker 断开连接时，立即从缓存中移除其数据，防止其统计数据污染聚合结果
+            // [AXIOM V5.5 FIX 僵尸清理] Worker 断开连接时，立即从缓存中移除其数据
             workerStatsCache.delete(ws.workerId);
-            console.log(`[IPC_WSS] 一个数据平面 (Proxy Worker: ${ws.workerId}) 已断开连接。`);
+            console.log(`[IPC_WSS] 数据平面 (Worker: ${ws.workerId}) 已断开连接。`);
         });
         
         ws.on('error', (err) => {
             console.error(`[IPC_WSS] 客户端 WebSocket 错误: ${err.message}`);
         });
-    });
-    
-    wssIpc.on('error', (err) => {
-         console.error(`[IPC_WSS] 实时 IPC 服务器错误: ${err.message}`);
     });
     
     // --- 2. UI (Frontend) 服务器 (/ws/ui) ---
@@ -1996,8 +2031,8 @@ function startWebSocketServers(httpServer) {
         });
     });
     
-    wssUi.on('error', (err) => {
-         console.error(`[IPC_UI] 前端 WS 服务器错误: ${err.message}`);
+    wssIpc.on('error', (err) => {
+         console.error(`[IPC_WSS] 实时 IPC 服务器错误: ${err.message}`);
     });
 
     // --- 3. HTTP 服务器 'upgrade' 路由 ---
@@ -2031,7 +2066,7 @@ function startWebSocketServers(httpServer) {
         }
     });
     
-    console.log(`[AXIOM V5.5] 实时 WebSocket 服务已附加到主 HTTP 服务器。`);
+    console.log(`[AXIOM V5.7] 实时 WebSocket 服务已附加到主 HTTP 服务器。`);
 }
 
 
@@ -2049,10 +2084,9 @@ async function startApp() {
         setTimeout(syncUserStatus, 5000); 
         
         server.listen(config.panel_port, '0.0.0.0', () => {
-            console.log(`[AXIOM V5.5] WSS Panel (HTTP) 运行在 port ${config.panel_port}`);
-            console.log(`[AXIOM V5.5] 实时 IPC (WSS) 运行在 port ${config.panel_port} (路径: /ipc)`);
-            console.log(`[AXIOM V5.5] 实时 UI (WSS) 运行在 port ${config.panel_port} (路径: /ws/ui)`);
-            console.log(`[AXIOM V5.5] 60秒维护任务已启动。`);
+            console.log(`[AXIOM V5.7] WSS Panel (HTTP) 运行在 port ${config.panel_port}`);
+            console.log(`[AXIOM V5.7] 实时 IPC (WSS) 运行在 port ${config.panel_port} (路径: /ipc)`);
+            console.log(`[AXIOM V5.7] 60秒维护任务已启动。`);
         });
         
         server.on('error', (err) => {
