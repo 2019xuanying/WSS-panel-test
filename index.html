@@ -1,9 +1,8 @@
 <!DOCTYPE html>
 <!-- 
-  V8.3.2 (Axiom Refactor V5.6 - BadVPN UI Integration)
-  [AXIOM V5.6 CHANGELOG]
-  - [UI FIX] 将硬编码的日志按钮从 'udp_server' (Node.js) 更新为 'udpgw' (BadVPN)。
-  - 确保静态 HTML 结构与后端 V9.1.0 的服务映射一致。
+  V8.3.3 (Axiom Refactor V5.7 - SSH-UDP Integration)
+  - [NEW] 在端口配置视图中新增 SSH-UDP Auth 端口输入框。
+  - 确保日志按钮与后端 CORE_SERVICES 列表匹配。
 -->
 <html lang="zh-CN" data-theme="light">
 <head>
@@ -59,7 +58,7 @@
             
             <!-- Header / 导航栏 (DaisyUI Navbar) -->
             <header class="navbar bg-base-100/80 backdrop-blur-md sticky top-0 z-30 shadow-sm border-b border-base-300/50">
-                <!-- ... [保留的 Header 内容 (包括 WS 状态灯)] ... -->
+                <!-- ... [Header 内容] ... -->
                  <div class="flex-none lg:hidden">
                     <label for="my-drawer-2" class="btn btn-ghost btn-square drawer-button">
                         <i data-lucide="menu" class="w-6 h-6"></i>
@@ -101,10 +100,9 @@
                 </div>
 
                 <!-- 1. 仪表盘视图 (默认显示) -->
-                <!-- [AXIOM V3.1] 建议 #1: 启用多列网格布局 -->
                 <div id="view-dashboard" class="grid grid-cols-1 lg:grid-cols-3 gap-6">
                     
-                    <!-- [AXIOM V3.1] 建议 #4: 骨架屏加载器 -->
+                    <!-- 骨架屏加载器 -->
                     <div id="dashboard-skeleton-loader" class="lg:col-span-3 grid grid-cols-1 lg:grid-cols-3 gap-6">
                         <!-- 骨架: 基础设施卡片 -->
                         <div class="card bg-base-100 shadow-xl lg:col-span-1">
@@ -142,24 +140,22 @@
                         </div>
                     </div>
                     
-                    <!-- [AXIOM V3.1] 真实数据容器 (默认隐藏) -->
-                    <!-- 这些容器将由 app.js 填充并显示 -->
+                    <!-- 真实数据容器 (默认隐藏) -->
                     
-                    <!-- 建议 #3: 合并后的“核心基础设施”卡片 (列 1) -->
+                    <!-- 核心基础设施卡片 (列 1) -->
                     <div id="system-status-card" class="card bg-base-100 shadow-xl hidden">
                         <div class="card-body p-6">
                             <h2 class="card-title text-xl font-semibold text-base-content border-b border-base-300 pb-3">
                                 <i data-lucide="server" class="w-5 h-5 mr-1 text-info"></i>
                                 核心基础设施
                             </h2>
-                            <!-- id="system-status-grid" 将由 app.js 填充状态、端口和按钮 -->
                             <div id="system-status-grid" class="space-y-3">
                                 <!-- app.js 将在此处填充内容 -->
                             </div>
                         </div>
                     </div>
                     
-                    <!-- 建议 #1: “用户统计”卡片 (列 2) -->
+                    <!-- 用户统计卡片 (列 2) -->
                     <div id="user-stats-card" class="card bg-base-100 shadow-xl lg:col-span-2 hidden">
                         <div class="card-body p-6">
                              <h2 class="card-title text-xl font-semibold text-base-content border-b border-base-300 pb-3">
@@ -170,7 +166,6 @@
                                 <div class="md:col-span-1 h-48 w-full max-w-xs mx-auto">
                                     <canvas id="user-stats-chart"></canvas>
                                 </div>
-                                <!-- id="user-quick-stats-text" 将由 app.js 填充 -->
                                 <div id="user-quick-stats-text" class="md:col-span-2 stats stats-vertical shadow">
                                     <!-- app.js 将在此处填充内容 -->
                                 </div>
@@ -178,7 +173,7 @@
                         </div>
                     </div>
 
-                    <!-- 建议 #2: “实时流量”卡片 (跨 3 列) -->
+                    <!-- 实时流量卡片 (跨 3 列) -->
                     <div id="realtime-traffic-card" class="card bg-base-100 shadow-xl lg:col-span-3 hidden">
                         <div class="card-body p-6">
                             <h2 class="card-title text-xl font-semibold text-base-content border-b border-base-300 pb-3">
@@ -192,9 +187,8 @@
                     </div>
                 </div>
 
-                <!-- 2. 用户管理视图 (无布局变化) -->
+                <!-- 2. 用户管理视图 -->
                 <div id="view-users" class="hidden">
-                    <!-- ... [保留的用户管理视图] ... -->
                     <h2 class="text-2xl font-bold text-base-content mb-6">👤 用户管理</h2>
                     <div id="batch-action-bar" class="fixed top-[68px] right-0 bg-primary text-primary-content p-4 shadow-lg z-20 flex flex-col sm:flex-row items-center justify-between gap-4">
                         <div>
@@ -258,9 +252,8 @@
                     </section>
                 </div>
                 
-                <!-- 3. 实时连接 IP 列表视图 (无布局变化) -->
+                <!-- 3. 实时连接 IP 列表视图 -->
                 <div id="view-live-ips" class="hidden">
-                    <!-- ... [保留的 IP 列表视图] ... -->
                      <h2 class="text-2xl font-bold text-base-content mb-6">📡 实时连接 IP 列表</h2>
                     <section class="card bg-base-100 shadow-xl">
                         <div class="card-body p-6">
@@ -273,9 +266,8 @@
                     </section>
                 </div>
 
-                <!-- 4. Host 白名单配置视图 (无布局变化) -->
+                <!-- 4. Host 白名单配置视图 -->
                 <div id="view-hosts" class="hidden">
-                    <!-- ... [保留的 Host 视图] ... -->
                     <h2 class="text-2xl font-bold text-base-content mb-6">⚙️ WSS 代理 Host 白名单管理</h2>
                     <section class="card bg-base-100 shadow-xl">
                         <form onsubmit="event.preventDefault(); saveHosts();" class="card-body p-6">
@@ -293,9 +285,8 @@
                     </section>
                 </div>
                 
-                <!-- 7. 载荷生成器 (无布局变化) -->
+                <!-- 7. 载荷生成器 -->
                 <div id="view-payload-gen" class="hidden">
-                    <!-- ... [保留的载荷生成器视图] ... -->
                     <h2 class="text-2xl font-bold text-base-content mb-6">🧬 载荷 (Payload) 生成器</h2>
                     <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
                         <div class="card bg-base-100 shadow-xl">
@@ -478,9 +469,8 @@
                 </div >
 
 
-                <!-- 5. 系统配置/日志视图 (无布局变化) -->
+                <!-- 5. 系统配置/日志视图 -->
                 <div id="view-settings" class="hidden">
-                    <!-- ... [保留的设置视图] ... -->
                     <h2 class="text-2xl font-bold text-base-content mb-6">🛠️ 系统配置/日志</h2>
                     <section class="grid grid-cols-1 md:grid-cols-2 gap-6">
                         <div class="card bg-base-100 shadow-xl">
@@ -532,11 +522,8 @@
                                 <h3 class="card-title text-xl font-semibold text-base-content border-b border-base-300 pb-3">核心服务日志 (最新 50 行)</h3>
                                 <div class="space-y-4">
                                     <div class="btn-group flex-wrap gap-1">
-                                        <button onclick="fetchServiceLogs('wss')" class="btn btn-ghost btn-sm">WSS Proxy</button>
-                                        <button onclick="fetchServiceLogs('stunnel4')" class="btn btn-ghost btn-sm">Stunnel4</button>
-                                        <!-- [AXIOM V5.6 FIX] Updated from 'udp_server' to 'udpgw' and label -->
-                                        <button onclick="fetchServiceLogs('udpgw')" class="btn btn-ghost btn-sm">BadVPN UDPGW</button> 
-                                        <button onclick="fetchServiceLogs('wss_panel')" class="btn btn-ghost btn-sm">Web Panel</button>
+                                        <!-- JS 会在这里动态填充按钮 -->
+                                        <p class="text-xs text-gray-500">加载日志按钮中...</p>
                                     </div >
                                     <div class="mockup-code bg-gray-800 text-gray-200 text-xs">
                                         <pre id="service-log-content" class="log-pre p-4">请选择服务加载日志...</pre>
@@ -555,9 +542,8 @@
                     </section>
                 </div >
                 
-                <!-- 6. 安全/IP 封禁列表视图 (无布局变化) -->
+                <!-- 6. 安全/IP 封禁列表视图 -->
                 <div id="view-security" class="hidden">
-                    <!-- ... [保留的 IP 封禁视图] ... -->
                     <h2 class="text-2xl font-bold text-base-content mb-6">🔒 全局 IP 封禁管理</h2>
                     <section class="card bg-base-100 shadow-xl mb-8">
                         <div class="card-body p-6">
@@ -581,9 +567,8 @@
                     </section>
                 </div >
                 
-                <!-- 8. 端口配置视图 (无布局变化) -->
+                <!-- 8. 端口配置视图 -->
                 <div id="view-port-config" class="hidden">
-                    <!-- ... [保留的端口配置视图] ... -->
                     <h2 class="text-2xl font-bold text-base-content mb-6">🔌 服务端口配置</h2>
                     <section class="card bg-base-100 shadow-xl">
                         <form id="port-config-form" onsubmit="event.preventDefault(); saveGlobalConfig();" class="card-body p-6">
@@ -624,6 +609,15 @@
                                             <span class="label-text">Native UDPGW (BadVPN) 端口</span>
                                         </label>
                                         <input type="number" id="config-udpgw-port" min="1" max="65535" required class="input input-bordered w-full">
+                                    </div >
+                                    <div class="form-control">
+                                        <label class="label" for="config-ssh-udp-port">
+                                            <span class="label-text">SSH-UDP Auth 端口 (TCP)</span>
+                                        </label>
+                                        <input type="number" id="config-ssh-udp-port" min="1" max="65535" required class="input input-bordered w-full">
+                                        <label class="label">
+                                            <span class="label-text-alt">HTTP Custom UDP 转发端口 (公网访问，带鉴权)。</span>
+                                        </label>
                                     </div >
                                 </div >
                                 <div class="space-y-4 p-4 bg-base-200 rounded-lg border border-base-300">
