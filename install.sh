@@ -5,11 +5,12 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V2.3.1 (Axiom - SSH-UDP Integration & Unbound Variable Fix)
+# V2.3.2 (Axiom - C++ BadVPN + SSH-UDP Integration)
 #
 # [CHANGELOG]
-# - [FIX] 修复 WSS_SERVICE_PATH 和 PANEL_SERVICE_PATH 未绑定变量的错误。
+# - 恢复 BadVPN C++ 编译和安装逻辑 (确保 udpgw 运行 C++ 二进制)。
 # - 新增 SSH-UDP (UDP over TCP with Auth) 服务部署逻辑。
+# - 修复了所有 unbound variable 错误。
 # ==========================================================
 
 # =============================
@@ -36,13 +37,14 @@ PANEL_JS_DEST="$PANEL_DIR/app.js"
 LOGIN_HTML_DEST="$PANEL_DIR/login.html" 
 PACKAGE_JSON_DEST="$PANEL_DIR/package.json"
 
-# [FIXED] Systemd 服务路径
+# [FIXED] Systemd 服务路径 (确保在顶部定义)
 WSS_SERVICE_PATH="/etc/systemd/system/wss.service"
 PANEL_SERVICE_PATH="/etc/systemd/system/wss_panel.service"
+WSS_TEMPLATE="$REPO_ROOT/wss.service.template"
+PANEL_TEMPLATE="$REPO_ROOT/wss_panel.service.template"
 
-# UDPGW (BadVPN) 路径
-UDPGW_SCRIPT_SRC="$REPO_ROOT/udp_server.js"
-UDPGW_SCRIPT_DEST="$PANEL_DIR/udp_server.js"
+# UDPGW (BadVPN C++) 路径
+BADVPN_SRC_DIR="/root/badvpn" # C++ 源码路径
 UDPGW_SERVICE_PATH="/etc/systemd/system/udpgw.service"
 UDPGW_TEMPLATE="$REPO_ROOT/udpgw.service.template"
 
@@ -152,10 +154,14 @@ if ! command -v node >/dev/null; then
     apt install -y nodejs
 fi
 
-apt install -y wget curl git net-tools openssl stunnel4 iproute2 iptables procps libsqlite3-dev passwd sudo || echo "警告: 依赖安装失败。"
+# 安装编译 BadVPN 所需的工具
+apt install -y wget curl git net-tools cmake build-essential openssl stunnel4 iproute2 iptables procps libsqlite3-dev passwd sudo || echo "警告: 依赖安装失败。"
 
 if ! id -u "$panel_user" >/dev/null 2>&1; then
+    echo "正在创建系统用户 '$panel_user'..."
     adduser --system --no-create-home "$panel_user"
+else
+    echo "系统用户 '$panel_user' 已存在。"
 fi
 
 echo "安装 Node.js 依赖..."
@@ -165,6 +171,7 @@ if ! npm install --production; then
     echo "严重警告: Node.js 核心依赖安装失败。"
     exit 1
 fi
+cd "$REPO_ROOT" # 切换回根目录
 
 # 首次部署，计算 ROOT hash
 if [ ! -f "$ROOT_HASH_FILE" ] && [ -n "${PANEL_ROOT_PASS_RAW:-}" ]; then
@@ -275,6 +282,7 @@ net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_keepalive_time = 60
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_keepalive_intvl = 5
+# BadVPN UDPGW Buffer Tuning (Max 32MB, Default 8MB)
 net.core.rmem_max = 33554432
 net.core.wmem_max = 33554432
 net.core.rmem_default = 8388608
@@ -293,34 +301,19 @@ chmod +x "$WSS_PROXY_PATH"
 cp "$REPO_ROOT/wss_panel.js" "$PANEL_BACKEND_DEST"
 chmod +x "$PANEL_BACKEND_DEST"
 
-# 部署 UDPGW (Node.js) - FIX: 确保文件存在
-if [ -f "$UDPGW_SCRIPT_SRC" ]; then
-    echo "部署 UDPGW (Node.js) 服务脚本..."
-    cp "$UDPGW_SCRIPT_SRC" "$UDPGW_SCRIPT_DEST"
-    chmod +x "$UDPGW_SCRIPT_DEST"
-else
-    # 严重警告: 文件确实缺失。此时部署可能会失败。
-    echo "严重错误: 找不到 ${UDPGW_SCRIPT_SRC} 源文件，UDPGW 服务将无法部署！"
-    # 这里我们不再退出，而是继续，等待用户处理文件，因为用户明确表示要修复部署。
-fi
-
-
-# [NEW] 部署 SSH-UDP (Node.js)
+# [NEW] 部署 SSH-UDP (Node.js) - 确保文件存在
 if [ -f "$SSH_UDP_SCRIPT_SRC" ]; then
     echo "部署 SSH-UDP (Auth) 服务脚本..."
     cp "$SSH_UDP_SCRIPT_SRC" "$SSH_UDP_SCRIPT_DEST"
     chmod +x "$SSH_UDP_SCRIPT_DEST"
 else
-    echo "严重错误: 找不到 ${SSH_UDP_SCRIPT_SRC} 源文件，SSH-UDP 服务将无法部署！"
+    echo "严重警告: 找不到 ${SSH_UDP_SCRIPT_SRC} 源文件，SSH-UDP 服务将无法部署！"
 fi
 
+# 部署前端静态文件
 cp "$REPO_ROOT/index.html" "$PANEL_HTML_DEST"
 cp "$REPO_ROOT/app.js" "$PANEL_JS_DEST"
 cp "$REPO_ROOT/login.html" "$LOGIN_HTML_DEST"
-cp "$REPO_ROOT/wss.service.template" "/etc/systemd/system/wss.service.template" # ensure template exists for next step
-cp "$REPO_ROOT/wss_panel.service.template" "/etc/systemd/system/wss_panel.service.template" # ensure template exists for next step
-cp "$REPO_ROOT/udpgw.service.template" "/etc/systemd/system/udpgw.service.template" # ensure template exists for next step
-cp "$REPO_ROOT/ssh_udp.service.template" "/etc/systemd/system/ssh_udp.service.template" # ensure template exists for next step
 
 if [ ! -f "$DB_PATH" ]; then echo "Database will be initialized on start."; fi
 [ ! -f "$WSS_LOG_FILE" ] && touch "$WSS_LOG_FILE"
@@ -330,7 +323,7 @@ echo "----------------------------------"
 
 
 # =============================
-# 安装 Stunnel4 (省略部分细节，保持现有逻辑)
+# 安装 Stunnel4 (保持不变)
 # =============================
 echo "==== 重新安装 Stunnel4 ===="
 if ! getent group shell_users >/dev/null; then groupadd shell_users; fi
@@ -365,43 +358,48 @@ systemctl enable stunnel4
 systemctl restart stunnel4
 echo "----------------------------------"
 
-
 # =============================
-# 部署 Systemd 服务
+# 编译并部署 BadVPN UDPGW (C++ 方案)
 # =============================
-echo "==== 部署 Systemd 服务 ===="
-
-# 1. UDPGW (Local BadVPN)
-cp "$UDPGW_TEMPLATE" "$UDPGW_SERVICE_PATH"
-systemctl enable udpgw
-
-# 2. [NEW] SSH-UDP (Public Auth UDP)
-if [ -f "$SSH_UDP_TEMPLATE" ]; then
-    cp "$SSH_UDP_TEMPLATE" "$SSH_UDP_SERVICE_PATH"
-    systemctl enable ssh_udp
-else
-    echo "警告: ssh_udp.service.template 未找到。"
+echo "==== 编译并部署 BadVPN UDPGW (C++ 方案) ===="
+# 1. 检查并拉取源码
+if [ ! -d "$BADVPN_SRC_DIR" ]; then
+    echo "正在拉取 BadVPN 源码..."
+    git clone https://github.com/ambrop72/badvpn.git "$BADVPN_SRC_DIR" > /dev/null 2>&1
 fi
 
-# 3. WSS Proxy
-WSS_TEMPLATE="$REPO_ROOT/wss.service.template"
-cp "$WSS_TEMPLATE" "$WSS_SERVICE_PATH"
-sed -i "s|@WSS_LOG_FILE_PATH@|$WSS_LOG_FILE|g" "$WSS_SERVICE_PATH"
-sed -i "s|@WSS_PROXY_SCRIPT_PATH@|$WSS_PROXY_PATH|g" "$WSS_SERVICE_PATH"
+# 2. 创建构建目录
+mkdir -p "$BADVPN_SRC_DIR/badvpn-build"
+cd "$BADVPN_SRC_DIR/badvpn-build"
 
-# 4. WSS Panel
-PANEL_TEMPLATE="$REPO_ROOT/wss_panel.service.template"
-cp "$PANEL_TEMPLATE" "$PANEL_SERVICE_PATH"
-sed -i "s|@PANEL_DIR@|$PANEL_DIR|g" "$PANEL_SERVICE_PATH"
-sed -i "s|@PANEL_USER@|$panel_user|g" "$PANEL_SERVICE_PATH"
-sed -i "s|@PANEL_BACKEND_SCRIPT_PATH@|$PANEL_BACKEND_FILE|g" "$PANEL_SERVICE_PATH"
+# 3. Cmake 配置 (只编译 UDPGW, Release 模式)
+echo "正在配置 BadVPN 编译选项..."
+cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
 
-chown -R "$panel_user:$panel_user" "$PANEL_DIR"
-chown "$panel_user:$panel_user" "$WSS_LOG_FILE"
-chown "$panel_user:$panel_user" "$CONFIG_PATH"
-chmod 600 "$CONFIG_PATH"
+# 4. 编译
+echo "正在编译 BadVPN (可能需要几分钟)..."
+make -j$(nproc) > /dev/null 2>&1
 
-# 5. IPTABLES (开放新端口)
+# 5. 部署 Systemd 服务 (使用 C++ 模板)
+cd "$REPO_ROOT" > /dev/null 2>&1
+if [ -f "$UDPGW_TEMPLATE" ]; then
+    cp "$UDPGW_TEMPLATE" "$UDPGW_SERVICE_PATH"
+    sed -i "s|@UDPGW_PORT@|$UDPGW_PORT|g" "$UDPGW_SERVICE_PATH"
+else
+    echo "严重警告: 找不到 ${UDPGW_TEMPLATE} 模板文件，UDPGW 服务将无法启动。"
+fi
+
+systemctl daemon-reload
+systemctl enable udpgw
+systemctl restart udpgw
+echo "BadVPN UDPGW C++ 已启动 (端口: $UDPGW_PORT)。"
+echo "----------------------------------"
+
+
+# =============================
+# IPTABLES & Systemd (其他服务)
+# =============================
+echo "==== 配置 IPTABLES ===="
 BLOCK_CHAIN="WSS_IP_BLOCK"
 iptables -F $BLOCK_CHAIN 2>/dev/null || true
 iptables -X $BLOCK_CHAIN 2>/dev/null || true
@@ -414,6 +412,7 @@ iptables -I INPUT -p tcp --dport $WSS_TLS_PORT -j ACCEPT
 iptables -I INPUT -p tcp --dport $STUNNEL_PORT -j ACCEPT
 iptables -I INPUT -p tcp --dport $PANEL_PORT -j ACCEPT
 iptables -I INPUT -p tcp --dport $SSH_UDP_PORT -j ACCEPT # [NEW] 开放 SSH-UDP 端口
+iptables -I INPUT -p tcp --dport $UDPGW_PORT -j ACCEPT # 开放 UDPGW 端口 (TCP协议)
 
 if command -v netfilter-persistent >/dev/null; then
     /sbin/iptables-save > "$IPTABLES_RULES"
