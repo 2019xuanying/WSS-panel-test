@@ -1,0 +1,62 @@
+{
+  // ==========================================================
+  // Xray Core VLESS + WebSocket 配置模板 (Axiom V6.0)
+  // 职责: 监听内部端口，接收来自 Nginx 反代 /xray/ 的 VLESS/WS 流量，并转发给 SSHD。
+  // ==========================================================
+  
+  "log": {
+    "loglevel": "warning",
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log"
+  },
+  
+  "inbounds": [
+    {
+      "port": @XRAY_INTERNAL_PORT@,
+      "protocol": "vless",
+      "listen": "127.0.0.1",
+      "settings": {
+        // VLESS 协议的配置
+        "clients": [
+          {
+            // 此处使用一个固定的 UUID 作为 Xray 的用户ID。
+            // 客户端需要知道此 UUID 才能连接。
+            // 流量统计将基于这个入站连接，但无法按用户区分。
+            "id": "e4567890-1234-5678-9012-345678901234",
+            "level": 0
+          }
+        ],
+        "decryption": "none" // VLESS + WS 流量通常无需额外的解密
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          // 与 Nginx 转发路径对应
+          "path": "/xray/" 
+        }
+      }
+    }
+  ],
+  
+  "outbounds": [
+    {
+      // 出站目标: SSH Daemon (例如 127.0.0.1:22)
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "AsIs",
+        "redirect": "127.0.0.1:@INTERNAL_FORWARD_PORT@"
+      },
+      "tag": "direct"
+    },
+    {
+      // 阻止无法路由的流量外泄
+      "protocol": "blackhole",
+      "tag": "blocked"
+    }
+  ],
+  
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": []
+  }
+}
