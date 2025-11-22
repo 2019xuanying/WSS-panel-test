@@ -1,11 +1,10 @@
 /**
- * WSS Panel Frontend (Axiom Refactor V5.5 - UDPGW & Zombie Cleanup)
+ * WSS Panel Frontend (Axiom Refactor V5.6 - BadVPN UI Integration)
  *
- * [AXIOM V5.5 CHANGELOG]
- * - [B2 FIX] 确保 CORE_SERVICES_MAP 包含 'udp_server'，用于日志和状态显示。
- * - [僵尸清理 FIX] 优化 handleSilentUpdate，确保只有在收到新的活动数据时才更新用户实时速度。
- * - 确保 fetchAllStaticData 在初始化时正确设置日志按钮。
- * - [V5.2] 实现 `openConnectionDetailsModal(username)` 函数。
+ * [AXIOM V5.6 CHANGELOG]
+ * - [UI FIX] 更新 CORE_SERVICES_MAP 以匹配后端新的 'udpgw' (BadVPN) 服务 ID。
+ * - 修复日志查看器按钮，确保请求正确的服务日志。
+ * - 保持与后端 V9.1.0 的协议一致性。
  */
 
 // --- 全局配置 (将由 initializeApp 异步填充) ---
@@ -36,11 +35,11 @@ let lastUserStats = { total: -1, total_traffic_gb: -1 };
 
 const TOKEN_PLACEHOLDER = "[*********]";
 
-// [AXIOM V5.5 FIX] CORE_SERVICES 映射，用于 UI 日志和状态显示
+// [AXIOM V5.6 FIX] 更新服务映射，指向 BadVPN UDPGW
 const CORE_SERVICES_MAP = {
     'wss': 'WSS Proxy',
     'stunnel4': 'Stunnel4',
-    'udp_server': 'Native UDPGW', // [AXIOM V5.5] 确保包含 UDPGW
+    'udpgw': 'BadVPN UDPGW', // [AXIOM V5.6] Updated from udp_server
     'wss_panel': 'Web Panel'
 };
 
@@ -1526,10 +1525,10 @@ document.getElementById('add-user-form').addEventListener('submit', async (e) =>
             username: username, 
             password: password, 
             expiration_days: parseInt(expirationDays),
-            quota_gb: parseFloat(quotaGb),
-            rate_kbps: parseInt(rateKbps),
-            max_connections: parseInt(maxConnections),
-            require_auth_header: requireAuth ? 1 : 0,
+            quota_gb: parseFloat(quota_gb), 
+            rate_kbps: parseInt(rate_kbps),
+            max_connections: parseInt(max_connections),
+            require_auth_header: require_auth_header ? 1 : 0,
             allow_shell: allowShell ? 1 : 0 
         })
     });
