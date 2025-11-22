@@ -1,8 +1,8 @@
 <!DOCTYPE html>
 <!-- 
-  V8.3.3 (Axiom Refactor V5.7 - SSH-UDP Integration)
-  - [NEW] 在端口配置视图中新增 SSH-UDP Auth 端口输入框。
-  - 确保日志按钮与后端 CORE_SERVICES 列表匹配。
+  V9.0.0 (Axiom Refactor V6.0 - Xray/Nginx Integration UI)
+  - [NEW] 新增端口配置视图，包含 Nginx/Xray 内部端口和 Nginx 启用开关。
+  - [FIX] 更新系统配置视图，包含 Nginx 启用开关。
 -->
 <html lang="zh-CN" data-theme="light">
 <head>
@@ -257,7 +257,7 @@
                      <h2 class="text-2xl font-bold text-base-content mb-6">📡 实时连接 IP 列表</h2>
                     <section class="card bg-base-100 shadow-xl">
                         <div class="card-body p-6">
-                            <h3 class="card-title text-xl font-semibold text-base-content border-b border-base-300 pb-3">当前连接到 WSS/Stunnel 端口的外部 IP</h3>
+                            <h3 class="card-title text-xl font-semibold text-base-content border-b border-base-300 pb-3">当前连接到 WSS/Stunnel/SSH-UDP 的外部 IP</h3>
                             <div id="live-ip-list" class="space-y-3 max-h-96 overflow-y-auto p-3 bg-base-200 rounded-lg border border-base-300">
                                 <p class="text-gray-500">正在加载实时 IP 数据...</p>
                             </div>
@@ -488,6 +488,15 @@
                                         <span class="label-text-alt">当单个用户实时速率超过此值, 将被自动暂停。 (0 = 不启用)</span>
                                     </label>
                                 </div >
+                                <div class="form-control border-t pt-4 mt-4">
+                                     <label class="label cursor-pointer justify-between" for="global-nginx-enable">
+                                        <span class="label-text font-bold">启用 Nginx/Xray TLS 混淆</span>
+                                        <input type="checkbox" id="global-nginx-enable" class="toggle toggle-primary">
+                                    </label>
+                                    <label class="label">
+                                        <span class="label-text-alt">启用后，Nginx 将接管 443 端口，用于流量分流。WSS Proxy 将切换到内部端口监听。</span>
+                                    </label>
+                                </div>
                                 <div class="card-actions mt-2">
                                     <button type="submit" class="btn btn-primary w-full">
                                         <i data-lucide="save" class="w-4 h-4"></i> 保存全局设置
@@ -579,8 +588,8 @@
                             </p>
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4">
                                 <div class="space-y-4 p-4 bg-base-200 rounded-lg border border-base-300">
-                                    <h4 class="font-semibold text-lg text-base-content">外部端口 (面向用户)</h4>
-                                    <div class="form-control">
+                                    <h4 class="font-semibold text-lg text-base-content">外部/公网端口 (直接访问)</h4>
+                                     <div class="form-control">
                                         <label class="label" for="config-panel-port">
                                             <span class="label-text">Web 面板端口 (HTTP)</span>
                                         </label>
@@ -605,30 +614,57 @@
                                         <input type="number" id="config-stunnel-port" min="1" max="65535" required class="input input-bordered w-full">
                                     </div >
                                     <div class="form-control">
+                                        <label class="label" for="config-ssh-udp-port">
+                                            <span class="label-text">SSH-UDP Auth 端口 (Raw TCP)</span>
+                                        </label>
+                                        <input type="number" id="config-ssh-udp-port" min="1" max="65535" required class="input input-bordered w-full">
+                                        <label class="label">
+                                            <span class="label-text-alt">HTTP Custom UDP 转发端口 (公网访问)。</span>
+                                        </label>
+                                    </div >
+                                    <div class="form-control">
+                                        <label class="label" for="config-nginx-external-port">
+                                            <span class="label-text">Nginx/Xray 外部监听端口 (TLS)</span>
+                                        </label>
+                                        <input type="number" id="config-nginx-external-port" min="1" max="65535" required class="input input-bordered w-full">
+                                        <label class="label">
+                                            <span class="label-text-alt">Nginx 接管的对外端口 (通常为 443)。</span>
+                                        </label>
+                                    </div >
+                                </div >
+                                <div class="space-y-4 p-4 bg-base-200 rounded-lg border border-base-300">
+                                    <h4 class="font-semibold text-lg text-base-content">内部转发端口 (仅 127.0.0.1)</h4>
+                                    <div class="form-control">
+                                        <label class="label" for="config-internal-forward-port">
+                                            <span class="label-text">SSH Daemon 转发端口 (SSHD)</span>
+                                        </label>
+                                        <input type="number" id="config-internal-forward-port" min="1" max="65535" required class="input input-bordered w-full">
+                                        <label class="label">
+                                            <span class="label-text-alt">WSS/Xray 代理将流量转发到此端口 (通常是 22)。</span>
+                                        </label>
+                                    </div >
+                                    <div class="form-control">
                                         <label class="label" for="config-udpgw-port">
                                             <span class="label-text">Native UDPGW (BadVPN) 端口</span>
                                         </label>
                                         <input type="number" id="config-udpgw-port" min="1" max="65535" required class="input input-bordered w-full">
                                     </div >
-                                    <div class="form-control">
-                                        <label class="label" for="config-ssh-udp-port">
-                                            <span class="label-text">SSH-UDP Auth 端口 (TCP)</span>
+                                     <div class="form-control">
+                                        <label class="label" for="config-internal-wss-port">
+                                            <span class="label-text">WSS Proxy 内部监听端口 (WSS -> Nginx)</span>
                                         </label>
-                                        <input type="number" id="config-ssh-udp-port" min="1" max="65535" required class="input input-bordered w-full">
+                                        <input type="number" id="config-internal-wss-port" min="1" max="65535" required class="input input-bordered w-full">
                                         <label class="label">
-                                            <span class="label-text-alt">HTTP Custom UDP 转发端口 (公网访问，带鉴权)。</span>
+                                            <span class="label-text-alt">Nginx 将 TLS 流量反代到此端口。</span>
                                         </label>
                                     </div >
-                                </div >
-                                <div class="space-y-4 p-4 bg-base-200 rounded-lg border border-base-300">
-                                    <h4 class="font-semibold text-lg text-base-content">内部端口 (仅 127.0.0.1)</h4>
                                     <div class="form-control">
-                                        <label class="label" for="config-internal-forward-port">
-                                            <span class="label-text">内部 SSH (WSS) 转发端口</span>
+                                        <label class="label" for="config-xray-internal-port">
+                                            <span class="label-text">Xray Core 内部监听端口 (Xray -> Nginx)</span>
                                         </label>
-                                        <input type="number" id="config-internal-forward-port" min="1" max="65535" required class="input input-bordered w-full">
+                                        <input type="number" id="config-xray-internal-port" min="1" max="65535" required class="input input-bordered w-full">
                                         <label class="label">
-                                            <span class="label-text-alt">WSS 代理将流量转发到此端口 (通常是 22)。</span>
+                                            <span class="label-text-alt">Nginx 将 Xray 流量反代到此端口。</span>
                                         </label>
                                     </div >
                                     <div class="form-control">
@@ -636,9 +672,6 @@
                                             <span class="label-text">内部 API 端口 (Proxy -> Panel)</span>
                                         </label>
                                         <input type="number" id="config-internal-api-port" min="1" max="65535" required class="input input-bordered w-full" disabled>
-                                        <label class="label">
-                                            <span class="label-text-alt">此端口 (54322) 不可修改，用于统计。</span>
-                                        </label>
                                     </div >
                                 </div >
                             </div >
@@ -879,7 +912,7 @@
             <button>close</button>
         </form>
     </dialog>
-    
+
     <!-- "流量图" 模态框 -->
     <dialog id="traffic-chart-modal" class="modal">
          <div class="modal-box max-w-3xl">
@@ -919,4 +952,4 @@
     <script src="app.js" defer></script>
 
 </body >
-</html >
+</html>
