@@ -5,7 +5,7 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V2.5.1 (Axiom V6.1 - Xray Install & Domain Fix)
+# V2.5.3 (Axiom V6.2 - Robust Xray Install & Config Check)
 # ==========================================================
 
 # =============================
@@ -21,6 +21,7 @@ INTERNAL_SECRET_PATH="$PANEL_DIR/internal_secret.txt"
 IPTABLES_RULES="/etc/iptables/rules.v4"
 DB_PATH="$PANEL_DIR/wss_panel.db"
 XRAY_BIN_PATH="/usr/local/bin/xray" # Xray Core 默认安装路径
+XRAY_INSTALL_URL="https://github.com/XTLS/Xray-core/raw/main/install-release.sh" # 原始安装脚本 URL
 
 # 源文件路径
 WSS_PROXY_SRC="$REPO_ROOT/wss_proxy.js"
@@ -177,16 +178,24 @@ if ! command -v nginx >/dev/null; then
     apt install -y nginx
 fi
 
-# [V6.1 修复] Xray 安装 (分步执行)
+# [V6.2 修复] Xray 安装 (健壮性检查)
 if ! command -v xray >/dev/null; then
-    echo "正在下载和安装 Xray Core..."
+    echo "正在下载和安装 Xray Core (使用官方脚本)..."
     XRAY_INSTALL_SCRIPT="/tmp/install-xray.sh"
-    # 使用 curl 下载脚本
-    if curl -L -o "$XRAY_INSTALL_SCRIPT" https://github.com/XTLS/Xray-core/raw/main/install-release.sh; then
-        chmod +x "$XRAY_INSTALL_SCRIPT"
-        # 执行脚本
-        if ! bash "$XRAY_INSTALL_SCRIPT"; then
-            echo "警告: Xray Core 安装失败，请手动检查 /tmp/install-xray.sh 的输出。"
+    
+    # 使用 curl 下载脚本到临时文件，并检查是否为 HTML (即下载失败)
+    # --fail: 任何 HTTP 错误都会导致非零退出码
+    # --location: 遵循重定向
+    if curl --fail --location --silent --output "$XRAY_INSTALL_SCRIPT" "$XRAY_INSTALL_URL"; then
+        # 再次检查文件是否为有效的 Bash 脚本 (至少 100 字节，防止空文件，并检查首行)
+        if [ -s "$XRAY_INSTALL_SCRIPT" ] && [ "$(head -n 1 "$XRAY_INSTALL_SCRIPT" | grep -Ec "^#!\/bin\/bash|^#!\/usr\/bin\/env bash")" -eq 1 ]; then
+            chmod +x "$XRAY_INSTALL_SCRIPT"
+            echo "Xray 安装脚本下载成功，正在执行..."
+            if ! bash "$XRAY_INSTALL_SCRIPT"; then
+                echo "警告: Xray Core 安装脚本执行失败。"
+            fi
+        else
+            echo "错误: 下载的文件不是有效的 Bash 脚本 (可能被网络劫持或下载失败)。跳过 Xray 安装。"
         fi
         rm -f "$XRAY_INSTALL_SCRIPT"
     else
@@ -345,6 +354,7 @@ chown -R "$panel_user:$panel_user" "$PANEL_DIR"
 # =============================
 echo "==== 配置 Stunnel4, Nginx, Xray ===="
 if ! getent group shell_users >/dev/null; then groupadd shell_users; fi
+# 使用域名生成自签名证书
 openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/stunnel/certs/stunnel.key -out /etc/stunnel/certs/stunnel.crt -days 1095 -subj "/CN=$SERVER_DOMAIN" > /dev/null 2>&1
 cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem
 chmod 600 /etc/stunnel/certs/*.key /etc/stunnel/certs/*.pem
@@ -372,7 +382,7 @@ systemctl restart stunnel4
 sed -i "s/@XRAY_INTERNAL_PORT@/$XRAY_INTERNAL_PORT/g" "$XRAY_CONFIG_DEST"
 sed -i "s/@INTERNAL_FORWARD_PORT@/$INTERNAL_FORWARD_PORT/g" "$XRAY_CONFIG_DEST"
 # [V6.1 新增] 替换 Xray UUID
-sed -i "s/e4567890-1234-5678-9012-345678901234/$XRAY_UUID/g" "$XRAY_CONFIG_DEST"
+sed -i "s/@XRAY_UUID@/$XRAY_UUID/g" "$XRAY_CONFIG_DEST"
 
 
 # 7.3 Nginx 配置 (替换占位符并启用)
