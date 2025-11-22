@@ -5,6 +5,7 @@
   "wss_tls_port": 443,
   "stunnel_port": 444,
   "udpgw_port": 7300,
+  "ssh_udp_port": 7400,
   "internal_forward_port": 22,
   "internal_api_port": 54322,
   "internal_api_secret": "default-secret-key-please-change",
