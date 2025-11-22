@@ -5,7 +5,7 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V2.5.0 (Axiom V6.0 - Nginx/Xray/Raw TCP Integration)
+# V2.5.1 (Axiom V6.1 - Xray Install & Domain Fix)
 # ==========================================================
 
 # =============================
@@ -76,7 +76,7 @@ touch "$WSS_LOG_FILE"
 # 2. 交互式端口配置
 # =============================
 echo "----------------------------------"
-echo "==== WSS 基础设施配置 (V6.0) ===="
+echo "==== WSS 基础设施配置 (V6.1) ===="
 echo "请确认或修改以下端口和服务用户设置 (回车以使用默认值)。"
 
 read -p "  1. WSS HTTP 端口 [80]: " WSS_HTTP_PORT
@@ -92,28 +92,34 @@ SSH_UDP_PORT=${SSH_UDP_PORT:-7400}
 read -p "  4. Nginx 外部监听端口 (TLS) [443]: " NGINX_EXTERNAL_PORT
 NGINX_EXTERNAL_PORT=${NGINX_EXTERNAL_PORT:-443}
 
+# [V6.1 新增] Nginx 域名配置
+read -p "  5. 混淆域名 (用于 Nginx/Xray SNI 验证) [example.com]: " SERVER_DOMAIN
+SERVER_DOMAIN=${SERVER_DOMAIN:-example.com}
+
 # 内部端口
-read -p "  5. WSS Proxy 内部监听端口 [44333]: " INTERNAL_WSS_PORT
+read -p "  6. WSS Proxy 内部监听端口 [44333]: " INTERNAL_WSS_PORT
 INTERNAL_WSS_PORT=${INTERNAL_WSS_PORT:-44333}
 
-read -p "  6. Xray Core 内部监听端口 [44444]: " XRAY_INTERNAL_PORT
+read -p "  7. Xray Core 内部监听端口 [44444]: " XRAY_INTERNAL_PORT
 XRAY_INTERNAL_PORT=${XRAY_INTERNAL_PORT:-44444}
 
-read -p "  7. BadVPN UDPGW 端口 (本地) [7300]: " UDPGW_PORT
+read -p "  8. BadVPN UDPGW 端口 (本地) [7300]: " UDPGW_PORT
 UDPGW_PORT=${UDPGW_PORT:-7300}
 
-read -p "  8. Web 面板端口 [54321]: " PANEL_PORT
+read -p "  9. Web 面板端口 [54321]: " PANEL_PORT
 PANEL_PORT=${PANEL_PORT:-54321}
 
-read -p "  9. 内部 SSH (转发) 端口 [22]: " INTERNAL_FORWARD_PORT
+read -p "  10. 内部 SSH (转发) 端口 [22]: " INTERNAL_FORWARD_PORT
 INTERNAL_FORWARD_PORT=${INTERNAL_FORWARD_PORT:-22}
 
-read -p "  10. 内部 Stunnel SSHD 端口 [2222]: " SSHD_STUNNEL_PORT
+read -p "  11. 内部 Stunnel SSHD 端口 [2222]: " SSHD_STUNNEL_PORT
 SSHD_STUNNEL_PORT=${SSHD_STUNNEL_PORT:-2222}
 
-read -p "  11. Panel 服务用户名 [admin]: " panel_user
+read -p "  12. Panel 服务用户名 [admin]: " panel_user
 panel_user=${panel_user:-admin}
 
+# 生成唯一的 Xray UUID
+XRAY_UUID=$(cat /proc/sys/kernel/random/uuid || openssl rand -hex 16)
 INTERNAL_API_PORT=54322 
 WSS_TLS_PORT=$NGINX_EXTERNAL_PORT # WSS TLS 公网端口被 Nginx 占用
 PANEL_API_URL="http://127.0.0.1:$PANEL_PORT/internal"
@@ -121,16 +127,11 @@ PROXY_API_URL="http://127.0.0.1:$INTERNAL_API_PORT"
 
 echo "---------------------------------"
 echo "配置确认："
-echo "Panel 用户: $panel_user"
-echo "WSS HTTP -> $WSS_HTTP_PORT"
-echo "Stunnel (SSH/TLS) -> $STUNNEL_PORT"
-echo "SSH-UDP (Raw TCP) -> $SSH_UDP_PORT"
+echo "混淆域名: $SERVER_DOMAIN"
+echo "Xray UUID: $XRAY_UUID"
 echo "Nginx/Xray (TLS/WS) -> $NGINX_EXTERNAL_PORT (公网)"
 echo "WSS Proxy 内部监听: 127.0.0.1:$INTERNAL_WSS_PORT"
 echo "Xray Core 内部监听: 127.0.0.1:$XRAY_INTERNAL_PORT"
-echo "BadVPN UDPGW (本地) -> $UDPGW_PORT"
-echo "Web Panel (HTTP) & IPC -> $PANEL_PORT"
-echo "内部 SSH 转发: $INTERNAL_FORWARD_PORT"
 echo "---------------------------------"
 
 if [ -f "$ROOT_HASH_FILE" ]; then
@@ -176,10 +177,21 @@ if ! command -v nginx >/dev/null; then
     apt install -y nginx
 fi
 
-# [V6.0 新增] 安装 Xray
+# [V6.1 修复] Xray 安装 (分步执行)
 if ! command -v xray >/dev/null; then
     echo "正在下载和安装 Xray Core..."
-    bash -c "$(curl -L https://github.com/XTLS/Xray-core/raw/main/install-release.sh)" || echo "警告: Xray Core 安装失败，将跳过 Xray 服务配置。"
+    XRAY_INSTALL_SCRIPT="/tmp/install-xray.sh"
+    # 使用 curl 下载脚本
+    if curl -L -o "$XRAY_INSTALL_SCRIPT" https://github.com/XTLS/Xray-core/raw/main/install-release.sh; then
+        chmod +x "$XRAY_INSTALL_SCRIPT"
+        # 执行脚本
+        if ! bash "$XRAY_INSTALL_SCRIPT"; then
+            echo "警告: Xray Core 安装失败，请手动检查 /tmp/install-xray.sh 的输出。"
+        fi
+        rm -f "$XRAY_INSTALL_SCRIPT"
+    else
+        echo "警告: 无法下载 Xray 安装脚本，请检查网络连接。"
+    fi
 fi
 
 
@@ -231,6 +243,8 @@ tee "$CONFIG_PATH" > /dev/null <<EOF
   "xray_internal_port": $XRAY_INTERNAL_PORT,
   "nginx_external_port": $NGINX_EXTERNAL_PORT,
   "nginx_enabled": 1,
+  "server_domain": "$SERVER_DOMAIN",
+  "xray_uuid": "$XRAY_UUID",
   "internal_api_secret": "$INTERNAL_SECRET",
   "panel_api_url": "$PANEL_API_URL",
   "proxy_api_url": "$PROXY_API_URL"
@@ -331,7 +345,7 @@ chown -R "$panel_user:$panel_user" "$PANEL_DIR"
 # =============================
 echo "==== 配置 Stunnel4, Nginx, Xray ===="
 if ! getent group shell_users >/dev/null; then groupadd shell_users; fi
-openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/stunnel/certs/stunnel.key -out /etc/stunnel/certs/stunnel.crt -days 1095 -subj "/CN=example.com" > /dev/null 2>&1
+openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/stunnel/certs/stunnel.key -out /etc/stunnel/certs/stunnel.crt -days 1095 -subj "/CN=$SERVER_DOMAIN" > /dev/null 2>&1
 cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem
 chmod 600 /etc/stunnel/certs/*.key /etc/stunnel/certs/*.pem
 
@@ -357,10 +371,16 @@ systemctl restart stunnel4
 # 7.2 Xray 核心配置 (替换占位符)
 sed -i "s/@XRAY_INTERNAL_PORT@/$XRAY_INTERNAL_PORT/g" "$XRAY_CONFIG_DEST"
 sed -i "s/@INTERNAL_FORWARD_PORT@/$INTERNAL_FORWARD_PORT/g" "$XRAY_CONFIG_DEST"
+# [V6.1 新增] 替换 Xray UUID
+sed -i "s/e4567890-1234-5678-9012-345678901234/$XRAY_UUID/g" "$XRAY_CONFIG_DEST"
+
 
 # 7.3 Nginx 配置 (替换占位符并启用)
 if [ -f "$NGINX_CONF_TEMPLATE" ]; then
     cp "$NGINX_CONF_TEMPLATE" "$NGINX_CONF_DEST"
+    # 替换域名
+    sed -i "s/@SERVER_DOMAIN@/$SERVER_DOMAIN/g" "$NGINX_CONF_DEST"
+    # 替换端口
     sed -i "s/@NGINX_EXTERNAL_PORT@/$NGINX_EXTERNAL_PORT/g" "$NGINX_CONF_DEST"
     sed -i "s/@INTERNAL_WSS_PORT@/$INTERNAL_WSS_PORT/g" "$NGINX_CONF_DEST"
     sed -i "s/@XRAY_INTERNAL_PORT@/$XRAY_INTERNAL_PORT/g" "$NGINX_CONF_DEST"
@@ -487,14 +507,14 @@ systemctl restart sshd_stunnel
 systemctl restart stunnel4
 systemctl restart udpgw
 systemctl restart ssh_udp
-systemctl restart xray # 重启 Xray
+systemctl restart xray || true # Xray 可能未安装成功，跳过错误
 systemctl restart wss_panel
 systemctl restart wss
-systemctl restart nginx # 重启 Nginx
+systemctl restart nginx || true # Nginx 可能未安装成功，跳过错误
 
 echo "=================================================="
-echo "✅ 部署完成！(Axiom V6.0 - Full Port Forwarding + Nginx/Xray)"
+echo "✅ 部署完成！(Axiom V6.1 - Domain Configured & Xray Fix)"
 echo "Web Panel 地址: http://[YOUR_IP]:$PANEL_PORT"
-echo "Nginx/Xray 混淆端口: $NGINX_EXTERNAL_PORT"
-echo "SSH-UDP 监听端口: $SSH_UDP_PORT (已接管 1-65535 空闲端口)"
+echo "Nginx/Xray 混淆域名/端口: $SERVER_DOMAIN:$NGINX_EXTERNAL_PORT"
+echo "Xray VLESS UUID: $XRAY_UUID"
 echo "=================================================="
