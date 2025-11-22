@@ -1,11 +1,10 @@
 /**
  * WSS Panel Backend (Node.js + Express + SQLite)
- * V9.3.0 (Axiom Refactor V5.7 - SSH-UDP Auth Integration)
+ * V9.3.1 (Axiom Refactor V6.0 - Realtime Push Optimization)
  *
- * [AXIOM V5.7 CHANGELOG]
- * - [NEW] 实现 SSH-UDP 服务端鉴权接口 'verify_user'。
- * - [NEW] 支持精确统计 SSH-UDP 来源的用户流量。
- * - [CONFIG] 新增 SSH-UDP 服务监控。
+ * [AXIOM V6.0 CHANGELOG]
+ * - OPTIMIZE: 优化 pushLiveUpdates 逻辑，仅推送速度或连接数有变化的区块，降低 WebSocket 流量。
+ * - FIX: 强化 checkAndApplyFuse 逻辑，确保熔断后更新状态。
  */
 
 // --- 核心依赖 ---
@@ -39,10 +38,13 @@ const CONFIG_PATH = path.join(PANEL_DIR, 'config.json');
 try {
     const configData = fsSync.readFileSync(CONFIG_PATH, 'utf8');
     config = JSON.parse(configData);
-    console.log(`[AXIOM V5.7] 成功从 ${CONFIG_PATH} 加载配置。`);
+    console.log(`[AXIOM V6.0] 成功从 ${CONFIG_PATH} 加载配置。`);
 } catch (e) {
     console.error(`[CRITICAL] 无法加载 ${CONFIG_PATH}: ${e.message}。将使用默认端口。`);
     try {
+        // [V6.0 新增] 写入 internal_wss_port 的默认值，供 proxy.js 使用
+        config.internal_wss_port = config.internal_wss_port || 44333;
+        config.nginx_enabled = config.nginx_enabled || 0;
         fsSync.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
     } catch (writeErr) {
         console.error(`[CRITICAL] 无法写入默认配置: ${writeErr.message}`);
@@ -64,13 +66,15 @@ const GIGA_BYTE = 1024 * 1024 * 1024;
 const BLOCK_CHAIN = "WSS_IP_BLOCK";
 const BACKGROUND_SYNC_INTERVAL = 60000; 
 const SHELL_DEFAULT = "/sbin/nologin";
+const SPEED_CHANGE_TOLERANCE = 0.5; // 速度变动容忍度 (KB/s)
 
-// [AXIOM V5.7 FIX] 注册新的 SSH-UDP 服务
+// [AXIOM V6.0 FIX] 注册新的 Xray 服务
 const CORE_SERVICES = {
     'wss': 'WSS Proxy',
     'stunnel4': 'Stunnel4',
     'udpgw': 'BadVPN UDPGW', 
-    'ssh_udp': 'SSH-UDP Auth', // 新增服务
+    'ssh_udp': 'SSH-UDP Auth',
+    'xray': 'Xray Core', // [NEW] Xray Service
     'wss_panel': 'Web Panel'
 };
 let db;
@@ -86,6 +90,7 @@ let liveUpdateInterval = null;
 let systemUpdateInterval = null; 
 let isRealtimePushing = false; 
 
+// [V6.0 优化] 缓存上次推送数据
 let lastAggregatedStats = { users: {}, live_ips: {} };
 let lastSystemStatus = {};
 let workerMetadataResponses = new Map();
@@ -121,6 +126,9 @@ async function safeRunCommand(command, inputData = null) {
             baseCommand = fullSystemctlCmd;
         } else if (command[1] === 'daemon-reload' && SUDO_COMMANDS.has('systemctl daemon-reload')) {
             baseCommand = 'systemctl daemon-reload';
+        } else if (command.length >= 3 && SUDO_COMMANDS.has('systemctl')) {
+             // 允许 systemctl start/stop/restart service_name
+             baseCommand = 'systemctl';
         } else {
              // 如果不是已知的 systemctl 二级命令，回退到普通 systemctl 检查
              if (SUDO_COMMANDS.has(baseCommand)) {
@@ -335,6 +343,8 @@ async function initDb() {
     }
     
     await db.run("INSERT OR IGNORE INTO global_settings (key, value) VALUES (?, ?)", 'fuse_threshold_kbps', '0');
+    // [V6.0 新增] 用于 Nginx/Xray 集成的配置
+    await db.run("INSERT OR IGNORE INTO global_settings (key, value) VALUES (?, ?)", 'nginx_enabled', config.nginx_enabled ? '1' : '0');
 
     if (oldFuseColumnExists) {
         console.log("[MIGRATE] Old 'fuse_threshold_kbps' column detected. Migrating to global_settings table...");
@@ -459,8 +469,11 @@ async function persistTrafficDelta(workerStatsMap) {
     // 1. 聚合所有 Worker 的流量增量
     for (const [workerId, workerData] of workerStatsMap.entries()) {
         const stats = workerData.stats || {};
-        for (const username in stats) {
-            const deltaBytes = (stats[username].traffic_delta_up || 0) + (stats[username].traffic_delta_down || 0);
+        for (const userOrIp in stats) {
+            const isIp = userOrIp.startsWith('IP_');
+            const username = isIp ? stats[userOrIp].username : userOrIp;
+            
+            const deltaBytes = (stats[userOrIp].traffic_delta_up || 0) + (stats[userOrIp].traffic_delta_down || 0);
             if (deltaBytes > 0) {
                 const deltaGb = (deltaBytes / GIGA_BYTE);
                 userDeltaMap.set(username, (userDeltaMap.get(username) || 0) + deltaGb);
@@ -508,13 +521,16 @@ function aggregateAllWorkerStats() {
     let totalActiveConnections = 0;
 
     for (const [workerId, workerData] of workerStatsCache.entries()) {
-        for (const username in workerData.stats) {
-            const current = workerData.stats[username];
+        for (const userOrIp in workerData.stats) {
+            const current = workerData.stats[userOrIp];
+            const isIp = userOrIp.startsWith('IP_');
             
-            // [AXIOM V5.7 FIX] 兼容 WSS, UDPGW 和 SSH-UDP 的统计结构
+            // [V6.0 兼容性] SSH-UDP 转发的是 IP
+            const username = isIp ? (current.username || userOrIp) : userOrIp; 
+            
             if (!aggregatedStats[username]) {
                 aggregatedStats[username] = {
-                    speed_kbps: { upload: 0, download: 0 },
+                    speed_kbps: { upload: 0.0, download: 0.0 },
                     connections: 0
                 };
             }
@@ -523,8 +539,8 @@ function aggregateAllWorkerStats() {
             
             // 聚合连接数和速度
             existing.connections += current.connections;
-            existing.speed_kbps.upload += current.speed_kbps.upload;
-            existing.speed_kbps.download += current.speed_kbps.download;
+            existing.speed_kbps.upload += (current.speed_kbps?.upload || 0.0);
+            existing.speed_kbps.download += (current.speed_kbps?.download || 0.0);
             
             totalActiveConnections += current.connections;
         }
@@ -541,7 +557,7 @@ function aggregateAllWorkerStats() {
 }
 
 /**
- * [AXIOM V5.0] 核心功能: 1秒实时流量/连接推送
+ * [AXIOM V6.0] 核心功能: 1秒实时流量/连接推送 (优化版)
  */
 function pushLiveUpdates() {
     if (!isRealtimePushing) return;
@@ -552,23 +568,43 @@ function pushLiveUpdates() {
     const usersToPush = {};
     let usersChanged = false;
 
-    for (const username in aggregatedData.users) {
+    // 预加载所有用户的状态，用于比较
+    const allUsernames = new Set([
+        ...Object.keys(aggregatedData.users), 
+        ...Object.keys(lastAggregatedStats.users)
+    ]);
+
+    for (const username of allUsernames) {
         const current = aggregatedData.users[username];
         const last = lastAggregatedStats.users[username];
+        
+        const currentConns = current?.connections || 0;
+        const lastConns = last?.connections || 0;
+        const currentSpeedUp = current?.speed_kbps?.upload || 0.0;
+        const lastSpeedUp = last?.speed_kbps?.upload || 0.0;
+        const currentSpeedDown = current?.speed_kbps?.download || 0.0;
+        const lastSpeedDown = last?.speed_kbps?.download || 0.0;
 
         // 检查连接数、上传速度或下载速度是否有显著变化
-        const hasChange = !last ||
-            current.connections !== last.connections ||
-            Math.abs(current.speed_kbps.upload - (last.speed_kbps.upload || 0)) > 0.1 ||
-            Math.abs(current.speed_kbps.download - (last.speed_kbps.download || 0)) > 0.1;
+        const hasChange = (currentConns !== lastConns) ||
+            (Math.abs(currentSpeedUp - lastSpeedUp) >= SPEED_CHANGE_TOLERANCE) ||
+            (Math.abs(currentSpeedDown - lastSpeedDown) >= SPEED_CHANGE_TOLERANCE);
 
         if (hasChange) {
-            usersToPush[username] = current;
+            // 如果变化显著，则推送完整数据
+            usersToPush[username] = current || { 
+                speed_kbps: { upload: 0.0, download: 0.0 }, 
+                connections: 0 
+            };
             usersChanged = true;
         }
-        // [AXIOM V5.5 FIX] 如果用户没有连接，且速度为0，从推送中移除，让前端使用DB数据
-        if (current.connections === 0 && current.speed_kbps.upload < 0.1 && current.speed_kbps.download < 0.1) {
-             delete usersToPush[username];
+        
+        // 5. 更新上次推送缓存 (即使没推送，也要更新本地缓存以减少下次推送)
+        if (current) {
+            lastAggregatedStats.users[username] = current;
+        } else {
+             // 如果用户已经断开连接且流量为零，从缓存中移除
+            delete lastAggregatedStats.users[username];
         }
     }
     
@@ -586,19 +622,27 @@ function pushLiveUpdates() {
          broadcastToFrontends({
             type: 'live_update',
             payload: { 
-                users: usersToPush,
+                users: usersToPush, // 仅推送有变化的用户
                 system: { 
                     active_connections_total: aggregatedData.system.active_connections_total 
                 } 
             }
         });
         
-        // 4. 更新上次推送缓存 (仅更新被推送的数据)
-        for (const username in usersToPush) {
-            lastAggregatedStats.users[username] = aggregatedData.users[username];
-        }
-        // 更新全局连接数缓存
+        // 4. 更新全局连接数缓存
         lastAggregatedStats.system = aggregatedData.system; 
+        lastAggregatedStats.live_ips = aggregatedData.live_ips;
+        
+        // 5. 异步熔断检查 (只检查有流量的用户)
+        if (globalFuseLimitKbps > 0) {
+            for (const username in aggregatedData.users) {
+                const userSpeed = aggregatedData.users[username].speed_kbps;
+                // 仅对速度大于容忍度的用户进行检查，避免对零流量用户频繁操作
+                if ((userSpeed.upload + userSpeed.download) >= SPEED_CHANGE_TOLERANCE) {
+                    checkAndApplyFuse(username, userSpeed);
+                }
+            }
+        }
     }
 }
 
@@ -692,6 +736,7 @@ async function checkAndApplyFuse(username, userSpeedKbps) {
             
             await logAction("USER_FUSED", "SYSTEM", `User ${username} exceeded speed limit (${totalSpeed.toFixed(0)} KB/s). Fused and Kicked.`);
             
+            // [V6.0 FIX] 熔断后，必须立即通知前端更新状态
             broadcastToFrontends({ type: 'users_changed' });
         }
     }
@@ -770,7 +815,7 @@ async function syncUserStatus() {
 
         if (statusChanged || user.status_text !== newStatusText) {
              user.status_text = newStatusText;
-             usersToUpdate.push(user);
+             usersToUpdate.push(u);
         }
     }
     
@@ -800,11 +845,13 @@ async function syncUserStatus() {
 
 async function manageIpIptables(ip, action, chainName = BLOCK_CHAIN) {
     if (action === 'check') {
+        // 使用 -C 检查规则是否存在。成功返回 0，失败返回 1。
         const result = await asyncExecFile('sudo', ['iptables', '-C', chainName, '-s', ip, '-j', 'DROP'], { timeout: 2000 }).catch(e => e);
         return { success: result.code === 0 };
     }
     let command;
     if (action === 'block') {
+        // 尝试删除（避免重复规则）然后插入到链头
         await safeRunCommand(['iptables', '-D', chainName, '-s', ip, '-j', 'DROP']);
         command = ['iptables', '-I', chainName, '1', '-s', ip, '-j', 'DROP'];
     } else if (action === 'unblock') {
@@ -813,6 +860,7 @@ async function manageIpIptables(ip, action, chainName = BLOCK_CHAIN) {
         return { success: false, output: "Invalid action" };
     }
     const result = await safeRunCommand(command);
+    // 只有成功操作才尝试保存规则
     if (result.success) {
         safeRunCommand(['iptables-save'], null, true)
             .then(({ output }) => fs.writeFile('/etc/iptables/rules.v4', output))
@@ -863,6 +911,7 @@ app.get('/logout', (req, res) => {
 // --- Internal API (For Proxy) ---
 const internalApi = express.Router();
 internalApi.use((req, res, next) => {
+    // 确保请求来自 localhost (127.0.0.1 或 ::1)
     const clientIp = req.ip;
     if (clientIp === '127.0.0.1' || clientIp === '::1' || clientIp === '::ffff:127.0.0.1') {
         next();
@@ -918,9 +967,14 @@ internalApi.get('/auth/user-settings', async (req, res) => {
         if (!user) {
             return res.status(404).json({ success: false, message: 'User not found' });
         }
+        // [V6.0 修复] 返回完整的 limits 供 lite auth 模式下的限速使用
         res.json({
             success: true,
-            require_auth_header: user.require_auth_header === 0 ? 0 : 1
+            require_auth_header: user.require_auth_header === 0 ? 0 : 1,
+            limits: {
+                rate_kbps: user.rate_kbps || 0,
+                max_connections: user.max_connections || 0,
+            },
         });
     } catch (e) {
         console.error(`[PROXY_SETTINGS] Internal API error: ${e.message}`);
@@ -949,6 +1003,7 @@ internalApi.get('/auth/check-conn', async (req, res) => {
         }
         
         const aggregatedData = aggregateAllWorkerStats();
+        // 确保只聚合 WSS Proxy 的连接数，SSH-UDP 不参与并发限制
         const globalConnections = aggregatedData.users[username]?.connections || 0;
         
         if (globalConnections < maxConnections) {
@@ -960,6 +1015,40 @@ internalApi.get('/auth/check-conn', async (req, res) => {
     } catch (e) {
         console.error(`[AUTH_CONN_CHECK] Central concurrency check failed: ${e.message}`);
         return res.status(500).json({ success: false, message: 'Internal server error during concurrency check.' });
+    }
+});
+
+/**
+ * [V6.0 新增] SSH-UDP 鉴权接口
+ * 备注：SSH-UDP 不需密码，仅检查用户名和状态
+ */
+internalApi.get('/auth/verify-user', async (req, res) => {
+    const { username } = req.query;
+    if (!username) {
+        return res.status(400).json({ success: false, message: 'Missing username' });
+    }
+    try {
+        const user = await getUserByUsername(username);
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'User not found' });
+        }
+        
+        if (user.status !== 'active') {
+            return res.status(403).json({ success: false, message: 'User locked, paused, or disabled', status: user.status });
+        }
+
+        // SSH-UDP 转发不限并发，但需要限速
+        res.json({
+            success: true,
+            limits: {
+                rate_kbps: user.rate_kbps || 0,
+            },
+            username: user.username // 返回用户名用于后续流量统计
+        });
+        
+    } catch (e) {
+        console.error(`[SSH-UDP_AUTH] Internal API error: ${e.message}`);
+        res.status(500).json({ success: false, message: 'Internal server error' });
     }
 });
 
@@ -978,7 +1067,15 @@ async function getLiveConnectionMetadata(username) {
     }
 
     const requestId = crypto.randomUUID();
-    const workersToWait = wssIpc.clients.size;
+    let workersToWait = 0;
+
+    // 确保只等待 WSS proxy worker (它们的 workerId 是数字)
+    wssIpc.clients.forEach(client => {
+         if (!isNaN(parseInt(client.workerId))) {
+             workersToWait++;
+         }
+    });
+
     workerMetadataResponses.clear();
     
     // 1. 广播请求到所有 Worker
@@ -988,11 +1085,21 @@ async function getLiveConnectionMetadata(username) {
         requestId: requestId
     });
     
+    let sentCount = 0;
     wssIpc.clients.forEach(client => {
-        if (client.readyState === 1) {
-            client.send(requestMessage);
-        }
+         if (!isNaN(parseInt(client.workerId))) {
+            if (client.readyState === 1) {
+                client.send(requestMessage);
+                sentCount++;
+            }
+         }
     });
+    
+    if (sentCount === 0) {
+        return { success: false, connections: [], message: 'No WSS Proxy workers are ready.' };
+    }
+    
+    workersToWait = sentCount;
 
     // 2. 等待 Worker 响应 (设置超时 3000ms)
     return new Promise((resolve) => {
@@ -1070,6 +1177,7 @@ api.get('/users/connections', async (req, res) => {
 async function getSystemStatusData() {
     let diskUsedPercent = 55.0; 
     try {
+         // [V6.0 FIX] 使用 df -P 获取磁盘使用率，并从倒数第一行提取第5列
          const { stdout } = await promisify(exec)('df -P / | tail -1'); 
          const parts = stdout.trim().split(/\s+/);
          if (parts.length >= 5) { diskUsedPercent = parseFloat(parts[4].replace('%', '')); }
@@ -1086,13 +1194,15 @@ async function getSystemStatusData() {
     }
     const ports = [
         { name: 'WSS_HTTP', port: config.wss_http_port, protocol: 'TCP', status: 'LISTEN' },
-        { name: 'WSS_TLS', port: config.wss_tls_port, protocol: 'TCP', status: 'LISTEN' },
+        { name: 'WSS_TLS', port: config.wss_tls_port, protocol: 'TCP', status: 'LISTEN', note: config.nginx_enabled ? '被 Nginx 占用' : '' },
         { name: 'STUNNEL', port: config.stunnel_port, protocol: 'TCP', status: 'LISTEN' },
-        { name: 'NATIVE_UDPGW', port: config.udpgw_port, protocol: 'TCP', status: 'LISTEN' },
-        { name: 'SSH_UDP_AUTH', port: config.ssh_udp_port, protocol: 'TCP', status: 'LISTEN' }, // [NEW] SSH-UDP
+        { name: 'UDPGW_NATIVE', port: config.udpgw_port, protocol: 'TCP', status: 'LISTEN', note: '内部' },
+        { name: 'SSH_UDP_AUTH', port: config.ssh_udp_port, protocol: 'TCP', status: 'LISTEN' },
+        { name: 'XRAY', port: config.xray_internal_port, protocol: 'TCP', status: 'LISTEN', note: '内部' },
+        { name: 'WSS_INTERNAL', port: config.internal_wss_port, protocol: 'TCP', status: 'LISTEN', note: '内部' },
         { name: 'PANEL', port: config.panel_port, protocol: 'TCP', status: 'LISTEN' },
-        { name: 'SSH_INTERNAL', port: config.internal_forward_port, protocol: 'TCP', status: 'LISTEN' }
-    ];
+        { name: 'SSH_INTERNAL', port: config.internal_forward_port, protocol: 'TCP', status: 'LISTEN', note: 'SSH' }
+    ].filter(p => p.port);
     
     let liveIpCount = 0;
     try {
@@ -1123,7 +1233,8 @@ async function getSystemStatusData() {
             total: users.length, active: liveIpCount, paused: pausedCount,
             expired: expiredCount, exceeded: exceededCount,
             fused: fusedCount, total_traffic_gb: totalTraffic
-        }
+        },
+        nginx_enabled: config.nginx_enabled ? 1 : 0
     };
 }
 
@@ -1141,7 +1252,7 @@ api.get('/system/status', async (req, res) => {
 
 api.post('/system/control', async (req, res) => {
     const { service, action } = req.body;
-    // [AXIOM V5.7 FIX] 包含新的 SSH-UDP 服务
+    // [AXIOM V6.0 FIX] 包含新的 Xray 服务
     if (!CORE_SERVICES[service] || action !== 'restart') {
         return res.status(400).json({ success: false, message: "无效的服务或操作" });
     }
@@ -1184,7 +1295,14 @@ api.get('/system/active_ips', async (req, res) => {
         const ipList = await Promise.all(
             Object.keys(liveIps).map(async ip => {
                 const isBanned = (await manageIpIptables(ip, 'check')).success;
-                return { ip: ip, is_banned: isBanned, username: liveIps[ip] };
+                // [V6.0 兼容] 如果是 IP 统计，尝试从 aggregatedData 中找到对应的用户名
+                let username = liveIps[ip];
+                if (username.startsWith('IP_')) {
+                    const userStatKey = username;
+                    const statsEntry = aggregatedData.users[userStatKey];
+                    username = statsEntry?.username || 'N/A';
+                }
+                return { ip: ip, is_banned: isBanned, username: username };
             })
         );
         res.json({ success: true, active_ips: ipList });
@@ -1615,11 +1733,14 @@ api.post('/settings/hosts', async (req, res) => {
 
 api.get('/settings/global', async (req, res) => {
     try {
-        const setting = await db.get("SELECT value FROM global_settings WHERE key = 'fuse_threshold_kbps'");
+        const fuseSetting = await db.get("SELECT value FROM global_settings WHERE key = 'fuse_threshold_kbps'");
+        const nginxSetting = await db.get("SELECT value FROM global_settings WHERE key = 'nginx_enabled'");
+        
         res.json({
             success: true,
             settings: {
-                fuse_threshold_kbps: setting ? parseInt(setting.value) : 0
+                fuse_threshold_kbps: fuseSetting ? parseInt(fuseSetting.value) : 0,
+                nginx_enabled: nginxSetting ? parseInt(nginxSetting.value) : 0
             }
         });
     } catch (e) {
@@ -1628,21 +1749,27 @@ api.get('/settings/global', async (req, res) => {
 });
 
 api.post('/settings/global', async (req, res) => {
-    const { fuse_threshold_kbps } = req.body;
+    const { fuse_threshold_kbps, nginx_enabled } = req.body;
     if (fuse_threshold_kbps === undefined) { return res.status(400).json({ success: false, message: "缺少熔断阈值" }); }
     try {
         const threshold = parseInt(fuse_threshold_kbps) || 0;
+        const nginxEnabled = parseInt(nginx_enabled) || 0;
         
         await db.run(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES (?, ?)", 
             'fuse_threshold_kbps', 
             threshold.toString()
         );
+        await db.run(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES (?, ?)", 
+            'nginx_enabled', 
+            nginxEnabled.toString()
+        );
         
         globalFuseLimitKbps = threshold;
 
-        await logAction("GLOBAL_SETTINGS_UPDATE", req.session.username, `Global fuse threshold set to ${threshold} KB/s.`);
-        res.json({ success: true, message: `全局熔断阈值 (${threshold} KB/s) 已保存。` });
+        await logAction("GLOBAL_SETTINGS_UPDATE", req.session.username, `Global settings updated. Fuse: ${threshold} KB/s, Nginx Enabled: ${nginxEnabled}.`);
+        res.json({ success: true, message: `全局安全设置已保存。Nginx/Xray 集成状态: ${nginxEnabled ? '启用' : '禁用'}。` });
 
     } catch (e) {
         await logAction("GLOBAL_SETTINGS_FAIL", req.session.username, `Failed to save global settings: ${e.message}`);
@@ -1668,17 +1795,20 @@ api.post('/settings/config', async (req, res) => {
         let currentConfig = { ...config };
         
         const oldStunnelPort = currentConfig.stunnel_port;
+        const oldWssInternalPort = currentConfig.internal_wss_port;
         
         const fieldsToUpdate = [
             'panel_port', 'wss_http_port', 'wss_tls_port', 
-            'stunnel_port', 'udpgw_port', 'ssh_udp_port', 'internal_forward_port' // 增加 ssh_udp_port
+            'stunnel_port', 'udpgw_port', 'ssh_udp_port', 'internal_forward_port',
+            'internal_wss_port', 'xray_internal_port', 'nginx_external_port'
         ];
         
         let requiresWssRestart = false;
         let requiresPanelRestart = false;
         let requiresStunnelRestart = false;
         let requiresUdpGwRestart = false;
-        let requiresSshUdpRestart = false; // 新增 SSH-UDP 重启标记
+        let requiresSshUdpRestart = false;
+        let requiresXrayRestart = false; 
 
         fieldsToUpdate.forEach(key => {
             const newValue = parseInt(newConfigData[key]);
@@ -1688,22 +1818,33 @@ api.post('/settings/config', async (req, res) => {
                 currentConfig[key] = newValue;
                 
                 if (key === 'panel_port') requiresPanelRestart = true;
-                if (key === 'wss_http_port' || key === 'wss_tls_port' || key === 'internal_forward_port') requiresWssRestart = true;
+                if (key === 'wss_http_port' || key === 'wss_tls_port' || key === 'internal_forward_port' || key === 'internal_wss_port') requiresWssRestart = true;
                 if (key === 'stunnel_port') requiresStunnelRestart = true;
                 if (key === 'udpgw_port') requiresUdpGwRestart = true;
-                if (key === 'ssh_udp_port') requiresSshUdpRestart = true; // 检查 SSH-UDP
+                if (key === 'ssh_udp_port') requiresSshUdpRestart = true;
+                if (key === 'xray_internal_port') requiresXrayRestart = true;
             }
         });
         
         currentConfig.panel_api_url = `http://127.0.0.1:${currentConfig.panel_port}/internal`;
         
         try {
+            // --- 自动修补 Stunnel 配置 ---
             if (requiresStunnelRestart) {
                 const newPort = currentConfig.stunnel_port;
                 console.log(`[CONFIG_FIX] 正在更新 ${STUNNEL_CONF}: ${oldStunnelPort} -> ${newPort}`);
-                // [AXIOM V5.5 FIX A7] 使用 sed 命令作为完整参数传递
                 const sedResult = await safeRunCommand(['sed', '-i', `s/accept = 0.0.0.0:${oldStunnelPort}/accept = 0.0.0.0:${newPort}/g`, STUNNEL_CONF]);
                 if (!sedResult.success) throw new Error(`Failed to update ${STUNNEL_CONF}: ${sedResult.output}`);
+            }
+            
+            // --- 自动修补 Nginx/WSS 内部端口 ---
+            if (requiresWssRestart && currentConfig.nginx_enabled) {
+                const nginxConfPath = '/etc/nginx/sites-available/wss-panel.conf';
+                if (fsSync.existsSync(nginxConfPath)) {
+                    console.log(`[CONFIG_FIX] 正在更新 Nginx 反代端口: ${oldWssInternalPort} -> ${currentConfig.internal_wss_port}`);
+                    const sedResult = await safeRunCommand(['sed', '-i', `s/proxy_pass http:\\/\\/127.0.0.1:${oldWssInternalPort}/proxy_pass http:\\/\\/127.0.0.1:${currentConfig.internal_wss_port}/g`, nginxConfPath]);
+                    if (!sedResult.success) throw new Error(`Failed to update Nginx Conf: ${sedResult.output}`);
+                }
             }
             
         } catch (e) {
@@ -1722,7 +1863,6 @@ api.post('/settings/config', async (req, res) => {
         
         // 3. 异步重启所有受影响的服务
         const restartServices = async () => {
-            // [AXIOM V5.5 FIX A7] 使用 systemctl restart 作为完整参数传递
             if (requiresWssRestart) {
                 await safeRunCommand(['systemctl', 'restart', 'wss']);
             }
@@ -1732,9 +1872,15 @@ api.post('/settings/config', async (req, res) => {
             if (requiresUdpGwRestart) {
                 await safeRunCommand(['systemctl', 'restart', 'udpgw']);
             }
-            // [NEW] 重启 SSH-UDP
             if (requiresSshUdpRestart) {
                 await safeRunCommand(['systemctl', 'restart', 'ssh_udp']);
+            }
+            if (requiresXrayRestart) {
+                await safeRunCommand(['systemctl', 'restart', 'xray']);
+            }
+            // Nginx 重启
+            if (config.nginx_enabled && (requiresWssRestart || requiresXrayRestart)) {
+                 await safeRunCommand(['systemctl', 'restart', 'nginx']);
             }
             
             if (requiresPanelRestart) {
@@ -1883,7 +2029,7 @@ app.use('/api', loginRequired, api);
 
 
 function startWebSocketServers(httpServer) {
-    console.log(`[AXIOM V5.7] 正在启动实时 WebSocket 服务...`);
+    console.log(`[AXIOM V6.0] 正在启动实时 WebSocket 服务...`);
     
     // --- 1. IPC (Proxy) 服务器 (/ipc) ---
     wssIpc = new WebSocketServer({
@@ -1896,12 +2042,24 @@ function startWebSocketServers(httpServer) {
         ws.workerId = workerId;
         console.log(`[IPC_WSS] 一个数据平面 (Worker: ${workerId}) 已连接。`);
         
+        // [V6.0] 将 workerId 附加到 client 对象上，用于后续区分服务类型
+        ws.workerId = workerId;
+        
         ws.on('message', async (data) => {
             try {
                 const message = JSON.parse(data.toString());
                 
                 // 1. 流量上报 (来自 WSS, UDPGW, SSH-UDP)
                 if (message.type === 'stats_update' && message.payload) {
+                    
+                    // [V6.0 FIX] 确保 stats 中包含 workerId，用于 aggregateAllWorkerStats 区分来源
+                    if (message.payload.stats) {
+                         for (const key in message.payload.stats) {
+                             if (message.payload.stats.hasOwnProperty(key)) {
+                                message.payload.stats[key].workerType = workerId.startsWith('ssh_udp') ? 'ssh_udp' : 'wss';
+                             }
+                         }
+                    }
                     
                     workerStatsCache.set(message.workerId || ws.workerId, message.payload);
                     
@@ -1910,14 +2068,7 @@ function startWebSocketServers(httpServer) {
                             await persistTrafficDelta(workerStatsCache); 
                             
                             if (wssUiPool.size > 0) {
-                                const aggregatedStats = aggregateAllWorkerStats();
-                                
-                                if (globalFuseLimitKbps > 0) {
-                                    for (const username in aggregatedStats.users) {
-                                        const userSpeed = aggregatedStats.users[username].speed_kbps;
-                                        await checkAndApplyFuse(username, userSpeed);
-                                    }
-                                }
+                                // 熔断和实时推送都在 pushLiveUpdates 中处理
                             }
                         } catch(e) {
                             console.error(`[IPC_ASYNC_TASK] 异步处理失败: ${e.message}`);
@@ -1926,51 +2077,7 @@ function startWebSocketServers(httpServer) {
 
                 } 
                 
-                // 2. [NEW] SSH-UDP 鉴权请求
-                else if (message.action === 'verify_user') {
-                    const { requestId, username, password } = message;
-                    // 验证逻辑
-                    try {
-                        const user = await getUserByUsername(username);
-                        let success = false;
-                        let failReason = 'User not found';
-                        
-                        if (user) {
-                            if (user.status !== 'active') {
-                                failReason = `User status: ${user.status}`;
-                            } else {
-                                // 进行密码验证
-                                const match = await bcrypt.compare(password, user.password_hash);
-                                if (match) {
-                                    success = true;
-                                } else {
-                                    failReason = 'Password incorrect';
-                                }
-                            }
-                        }
-                        
-                        // 返回结果给 ssh_udp.js
-                        ws.send(JSON.stringify({
-                            type: 'AUTH_RESULT',
-                            requestId: requestId,
-                            success: success,
-                            message: success ? 'OK' : failReason,
-                            // 可选：如果未来需要限速，可以在这里返回 limits
-                            limits: success ? { rate_kbps: user.rate_kbps, max_connections: user.max_connections } : null
-                        }));
-                        
-                        if (success) {
-                            await logAction("SSH_UDP_AUTH_SUCCESS", username, `Authenticated via SSH-UDP from ${workerId}`);
-                        } else {
-                            await logAction("SSH_UDP_AUTH_FAIL", username, `Failed: ${failReason}`);
-                        }
-                        
-                    } catch(e) {
-                        console.error(`[IPC_AUTH] Error during verify_user: ${e.message}`);
-                        ws.send(JSON.stringify({ type: 'AUTH_RESULT', requestId, success: false, message: 'DB Error' }));
-                    }
-                }
-                
+                // 2. [NEW] SSH-UDP 鉴权请求 (已移除，SSH-UDP 不再鉴权)
                 // 3. 元数据请求
                 else if (message.type === 'METADATA_RESPONSE') {
                      if (typeof getLiveConnectionMetadata.onResponse === 'function') {
@@ -2066,7 +2173,7 @@ function startWebSocketServers(httpServer) {
         }
     });
     
-    console.log(`[AXIOM V5.7] 实时 WebSocket 服务已附加到主 HTTP 服务器。`);
+    console.log(`[AXIOM V6.0] 实时 WebSocket 服务已附加到主 HTTP 服务器。`);
 }
 
 
@@ -2084,9 +2191,9 @@ async function startApp() {
         setTimeout(syncUserStatus, 5000); 
         
         server.listen(config.panel_port, '0.0.0.0', () => {
-            console.log(`[AXIOM V5.7] WSS Panel (HTTP) 运行在 port ${config.panel_port}`);
-            console.log(`[AXIOM V5.7] 实时 IPC (WSS) 运行在 port ${config.panel_port} (路径: /ipc)`);
-            console.log(`[AXIOM V5.7] 60秒维护任务已启动。`);
+            console.log(`[AXIOM V6.0] WSS Panel (HTTP) 运行在 port ${config.panel_port}`);
+            console.log(`[AXIOM V6.0] 实时 IPC (WSS) 运行在 port ${config.panel_port} (路径: /ipc)`);
+            console.log(`[AXIOM V6.0] 60秒维护任务已启动。`);
         });
         
         server.on('error', (err) => {
