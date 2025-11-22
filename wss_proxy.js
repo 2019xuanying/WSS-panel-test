@@ -1,11 +1,11 @@
 /**
  * WSS Proxy Core (Node.js)
- * V8.7.0 (Axiom Refactor V5.7 - SSH-UDP Integration)
+ * V8.7.1 (Axiom Refactor V6.0 - Stability/Performance Fixes)
  *
- * [AXIOM V5.7 CHANGELOG]
- * - Codebase cleanup to remove defunct IPC Master API logic.
- * - Ensures correct IPC handling for 'kick', 'update_limits' etc.
- * - This service remains focused ONLY on WSS/SSH forwarding to 127.0.0.1:22.
+ * [AXIOM V6.0 CHANGELOG]
+ * - FIX: 强化连接清理逻辑 (cleanupConnection)，解决僵尸连接和内存泄漏问题。
+ * - FIX: 优化 on('data') 流程，在转发状态下直接处理限速和流量统计。
+ * - PREP: 预先引入 internal_wss_port 配置，用于后续 Nginx/Xray 集成。
  */
 
 const net = require('net');
@@ -30,7 +30,7 @@ function loadConfig() {
         const configData = fs.readFileSync(CONFIG_PATH, 'utf8');
         config = JSON.parse(configData);
         if (cluster.isWorker) {
-            console.log(`[AXIOM V5.7] Worker ${cluster.worker.id} 成功从 ${CONFIG_PATH} 加载配置。`);
+            console.log(`[AXIOM V6.0] Worker ${cluster.worker.id} 成功从 ${CONFIG_PATH} 加载配置。`);
         }
     } catch (e) {
         console.error(`[CRITICAL] 无法加载 ${CONFIG_PATH}: ${e.message}。服务将退出。`);
@@ -43,10 +43,12 @@ loadConfig();
 
 // --- 核心常量 (现在从 config 读取) ---
 const LISTEN_ADDR = '0.0.0.0';
+const LISTEN_ADDR_INTERNAL = '127.0.0.1'; // 新增内部监听地址
 const WSS_LOG_FILE = path.join(PANEL_DIR, 'wss.log'); 
 const HOSTS_DB_PATH = path.join(PANEL_DIR, 'hosts.json');
 const HTTP_PORT = config.wss_http_port;
 const TLS_PORT = config.wss_tls_port;
+const INTERNAL_WSS_PORT = config.internal_wss_port || 44333; // [V6.0 新增] WSS Proxy 内部监听端口
 const INTERNAL_FORWARD_PORT = config.internal_forward_port;
 const INTERNAL_API_PORT = config.internal_api_port;
 const PANEL_API_URL = config.panel_api_url;
@@ -261,8 +263,7 @@ function kickUser(username) {
         for (const socket of stats.connections.keys()) {
             socket.destroy(); 
         }
-        stats.connections.clear();
-        stats.ip_map.clear();
+        // 清理将在 socket.on('close') 触发的 cleanupConnection 中完成
     }
 }
 
@@ -586,6 +587,37 @@ async function checkConcurrency(username, maxConnections) {
     }
 }
 
+/**
+ * [AXIOM V6.0 FIX] 统一连接清理函数，防止僵尸连接
+ */
+function cleanupConnection(clientSocket, remoteSocket, username, clientIp, localPort) {
+    // 确保只执行一次
+    if (clientSocket.__cleaned) return;
+    clientSocket.__cleaned = true;
+
+    if (remoteSocket && !remoteSocket.destroyed) {
+        remoteSocket.destroy();
+    }
+    if (clientSocket && !clientSocket.destroyed) {
+        clientSocket.destroy();
+    }
+    
+    if (username) {
+        try {
+            const stats = getUserStat(username);
+            // 1. 移除 connections 中的 socket 引用
+            stats.connections.delete(clientSocket);
+            // 2. 移除 IP 映射
+            stats.ip_map.delete(clientIp);
+        } catch (e) {
+             console.error(`[CLEANUP] Error removing stats for ${username}: ${e.message}`);
+        }
+        logConnection(clientIp, clientSocket.remotePort, localPort, username, 'CONN_CLEAN');
+    } else {
+        logConnection(clientIp, clientSocket.remotePort, localPort, 'N/A', 'CONN_CLEAN_UNAUTH');
+    }
+}
+
 
 // --- Client Handler ---
 function handleClient(clientSocket, isTls) {
@@ -609,44 +641,45 @@ function handleClient(clientSocket, isTls) {
     clientSocket.setTimeout(TIMEOUT);
     clientSocket.setKeepAlive(true, 60000);
 
-    clientSocket.on('error', (err) => {
-        if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE' && err.code !== 'ETIMEDOUT') {
+    // [V6.0 FIX] 统一错误/关闭处理
+    const handleEnd = (err) => {
+        if (err && err.code !== 'ECONNRESET' && err.code !== 'EPIPE' && err.code !== 'ETIMEDOUT') {
             console.error(`[WSS_ERR] Client Socket Error (${username || clientIp}): ${err.message}`);
         }
-        if (remoteSocket) remoteSocket.destroy();
-        clientSocket.destroy();
-    });
+        cleanupConnection(clientSocket, remoteSocket, username, clientIp, localPort);
+    };
 
+    clientSocket.on('error', handleEnd);
     clientSocket.on('timeout', () => {
         console.log(`[WSS_TIMEOUT] Client Socket Timeout (${username || clientIp})`);
-        if (remoteSocket) remoteSocket.destroy();
-        clientSocket.destroy();
+        handleEnd(new Error('ETIMEDOUT'));
+    });
+    clientSocket.on('close', () => {
+        cleanupConnection(clientSocket, remoteSocket, username, clientIp, localPort);
     });
     
-    clientSocket.on('close', () => {
-        if (remoteSocket) remoteSocket.destroy();
-        if (username) {
-            try {
-                const stats = getUserStat(username);
-                // [AXIOM V5.2] 移除 connections 中的 socket 引用
-                stats.connections.delete(clientSocket);
-                stats.ip_map.delete(clientIp);
-            } catch (e) {}
-            logConnection(clientIp, clientPort, localPort, username, 'CONN_END');
-        } else {
-            logConnection(clientIp, clientPort, localPort, 'N/A', 'CONN_END_UNAUTH');
-        }
-    });
+    // [V6.0 FIX] 确保远程连接错误也能触发本地清理
+    const handleRemoteEnd = (err) => {
+         if (err && err.code === 'ECONNREFUSED') {
+             console.error(`[WSS] CRITICAL: Connection refused by target ${DEFAULT_TARGET.host}:${DEFAULT_TARGET.port}. (Is SSHD running on port ${INTERNAL_FORWARD_PORT}?)`);
+             clientSocket.end(INTERNAL_ERROR_RESPONSE); 
+         }
+         cleanupConnection(clientSocket, remoteSocket, username, clientIp, localPort);
+    }
 
     clientSocket.on('data', async (data) => {
         
         if (state === 'forwarding') {
             const stats = getUserStat(username);
+            
+            // --- Upstream (Upload) Limit & Stat ---
             const allowedBytes = stats.bucket_up.consume(data.length);
             if (allowedBytes === 0) return; 
+            
             const dataToWrite = (allowedBytes < data.length) ? data.subarray(0, allowedBytes) : data;
             stats.traffic_delta.upload += dataToWrite.length;
             stats.traffic_live.upload += dataToWrite.length;
+            
             if (remoteSocket && remoteSocket.writable) {
                 remoteSocket.write(dataToWrite);
             }
@@ -663,6 +696,7 @@ function handleClient(clientSocket, isTls) {
                 if (fullRequest.length > BUFFER_SIZE * 2) {
                     logConnection(clientIp, clientPort, localPort, 'N/A', 'REJECTED_HUGE_HEADER');
                     clientSocket.end(FORBIDDEN_RESPONSE); 
+                    cleanupConnection(clientSocket, remoteSocket, username, clientIp, localPort);
                 }
                 return; 
             }
@@ -676,6 +710,7 @@ function handleClient(clientSocket, isTls) {
             if (!checkHost(headers)) {
                 logConnection(clientIp, clientPort, localPort, 'N/A', 'REJECTED_HOST');
                 clientSocket.end(FORBIDDEN_RESPONSE);
+                cleanupConnection(clientSocket, remoteSocket, username, clientIp, localPort);
                 return; 
             }
             
@@ -689,6 +724,7 @@ function handleClient(clientSocket, isTls) {
                  if (auth) {
                     logConnection(clientIp, clientPort, localPort, 'N/A', 'REJECTED_AUTH_NOT_WEBSOCKET');
                     clientSocket.end(FORBIDDEN_RESPONSE);
+                    cleanupConnection(clientSocket, remoteSocket, username, clientIp, localPort);
                     return; 
                  }
                  logConnection(clientIp, clientPort, localPort, 'N/A', 'DUMMY_HTTP_REQUEST');
@@ -705,11 +741,13 @@ function handleClient(clientSocket, isTls) {
                 if (authResult.status === 503) {
                     logConnection(clientIp, clientPort, localPort, username, `AUTH_FAIL (API Down)`);
                     clientSocket.end(INTERNAL_ERROR_RESPONSE);
+                    cleanupConnection(clientSocket, remoteSocket, username, clientIp, localPort);
                     return;
                 }
                 if (!authResult.success) {
                     logConnection(clientIp, clientPort, localPort, username, `AUTH_FAILED (${authResult.message})`);
                     clientSocket.end(UNAUTHORIZED_RESPONSE);
+                    cleanupConnection(clientSocket, remoteSocket, username, clientIp, localPort);
                     return; 
                 }
                 limits = authResult.limits; 
@@ -722,12 +760,14 @@ function handleClient(clientSocket, isTls) {
                 if (requireAuthHeader === 1) { 
                     logConnection(clientIp, clientPort, localPort, 'N/A', 'AUTH_MISSING');
                     clientSocket.end(UNAUTHORIZED_RESPONSE);
+                    cleanupConnection(clientSocket, remoteSocket, username, clientIp, localPort);
                     return;
                 }
 
                 if (!uriMatch) {
                     logConnection(clientIp, clientPort, localPort, 'N/A', 'URI_AUTH_MISSING');
                     clientSocket.end(UNAUTHORIZED_RESPONSE);
+                    cleanupConnection(clientSocket, remoteSocket, username, clientIp, localPort);
                     return; 
                 }
                 
@@ -737,6 +777,7 @@ function handleClient(clientSocket, isTls) {
                 if (liteAuth.status === 503) {
                      logConnection(clientIp, clientPort, localPort, tempUsername, `AUTH_FAIL (API Down)`);
                      clientSocket.end(INTERNAL_ERROR_RESPONSE);
+                     cleanupConnection(clientSocket, remoteSocket, username, clientIp, localPort);
                      return;
                 }
                 
@@ -749,6 +790,7 @@ function handleClient(clientSocket, isTls) {
                 } else {
                     logConnection(clientIp, clientPort, localPort, tempUsername, 'AUTH_LITE_FAILED');
                     clientSocket.end(UNAUTHORIZED_RESPONSE);
+                    cleanupConnection(clientSocket, remoteSocket, username, clientIp, localPort);
                     return; 
                 }
             }
@@ -757,6 +799,7 @@ function handleClient(clientSocket, isTls) {
             if (!await checkConcurrency(username, limits.max_connections)) {
                 logConnection(clientIp, clientPort, localPort, username, `REJECTED_CONCURRENCY`);
                 clientSocket.end(TOO_MANY_REQUESTS_RESPONSE);
+                cleanupConnection(clientSocket, remoteSocket, username, clientIp, localPort);
                 return; 
             }
             
@@ -807,17 +850,22 @@ function handleClient(clientSocket, isTls) {
                 state = 'forwarding';
                 
                 if (initialData.length > 0) {
+                    // [V6.0 FIX] 重新触发一次 data 事件，确保初始数据走限速逻辑
                     clientSocket.emit('data', initialData);
                 }
                 
                 // --- Downstream (Download) ---
                 remoteSocket.on('data', (data) => {
                     const stats = getUserStat(username);
+                    
+                    // --- Downstream (Download) Limit & Stat ---
                     const allowedBytes = stats.bucket_down.consume(data.length);
                     if (allowedBytes === 0) return; 
+                    
                     const dataToWrite = (allowedBytes < data.length) ? data.subarray(0, allowedBytes) : data;
                     stats.traffic_delta.download += dataToWrite.length;
                     stats.traffic_live.download += dataToWrite.length;
+                    
                     if (clientSocket.writable) {
                         clientSocket.write(dataToWrite);
                     }
@@ -825,20 +873,11 @@ function handleClient(clientSocket, isTls) {
                 remoteSocket.setKeepAlive(true, 60000);
             });
 
-            remoteSocket.on('error', (err) => {
-                if (err.code === 'ECONNREFUSED') {
-                    console.error(`[WSS] CRITICAL: Connection refused by target ${DEFAULT_TARGET.host}:${DEFAULT_TARGET.port}. (Is SSHD running on port ${INTERNAL_FORWARD_PORT}?)`);
-                    clientSocket.end(INTERNAL_ERROR_RESPONSE); 
-                }
-                clientSocket.destroy();
-            });
-
-            remoteSocket.on('close', () => {
-                clientSocket.end();
-            });
+            remoteSocket.on('error', handleRemoteEnd);
+            remoteSocket.on('close', handleRemoteEnd);
         } catch (e) {
             console.error(`[WSS] Failed to connect to target: ${e.message}`);
-            clientSocket.destroy();
+            cleanupConnection(clientSocket, remoteSocket, username, clientIp, localPort);
         }
     }
 }
@@ -855,6 +894,7 @@ function startServers() {
         // Master process does nothing here, relies on cluster.fork() in the main block
     } else {
         // This is a worker process
+        // 1. HTTP 监听 (公网端口)
         const httpServer = net.createServer((socket) => {
             handleClient(socket, false);
         });
@@ -864,6 +904,12 @@ function startServers() {
             console.error(`[CRITICAL Worker ${WORKER_ID}] HTTP Server failed to start on port ${HTTP_PORT}: ${err.message}`);
             process.exit(1); 
         });
+
+        // 2. TLS 监听 (内部/Nginx 反代端口)
+        // [V6.0 FIX] 如果 Nginx 占用了 443，则监听内部端口，否则仍监听 443
+        const tlsListenPort = config.nginx_enabled ? INTERNAL_WSS_PORT : TLS_PORT;
+        const tlsListenAddr = config.nginx_enabled ? LISTEN_ADDR_INTERNAL : LISTEN_ADDR;
+        const tlsServerPort = config.nginx_enabled ? INTERNAL_WSS_PORT : TLS_PORT;
 
         try {
             if (!fs.existsSync(CERT_FILE) || !fs.existsSync(KEY_FILE)) {
@@ -878,10 +924,11 @@ function startServers() {
             const tlsServer = tls.createServer(tlsOptions, (socket) => {
                 handleClient(socket, true);
             });
-            tlsServer.listen(TLS_PORT, LISTEN_ADDR, () => {
-                console.log(`[WSS Worker ${WORKER_ID}] Listening on ${LISTEN_ADDR}:${TLS_PORT} (TLS)`);
+            tlsServer.listen(tlsServerPort, tlsListenAddr, () => {
+                const listenType = config.nginx_enabled ? 'TLS (Internal)' : 'TLS (Public)';
+                console.log(`[WSS Worker ${WORKER_ID}] Listening on ${tlsListenAddr}:${tlsServerPort} (${listenType})`);
             }).on('error', (err) => {
-                console.error(`[CRITICAL Worker ${WORKER_ID}] TLS Server failed to start on port ${TLS_PORT}: ${err.message}`);
+                console.error(`[CRITICAL Worker ${WORKER_ID}] TLS Server failed to start on port ${tlsServerPort}: ${err.message}`);
                 process.exit(1); 
             });
         } catch (e) {
