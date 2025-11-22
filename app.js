@@ -1,5 +1,10 @@
 /**
- * WSS Panel Frontend (Axiom Refactor V5.7 - SSH-UDP Support)
+ * WSS Panel Frontend (Axiom Refactor V6.0 - Realtime Push Optimization)
+ *
+ * [AXIOM V6.0 CHANGELOG]
+ * - OPTIMIZE: 强化 handleSilentUpdate，通过直接操作 DOM 元素（而不是重绘整个列表）来最小化 CPU 使用率。
+ * - NEW: CORE_SERVICES_MAP 增加 'xray' 服务。
+ * - PREP: 在配置中增加 internal_wss_port, xray_internal_port, nginx_enabled 字段，以支持后续的 Xray/Nginx 集成。
  */
 
 // --- 全局配置 (将由 initializeApp 异步填充) ---
@@ -10,9 +15,11 @@ let FLASK_CONFIG = {
     WSS_TLS_PORT: "...",
     STUNNEL_PORT: "...",
     UDPGW_PORT: "...",
-    SSH_UDP_PORT: "...", // [NEW]
-    INTERNAL_FORWARD_PORT: "...",
-    PANEL_PORT: "..."
+    SSH_UDP_PORT: "...",
+    INTERNAL_WSS_PORT: "...", // [NEW V6.0]
+    XRAY_INTERNAL_PORT: "...", // [NEW V6.0]
+    PANEL_PORT: "...",
+    NGINX_ENABLED: 0 // [NEW V6.0]
 };
 
 // --- 全局变量 ---
@@ -31,12 +38,13 @@ let lastUserStats = { total: -1, total_traffic_gb: -1 };
 
 const TOKEN_PLACEHOLDER = "[*********]";
 
-// [AXIOM V5.7 FIX] 注册新的 SSH-UDP 服务
+// [AXIOM V6.0 FIX] 注册新的 Xray 服务
 const CORE_SERVICES_MAP = {
     'wss': 'WSS Proxy',
     'stunnel4': 'Stunnel4',
     'udpgw': 'BadVPN UDPGW', 
-    'ssh_udp': 'SSH-UDP Auth', // 新增服务
+    'ssh_udp': 'SSH-UDP Auth',
+    'xray': 'Xray Core', // [NEW] Xray Service
     'wss_panel': 'Web Panel'
 };
 
@@ -153,6 +161,7 @@ function copyToClipboard(elementId, message) {
         navigator.clipboard.writeText(copyText).then(() => {
             showStatus(message || '已复制到剪贴板！', true);
         }).catch(err => {
+            // Fallback for non-secure contexts or older browsers
             copyTextEl.select();
             document.execCommand('copy');
             showStatus(message || '已复制到剪贴板！', true);
@@ -233,7 +242,7 @@ function switchView(viewId) {
 // --- 数据渲染函数 ---
 
 /**
- * [AXIOM V5.7 FIX] 核心服务列表已更新
+ * [AXIOM V6.0 FIX] 核心服务列表已更新
  */
 function renderSystemStatus(data) {
     const grid = document.getElementById('system-status-grid');
@@ -312,11 +321,15 @@ function renderSystemStatus(data) {
     data.ports.forEach(p => {
         const isListening = p.status === 'LISTEN';
         const badgeClass = isListening ? 'badge-success' : 'badge-error';
+        const portNote = p.note ? `<span class="text-xs text-warning ml-2">(${p.note})</span>` : '';
         const div = document.createElement('div');
         div.id = `port-status-${p.name}`;
         div.className = 'flex justify-between items-center text-gray-700 p-2 bg-base-200 rounded-lg shadow-sm border border-base-300';
         div.innerHTML = 
-            '<span class="font-medium text-sm">' + p.name + ' (' + p.port + '/' + p.protocol + '):</span>' +
+            `<span class="font-medium text-sm">
+                ${p.name} (${p.port}/${p.protocol}):
+                ${portNote}
+            </span>` +
             `<span class="badge ${badgeClass} badge-sm font-bold" id="port-badge-${p.name}">` + p.status +
             '</span>';
         portsContainer.appendChild(div);
@@ -468,7 +481,7 @@ function handleDashboardConnectionSilentUpdate(systemStats) {
 
 
 /**
- * [AXIOM V5.7 FIX] CORE_SERVICES_MAP 在此函数中用于配置日志按钮。
+ * [AXIOM V6.0 FIX] 核心服务列表已更新
  */
 async function fetchAllStaticData() {
     try {
@@ -479,8 +492,9 @@ async function fetchAllStaticData() {
                 WSS_TLS_PORT: data.config.wss_tls_port,
                 STUNNEL_PORT: data.config.stunnel_port,
                 UDPGW_PORT: data.config.udpgw_port,
-                SSH_UDP_PORT: data.config.ssh_udp_port, // [NEW] Load new port
-                INTERNAL_FORWARD_PORT: data.config.internal_forward_port,
+                SSH_UDP_PORT: data.config.ssh_udp_port,
+                INTERNAL_WSS_PORT: data.config.internal_wss_port, // [NEW V6.0] Load new port
+                XRAY_INTERNAL_PORT: data.config.xray_internal_port, // [NEW V6.0] Load new port
                 PANEL_PORT: data.config.panel_port
             };
         }
@@ -490,6 +504,7 @@ async function fetchAllStaticData() {
         if (statusData) {
             renderSystemStatus(statusData);
             renderUserQuickStats(statusData.user_stats); 
+            FLASK_CONFIG.NGINX_ENABLED = statusData.nginx_enabled;
             initRealtimeTrafficChart();
         }
 
@@ -538,10 +553,23 @@ async function fetchGlobalConfig() {
         document.getElementById('config-wss-tls-port').value = data.config.wss_tls_port;
         document.getElementById('config-stunnel-port').value = data.config.stunnel_port;
         document.getElementById('config-udpgw-port').value = data.config.udpgw_port;
-        document.getElementById('config-ssh-udp-port').value = data.config.ssh_udp_port; // [NEW] Set SSH-UDP port
+        document.getElementById('config-ssh-udp-port').value = data.config.ssh_udp_port;
+        // [NEW V6.0] 端口
+        document.getElementById('config-internal-wss-port').value = data.config.internal_wss_port || 44333;
+        document.getElementById('config-xray-internal-port').value = data.config.xray_internal_port || 44444;
+        document.getElementById('config-nginx-external-port').value = data.config.nginx_external_port || 443;
+        // [NEW V6.0] 内部/转发端口
         document.getElementById('config-internal-forward-port').value = data.config.internal_forward_port;
         document.getElementById('config-internal-api-port').value = data.config.internal_api_port;
      }
+     
+     // 加载 Nginx 启用状态
+     const globalData = await fetchData('/settings/global');
+     if (globalData && globalData.settings) {
+        document.getElementById('global-nginx-enable').checked = (globalData.settings.nginx_enabled === 1);
+        FLASK_CONFIG.NGINX_ENABLED = globalData.settings.nginx_enabled;
+     }
+     
 }
 
 async function saveGlobalConfig() {
@@ -553,7 +581,12 @@ async function saveGlobalConfig() {
         wss_tls_port: parseInt(document.getElementById('config-wss-tls-port').value),
         stunnel_port: parseInt(document.getElementById('config-stunnel-port').value),
         udpgw_port: parseInt(document.getElementById('config-udpgw-port').value),
-        ssh_udp_port: parseInt(document.getElementById('config-ssh-udp-port').value), // [NEW] Get SSH-UDP port
+        ssh_udp_port: parseInt(document.getElementById('config-ssh-udp-port').value),
+        // [NEW V6.0]
+        internal_wss_port: parseInt(document.getElementById('config-internal-wss-port').value),
+        xray_internal_port: parseInt(document.getElementById('config-xray-internal-port').value),
+        nginx_external_port: parseInt(document.getElementById('config-nginx-external-port').value),
+        // [END NEW V6.0]
         internal_forward_port: parseInt(document.getElementById('config-internal-forward-port').value)
     };
     
@@ -571,6 +604,9 @@ async function saveGlobalConfig() {
                 window.location.port = configData.panel_port;
                 window.location.reload();
             }, 3000);
+        } else {
+             // 端口未变，刷新系统状态以更新端口列表
+             fetchAllStaticData(); 
         }
     }
 }
@@ -619,23 +655,30 @@ async function fetchGlobalSettings() {
      const data = await fetchData('/settings/global');
      if (data && data.settings) {
         document.getElementById('global-fuse-threshold').value = data.settings.fuse_threshold_kbps || 0;
+        document.getElementById('global-nginx-enable').checked = (data.settings.nginx_enabled === 1);
      }
 }
 
 async function saveGlobalSettings() {
     const fuseThreshold = document.getElementById('global-fuse-threshold').value;
+    const nginxEnabled = document.getElementById('global-nginx-enable').checked ? 1 : 0;
+    
     showStatus('正在保存全局安全设置并实时通知所有代理...', true);
     
     const result = await fetchData('/settings/global', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
-            fuse_threshold_kbps: parseInt(fuseThreshold)
+            fuse_threshold_kbps: parseInt(fuseThreshold),
+            nginx_enabled: nginxEnabled
         })
     });
     
     if (result) {
         showStatus(result.message, true);
+        FLASK_CONFIG.NGINX_ENABLED = nginxEnabled;
+        // 触发状态更新以显示端口变化
+        fetchAllStaticData(); 
     }
 }
 
@@ -733,9 +776,9 @@ function renderActiveGlobalIPs(ipData) {
         const buttonColor = isBanned ? 'btn-success' : 'btn-error';
         const banTag = isBanned ? '<span class="badge badge-error badge-outline ml-2">已封禁</span>' : '';
         
-        const usernameSpan = ipInfo.username ? 
+        const usernameSpan = ipInfo.username && ipInfo.username !== 'N/A' ? 
             `<span class="badge badge-primary badge-outline ml-2 font-mono text-xs">${ipInfo.username}</span>` : 
-            `<span class="badge badge-warning badge-outline ml-2 text-xs">未知用户</span>`;
+            `<span class="badge badge-warning badge-outline ml-2 text-xs">未知用户/IP 统计</span>`;
             
         htmlContent += `
             <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between p-3 bg-base-100 border border-base-300 rounded-lg shadow-sm">
@@ -954,7 +997,7 @@ function renderUserList(users) {
                 <td class="px-6 py-4 whitespace-nowrap text-sm font-mono text-base-content" role="cell">${user.username}</td>
                 
                 <td id="status-cell-${user.username}" class="px-6 py-4 whitespace-nowrap text-sm" role="cell">
-                    <span class="badge ${statusColor} text-xs font-semibold">
+                    <span class="badge ${statusColor} text-xs font-semibold" id="status-badge-${user.username}">
                         ${statusText}
                     </span>
                 </td>
@@ -1173,6 +1216,7 @@ function connectWebSocket() {
                     break;
                 
                 case 'users_changed':
+                    // 状态发生变化时，强制全量拉取并重新渲染用户列表
                     fetchAllUsersAndRender();
                     break;
                 
@@ -1206,24 +1250,35 @@ function connectWebSocket() {
     };
 }
 
-function handleSilentUpdate(userStats) {
+/**
+ * [AXIOM V6.0 OPTIMIZE] 只更新速度和连接数相关的 DOM 元素，最小化 DOM 操作。
+ * @param {object} updatedUserStats 仅包含有变化的用户统计数据的对象
+ */
+function handleSilentUpdate(updatedUserStats) {
     if (currentView !== 'users') return; 
 
-    for (const username in userStats) {
-        if (!userStats.hasOwnProperty(username)) continue;
+    for (const username in updatedUserStats) {
+        if (!updatedUserStats.hasOwnProperty(username)) continue;
         
-        const stats = userStats[username];
-        const speedUpText = formatSpeedUnits(stats.speed_kbps.upload || 0);
-        const speedDownText = formatSpeedUnits(stats.speed_kbps.download || 0);
+        const stats = updatedUserStats[username];
+        const speedUpText = formatSpeedUnits(stats.speed_kbps?.upload || 0);
+        const speedDownText = formatSpeedUnits(stats.speed_kbps?.download || 0);
         const connectionsText = stats.connections || 0;
         
         const userIndex = allUsersCache.findIndex(u => u.username === username);
-        if (userIndex === -1) continue; 
-
-        allUsersCache[userIndex].realtime_speed_up = stats.speed_kbps.upload;
-        allUsersCache[userIndex].realtime_speed_down = stats.speed_kbps.download;
-        allUsersCache[userIndex].active_connections = connectionsText;
         
+        // 1. 更新本地缓存 (必须，因为其他视图或排序依赖它)
+        if (userIndex !== -1) {
+             // 合并实时速度/连接数到缓存
+            allUsersCache[userIndex].realtime_speed_up = stats.speed_kbps?.upload || 0;
+            allUsersCache[userIndex].realtime_speed_down = stats.speed_kbps?.download || 0;
+            allUsersCache[userIndex].active_connections = connectionsText;
+        } else {
+            // 如果缓存中不存在，说明该用户可能来自 IP 统计 (SSH-UDP) 且面板从未加载，跳过
+            continue; 
+        }
+
+        // 2. 更新 DOM (桌面版表格)
         const speedCell = document.getElementById(`speed-cell-${username}`);
         const connCell = document.getElementById(`conn-cell-${username}`); 
 
@@ -1236,6 +1291,7 @@ function handleSilentUpdate(userStats) {
             connCell.textContent = connectionsText;
         }
 
+        // 3. 更新 DOM (移动版卡片)
         const speedUpMobile = document.getElementById(`speed-up-mobile-${username}`);
         const speedDownMobile = document.getElementById(`speed-down-mobile-${username}`);
         const connMobile = document.getElementById(`conn-mobile-${username}`);
@@ -1324,8 +1380,8 @@ function updateRealtimeTrafficChart(liveUpdatePayload) {
     let totalSpeedDown = 0;
     for (const username in liveUpdatePayload.users) {
         const userSpeed = liveUpdatePayload.users[username].speed_kbps;
-        totalSpeedUp += (userSpeed.upload || 0);
-        totalSpeedDown += (userSpeed.download || 0);
+        totalSpeedUp += (userSpeed?.upload || 0);
+        totalSpeedDown += (userSpeed?.download || 0);
     }
     
     const labels = realtimeChartInstance.data.labels;
@@ -1710,6 +1766,7 @@ function setupCreateUserTokenListeners() {
 
 async function initializeApp() {
     try {
+        // 尝试加载初始配置，确保 FLASK_CONFIG 有值
         const data = await fetchData('/settings/config');
         if (data && data.config) {
             FLASK_CONFIG = {
@@ -1717,8 +1774,9 @@ async function initializeApp() {
                 WSS_TLS_PORT: data.config.wss_tls_port,
                 STUNNEL_PORT: data.config.stunnel_port,
                 UDPGW_PORT: data.config.udpgw_port,
-                SSH_UDP_PORT: data.config.ssh_udp_port, 
-                INTERNAL_FORWARD_PORT: data.config.internal_forward_port,
+                SSH_UDP_PORT: data.config.ssh_udp_port,
+                INTERNAL_WSS_PORT: data.config.internal_wss_port,
+                XRAY_INTERNAL_PORT: data.config.xray_internal_port,
                 PANEL_PORT: data.config.panel_port
             };
         } else {
