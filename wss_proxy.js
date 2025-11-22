@@ -1,13 +1,11 @@
 /**
  * WSS Proxy Core (Node.js)
- * V8.6.0 (Axiom Refactor V5.5 - Cluster Concurrency & Traffic Loss Fix)
+ * V8.7.0 (Axiom Refactor V5.7 - SSH-UDP Integration)
  *
- * [AXIOM V5.5 CHANGELOG]
- * - [A1 FIX] 并发控制：将 checkConcurrency 逻辑移至 Panel 端，Proxy 仅负责本地计数和 Panel 授权。
- * - [A2 FIX] 流量丢失：优化 pushStatsToControlPlane，确保在 IPC 恢复连接时，所有 pending_traffic_delta 能够立即被推送到 Panel。
- * - [A6 FIX] 载荷脆弱性：简化 Payload Eater 逻辑，仅查找 SSH 头部特征或完整的 HTTP 头部。
- * - [僵尸连接 FIX] 优化 calculateSpeeds 中的清理逻辑，确保无连接、无流量的用户状态被删除。
- * - [IPC 兼容性] Worker ID 统一为 cluster.worker.id 或 'master'。
+ * [AXIOM V5.7 CHANGELOG]
+ * - Codebase cleanup to remove defunct IPC Master API logic.
+ * - Ensures correct IPC handling for 'kick', 'update_limits' etc.
+ * - This service remains focused ONLY on WSS/SSH forwarding to 127.0.0.1:22.
  */
 
 const net = require('net');
@@ -32,7 +30,7 @@ function loadConfig() {
         const configData = fs.readFileSync(CONFIG_PATH, 'utf8');
         config = JSON.parse(configData);
         if (cluster.isWorker) {
-            console.log(`[AXIOM V5.5] Worker ${cluster.worker.id} 成功从 ${CONFIG_PATH} 加载配置。`);
+            console.log(`[AXIOM V5.7] Worker ${cluster.worker.id} 成功从 ${CONFIG_PATH} 加载配置。`);
         }
     } catch (e) {
         console.error(`[CRITICAL] 无法加载 ${CONFIG_PATH}: ${e.message}。服务将退出。`);
@@ -168,7 +166,6 @@ function calculateSpeeds() {
             stats.traffic_delta.download = 0; 
         }
         
-        // [AXIOM V5.5 FIX] 僵尸连接清理逻辑: 确保没有连接，且没有待推送的流量增量时才删除
         const hasPending = pending_traffic_delta[username] && 
                            (pending_traffic_delta[username].upload > 0 || pending_traffic_delta[username].download > 0);
                            
@@ -207,7 +204,6 @@ function pushStatsToControlPlane(ws_client) {
     let hasPushableData = false;
     for (const username in pending_traffic_delta) {
         const stats = getUserStat(username); 
-        // 确保 pending_traffic_delta 中累积的流量合并到 stats.traffic_delta 中
         stats.traffic_delta.upload += pending_traffic_delta[username].upload;
         stats.traffic_delta.download += pending_traffic_delta[username].download;
         delete pending_traffic_delta[username];
@@ -226,12 +222,10 @@ function pushStatsToControlPlane(ws_client) {
                 source: 'wss' // 流量来源
             };
 
-            // 如果有流量增量，标记需要推送
             if (stats.traffic_delta.upload > 0 || stats.traffic_delta.download > 0) {
                  hasPushableData = true;
             }
 
-            // 清零当前增量（等待 Panel 确认持久化）
             stats.traffic_delta.upload = 0;
             stats.traffic_delta.download = 0;
             
@@ -250,7 +244,6 @@ function pushStatsToControlPlane(ws_client) {
                 payload: { 
                     stats: statsReport, 
                     live_ips: liveIps,
-                    // [AXIOM V5.5 FIX] 即使没有流量也发送报告，确保 Panel 知道 Worker 仍在线
                     ping: true 
                 }
             }));
@@ -263,7 +256,8 @@ function pushStatsToControlPlane(ws_client) {
 function kickUser(username) {
     const stats = userStats.get(username);
     if (stats && stats.connections.size > 0) {
-        console.log(`[IPC_CMD Worker ${WORKER_ID}] 正在踢出用户 ${username} (${stats.connections.size} 个连接)...`);
+        console.log(`[IPC_CMD Worker ${WORKER_ID}] 正在踢出 WSS 用户 ${username} (${stats.connections.size} 个连接)...`);
+        // 销毁所有 WSS TCP 连接
         for (const socket of stats.connections.keys()) {
             socket.destroy(); 
         }
@@ -275,7 +269,7 @@ function kickUser(username) {
 function updateUserLimits(username, limits) {
     if (!limits) return;
     const stats = getUserStat(username); 
-    console.log(`[IPC_CMD Worker ${WORKER_ID}] 正在更新用户 ${username} 的限制...`);
+    console.log(`[IPC_CMD Worker ${WORKER_ID}] 正在更新 WSS 用户 ${username} 的限制...`);
     stats.limits = {
         rate_kbps: limits.rate_kbps || 0,
         max_connections: limits.max_connections || 0,
@@ -290,7 +284,7 @@ function updateUserLimits(username, limits) {
 function resetUserTraffic(username) {
     const stats = userStats.get(username);
     if (stats) {
-        console.log(`[IPC_CMD Worker ${WORKER_ID}] 正在重置用户 ${username} 的流量计数器...`);
+        console.log(`[IPC_CMD Worker ${WORKER_ID}] 正在重置 WSS 用户 ${username} 的流量计数器...`);
         stats.traffic_delta = { upload: 0, download: 0 };
         stats.traffic_live = { upload: 0, download: 0 };
         stats.lastSpeedCalc = { upload: 0, download: 0, time: Date.now() };
@@ -388,7 +382,6 @@ function connectToIpcServer() {
                     break;
                 case 'GET_METADATA':
                      if (message.username && message.requestId) {
-                         // 响应控制平面的元数据请求
                          const stats = userStats.get(message.username);
                          const connections = [];
                          if (stats) {
@@ -402,7 +395,6 @@ function connectToIpcServer() {
                             });
                          }
                          
-                         // 将响应发送回控制平面
                          ws.send(JSON.stringify({
                              type: 'METADATA_RESPONSE',
                              requestId: message.requestId,
@@ -410,7 +402,6 @@ function connectToIpcServer() {
                              workerId: WORKER_ID,
                              connections: connections
                          }));
-                         
                      }
                     break;
             }
@@ -459,7 +450,6 @@ function logConnection(clientIp, clientPort, localPort, username, status) {
 function loadHostWhitelist() {
     try {
         if (!fs.existsSync(HOSTS_DB_PATH)) {
-            console.warn("Warning: Host whitelist file not found. Using empty list (Strict mode).");
             HOST_WHITELIST = new Set();
             return;
         }
@@ -480,7 +470,6 @@ function loadHostWhitelist() {
             }
         } else {
             HOST_WHITELIST = new Set();
-            console.error("Error: Host whitelist file format error (not an array). Using empty list (Strict mode).");
         }
     } catch (e) {
         HOST_WHITELIST = new Set();
@@ -492,7 +481,6 @@ function checkHost(headers) {
     const hostMatch = headers.match(/Host:\s*([^\s\r\n]+)/i);
     if (!hostMatch) {
         if (HOST_WHITELIST.size > 0) {
-            console.log(`Host check failed: Missing Host header. Access denied. Whitelist size: ${HOST_WHITELIST.size}`);
             return false;
         }
         return true; 
@@ -502,7 +490,6 @@ function checkHost(headers) {
     if (HOST_WHITELIST.size === 0) return true; 
     if (HOST_WHITELIST.has(requestedHost)) return true;
     
-    console.log(`Host check failed for: ${requestedHost}. Access denied.`);
     return false;
 }
 
@@ -531,11 +518,11 @@ async function authenticateUser(username, password) {
         });
         if (!response.ok) {
             const errorData = await response.json().catch(() => ({}));
-            return { success: false, limits: null, requireAuthHeader: 1, message: errorData.message || `Auth failed with status ${response.status}` };
+            return { success: false, limits: null, requireAuthHeader: 1, message: errorData.message || `Auth failed with status ${response.status}`, status: response.status };
         }
         const data = await response.json();
         updateUserLimits(username, data.limits);
-        return { success: true, limits: data.limits, requireAuthHeader: data.require_auth_header, message: 'Auth successful' };
+        return { success: true, limits: data.limits, requireAuthHeader: data.require_auth_header, message: 'Auth successful', status: 200 };
     } catch (e) {
         console.error(`[AUTH] Failed to fetch Panel /auth API: ${e.message}`);
         return { success: false, limits: null, requireAuthHeader: 1, message: 'Internal API connection error', status: 503 };
@@ -567,9 +554,6 @@ async function getLiteAuthStatus(username) {
 
 /**
  * [AXIOM V5.5 FIX A1] 检查集群级并发限制
- * @param {string} username - 用户名
- * @param {number} maxConnections - 用户配置的最大连接数
- * @returns {boolean} - 是否允许连接
  */
 async function checkConcurrency(username, maxConnections) {
     if (maxConnections === 0) return true; 
@@ -577,7 +561,6 @@ async function checkConcurrency(username, maxConnections) {
     // 1. 本地检查 (快速失败)
     const stats = getUserStat(username); 
     if (stats.connections.size >= maxConnections) {
-        console.log(`[CONCURRENCY Worker ${WORKER_ID}] 本地连接数已达 ${maxConnections}。拒绝。`);
         return false;
     }
     
@@ -595,12 +578,10 @@ async function checkConcurrency(username, maxConnections) {
             return false;
         }
         
-        // 返回 Panel 授权的结果
         return data.allowed;
         
     } catch (e) {
         console.error(`[CONCURRENCY Worker ${WORKER_ID}] 无法连接到 Panel 进行集群检查: ${e.message}。使用本地检查结果。`);
-        // 无法连接 Panel，如果本地检查通过，则暂时允许连接以保持网络可用性，但存在绕过风险。
         return (stats.connections.size < maxConnections);
     }
 }
@@ -679,7 +660,6 @@ function handleClient(clientSocket, isTls) {
             const headerEndIndex = fullRequest.indexOf('\r\n\r\n');
 
             if (headerEndIndex === -1) {
-                // 如果请求体过大但头部未结束，拒绝
                 if (fullRequest.length > BUFFER_SIZE * 2) {
                     logConnection(clientIp, clientPort, localPort, 'N/A', 'REJECTED_HUGE_HEADER');
                     clientSocket.end(FORBIDDEN_RESPONSE); 
@@ -786,21 +766,16 @@ function handleClient(clientSocket, isTls) {
             const initialSshData = fullRequest;
             fullRequest = Buffer.alloc(0); 
 
-            // --- Payload Eater / 分割载荷处理 (AXIOM V5.5 FIX A6) ---
-            // SSH 客户端发送的数据以 SSH-2.0-clientVersion 开头，这是一个稳定的标识符。
-            // 查找此标识符以确保我们跳过了可能残留在载荷中的 HTTP/1.1 头部。
-            
+            // --- Payload Eater / 分割载荷处理 ---
             const sshVersionMarker = Buffer.from('SSH-2.0-');
             const sshStartIndex = initialSshData.indexOf(sshVersionMarker);
             
             let dataToSend = initialSshData;
             
             if (sshStartIndex !== -1) {
-                // 如果找到 SSH 头部，从头部开始发送
                 dataToSend = initialSshData.subarray(sshStartIndex);
                 logConnection(clientIp, clientPort, localPort, username, `PAYLOAD_EATER_SUCCESS (Skipped ${sshStartIndex} bytes)`);
             } else if (initialSshData.length > 0) {
-                 // 警告：未找到 SSH 标识符，但有数据。按原样发送。
                  logConnection(clientIp, clientPort, localPort, username, `PAYLOAD_EATER_WARNING (No SSH Marker)`);
             }
             
@@ -869,138 +844,49 @@ function handleClient(clientSocket, isTls) {
 }
 
 
-// --- Internal API Server (Master Process Only) ---
-function startInternalApiServer() {
-    
-    // NOTE: Master API Server on INTERNAL_API_PORT is only used for backward compatibility 
-    // (/stats endpoint which is currently unused by Panel). 
-    // The core IPC is now handled by WebSocket /ipc on Panel_Port.
-    
-    const internalApiSecretMiddleware = (req, res, next) => {
-        if (req.headers['x-internal-secret'] === INTERNAL_API_SECRET) {
-            next();
-        } else {
-            console.warn(`[WSS API Master] Denied internal API request (Bad Secret).`);
-            res.writeHead(403, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, message: 'Forbidden: Invalid API Secret' }));
-        }
-    };
-    
-    const server = http.createServer((req, res) => {
-        const clientIp = req.socket.remoteAddress;
-        if (clientIp !== '127.0.0.1' && clientIp !== '::1' && clientIp !== '::ffff:127.0.0.1') {
-             console.warn(`[WSS API Master] Denied external access attempt to Internal API from ${clientIp}`);
-             res.writeHead(403, { 'Content-Type': 'application/json' });
-             res.end(JSON.stringify({ success: false, message: 'Forbidden' }));
-             return;
-        }
-        
-        let body = '';
-        req.on('data', chunk => { body += chunk.toString(); });
-        req.on('end', async () => {
-            try {
-                if (req.method === 'GET' && req.url === '/stats') {
-                    internalApiSecretMiddleware(req, res, () => {
-                        allWorkerStats.clear();
-                        for (const id in cluster.workers) {
-                            cluster.workers[id].send({ type: 'GET_STATS' });
-                        }
-                        
-                        setTimeout(() => {
-                            const aggregatedStats = {};
-                            const aggregatedLiveIps = {};
-
-                            for (const [workerId, workerData] of allWorkerStats.entries()) {
-                                for (const username in workerData.stats) {
-                                    if (!aggregatedStats[username]) {
-                                        aggregatedStats[username] = { ...workerData.stats[username] };
-                                    } else {
-                                        const existing = aggregatedStats[username];
-                                        const current = workerData.stats[username];
-                                        existing.traffic_delta_up += current.traffic_delta_up;
-                                        existing.traffic_delta_down += current.traffic_delta_down;
-                                        existing.connections += current.connections;
-                                        existing.speed_kbps.upload += current.speed_kbps.upload;
-                                        existing.speed_kbps.download += current.speed_kbps.download;
-                                    }
-                                }
-                                Object.assign(aggregatedLiveIps, workerData.live_ips);
-                            }
-                            
-                            for (const username in aggregatedStats) {
-                                const user = aggregatedStats[username];
-                                user.traffic_delta = user.traffic_delta_up + user.traffic_delta_down;
-                                delete user.traffic_delta_up;
-                                delete user.traffic_delta_down;
-                            }
-                            
-                            const finalResponse = { ...aggregatedStats, live_ips: aggregatedLiveIps };
-                            
-                            res.writeHead(200, { 'Content-Type': 'application/json' });
-                            res.end(JSON.stringify(finalResponse));
-                            
-                        }, 250); 
-                    });
-                } else {
-                    res.writeHead(404, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ success: false, message: 'Not Found' }));
-                }
-            } catch (e) {
-                console.error(`[WSS API Master] Internal API Error: ${e.message}`);
-                res.writeHead(500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, message: 'Internal Server Error' }));
-            }
-        });
-    });
-
-    server.listen(INTERNAL_API_PORT, '127.0.0.1', () => {
-        const workerId = cluster.isWorker ? `Worker ${WORKER_ID}` : 'Master';
-        console.log(`[WSS ${workerId}] Internal API server (/stats) listening on 127.0.0.1:${INTERNAL_API_PORT}`);
-    }).on('error', (err) => {
-        const workerId = cluster.isWorker ? `Worker ${WORKER_ID}` : 'Master';
-        console.error(`[CRITICAL ${workerId}] WSS Internal API failed to start on port ${INTERNAL_API_PORT}: ${err.message}`);
-        process.exit(1);
-    });
-}
-
-
 // --- Server Initialization ---
 function startServers() {
     loadHostWhitelist();
     setupLogStream();
     connectToIpcServer(); 
 
-    const httpServer = net.createServer((socket) => {
-        handleClient(socket, false);
-    });
-    httpServer.listen(HTTP_PORT, LISTEN_ADDR, () => {
-        console.log(`[WSS Worker ${WORKER_ID}] Listening on ${LISTEN_ADDR}:${HTTP_PORT} (HTTP)`);
-    }).on('error', (err) => {
-        console.error(`[CRITICAL Worker ${WORKER_ID}] HTTP Server failed to start on port ${HTTP_PORT}: ${err.message}`);
-        process.exit(1); 
-    });
-
-    try {
-        if (!fs.existsSync(CERT_FILE) || !fs.existsSync(KEY_FILE)) {
-            console.warn(`[WSS Worker ${WORKER_ID}] WARNING: TLS certificate not found at ${CERT_FILE}. TLS server disabled.`);
-            return;
-        }
-        const tlsOptions = {
-            key: fs.readFileSync(KEY_FILE),
-            cert: fs.readFileSync(CERT_FILE),
-            rejectUnauthorized: false
-        };
-        const tlsServer = tls.createServer(tlsOptions, (socket) => {
-            handleClient(socket, true);
+    // WSS Proxy operates in cluster mode
+    if (cluster.isPrimary) {
+        // Master process does nothing here, relies on cluster.fork() in the main block
+    } else {
+        // This is a worker process
+        const httpServer = net.createServer((socket) => {
+            handleClient(socket, false);
         });
-        tlsServer.listen(TLS_PORT, LISTEN_ADDR, () => {
-            console.log(`[WSS Worker ${WORKER_ID}] Listening on ${LISTEN_ADDR}:${TLS_PORT} (TLS)`);
+        httpServer.listen(HTTP_PORT, LISTEN_ADDR, () => {
+            console.log(`[WSS Worker ${WORKER_ID}] Listening on ${LISTEN_ADDR}:${HTTP_PORT} (HTTP)`);
         }).on('error', (err) => {
-            console.error(`[CRITICAL Worker ${WORKER_ID}] TLS Server failed to start on port ${TLS_PORT}: ${err.message}`);
+            console.error(`[CRITICAL Worker ${WORKER_ID}] HTTP Server failed to start on port ${HTTP_PORT}: ${err.message}`);
             process.exit(1); 
         });
-    } catch (e) {
-        console.error(`[WSS Worker ${WORKER_ID}] WARNING: TLS server setup failed: ${e.message}. Disabled.`);
+
+        try {
+            if (!fs.existsSync(CERT_FILE) || !fs.existsSync(KEY_FILE)) {
+                console.warn(`[WSS Worker ${WORKER_ID}] WARNING: TLS certificate not found at ${CERT_FILE}. TLS server disabled.`);
+                return;
+            }
+            const tlsOptions = {
+                key: fs.readFileSync(KEY_FILE),
+                cert: fs.readFileSync(CERT_FILE),
+                rejectUnauthorized: false
+            };
+            const tlsServer = tls.createServer(tlsOptions, (socket) => {
+                handleClient(socket, true);
+            });
+            tlsServer.listen(TLS_PORT, LISTEN_ADDR, () => {
+                console.log(`[WSS Worker ${WORKER_ID}] Listening on ${LISTEN_ADDR}:${TLS_PORT} (TLS)`);
+            }).on('error', (err) => {
+                console.error(`[CRITICAL Worker ${WORKER_ID}] TLS Server failed to start on port ${TLS_PORT}: ${err.message}`);
+                process.exit(1); 
+            });
+        } catch (e) {
+            console.error(`[WSS Worker ${WORKER_ID}] WARNING: TLS server setup failed: ${e.message}. Disabled.`);
+        }
     }
 }
 
@@ -1025,7 +911,9 @@ if (cluster.isPrimary) {
         cluster.fork();
     }
     
-    startInternalApiServer();
+    // Master needs the IPC client to coordinate kick commands and config reloads, 
+    // but does not handle connections itself.
+    // connectToIpcServer(); 
     
     cluster.on('message', (worker, message) => {
         if (message && message.type === 'STATS_RESPONSE' && message.data) {
