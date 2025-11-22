@@ -5,7 +5,7 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V2.4.2 (Axiom - Final Release)
+# V2.5.0 (Axiom V6.0 - Nginx/Xray/Raw TCP Integration)
 # ==========================================================
 
 # =============================
@@ -20,6 +20,7 @@ SECRET_KEY_FILE="$PANEL_DIR/secret_key.txt"
 INTERNAL_SECRET_PATH="$PANEL_DIR/internal_secret.txt" 
 IPTABLES_RULES="/etc/iptables/rules.v4"
 DB_PATH="$PANEL_DIR/wss_panel.db"
+XRAY_BIN_PATH="/usr/local/bin/xray" # Xray Core 默认安装路径
 
 # 源文件路径
 WSS_PROXY_SRC="$REPO_ROOT/wss_proxy.js"
@@ -30,6 +31,8 @@ LOGIN_HTML_SRC="$REPO_ROOT/login.html"
 PACKAGE_JSON_SRC="$REPO_ROOT/package.json"
 UDP_SERVER_SRC="$REPO_ROOT/udp_server.js"
 SSH_UDP_SRC="$REPO_ROOT/ssh_udp.js"
+NGINX_CONF_TEMPLATE="$REPO_ROOT/nginx_wss_xray.conf.template"
+XRAY_CONFIG_TEMPLATE="$REPO_ROOT/xray_config.json.template"
 
 # 目标文件路径
 WSS_PROXY_DEST="/usr/local/bin/wss_proxy.js"
@@ -41,18 +44,23 @@ LOGIN_HTML_DEST="$PANEL_DIR/login.html"
 PACKAGE_JSON_DEST="$PANEL_DIR/package.json"
 UDP_SERVER_DEST="$PANEL_DIR/udp_server.js"
 SSH_UDP_DEST="$PANEL_DIR/ssh_udp.js"
+XRAY_CONFIG_DEST="$PANEL_DIR/xray_config.json"
+NGINX_CONF_DEST="/etc/nginx/sites-available/wss-panel.conf"
+NGINX_SYMLINK="/etc/nginx/sites-enabled/wss-panel.conf"
 
 # Systemd 服务模板
 WSS_TEMPLATE="$REPO_ROOT/wss.service.template"
 PANEL_TEMPLATE="$REPO_ROOT/wss_panel.service.template"
 UDPGW_TEMPLATE="$REPO_ROOT/udpgw.service.template"
 SSH_UDP_TEMPLATE="$REPO_ROOT/ssh_udp.service.template"
+XRAY_TEMPLATE="$REPO_ROOT/xray.service.template"
 
 # Systemd 服务目标路径
 WSS_SERVICE_PATH="/etc/systemd/system/wss.service"
 PANEL_SERVICE_PATH="/etc/systemd/system/wss_panel.service"
 UDPGW_SERVICE_PATH="/etc/systemd/system/udpgw.service"
 SSH_UDP_SERVICE_PATH="/etc/systemd/system/ssh_udp.service"
+XRAY_SERVICE_PATH="/etc/systemd/system/xray.service"
 
 BADVPN_SRC_DIR="/root/badvpn"
 SSHD_STUNNEL_CONFIG="/etc/ssh/sshd_config_stunnel"
@@ -61,54 +69,68 @@ SSHD_STUNNEL_SERVICE="/etc/systemd/system/sshd_stunnel.service"
 mkdir -p "$PANEL_DIR" 
 mkdir -p /etc/stunnel/certs
 mkdir -p /var/log/stunnel4
+mkdir -p /var/log/xray # Xray 日志目录
 touch "$WSS_LOG_FILE"
 
 # =============================
 # 2. 交互式端口配置
 # =============================
 echo "----------------------------------"
-echo "==== WSS 基础设施配置 (V2.4) ===="
+echo "==== WSS 基础设施配置 (V6.0) ===="
 echo "请确认或修改以下端口和服务用户设置 (回车以使用默认值)。"
 
 read -p "  1. WSS HTTP 端口 [80]: " WSS_HTTP_PORT
 WSS_HTTP_PORT=${WSS_HTTP_PORT:-80}
 
-read -p "  2. WSS TLS 端口 [443]: " WSS_TLS_PORT
-WSS_TLS_PORT=${WSS_TLS_PORT:-443}
-
-read -p "  3. Stunnel (SSH/TLS) 端口 [444]: " STUNNEL_PORT
+read -p "  2. Stunnel (SSH/TLS) 端口 [444]: " STUNNEL_PORT
 STUNNEL_PORT=${STUNNEL_PORT:-444}
 
-read -p "  4. BadVPN UDPGW 端口 (本地) [7300]: " UDPGW_PORT
-UDPGW_PORT=${UDPGW_PORT:-7300}
-
-read -p "  5. SSH-UDP 公网端口 (核心服务) [7400]: " SSH_UDP_PORT
+read -p "  3. SSH-UDP 公网端口 (Raw TCP) [7400]: " SSH_UDP_PORT
 SSH_UDP_PORT=${SSH_UDP_PORT:-7400}
 
-read -p "  6. Web 面板端口 [54321]: " PANEL_PORT
+# Nginx/Xray 集成端口
+read -p "  4. Nginx 外部监听端口 (TLS) [443]: " NGINX_EXTERNAL_PORT
+NGINX_EXTERNAL_PORT=${NGINX_EXTERNAL_PORT:-443}
+
+# 内部端口
+read -p "  5. WSS Proxy 内部监听端口 [44333]: " INTERNAL_WSS_PORT
+INTERNAL_WSS_PORT=${INTERNAL_WSS_PORT:-44333}
+
+read -p "  6. Xray Core 内部监听端口 [44444]: " XRAY_INTERNAL_PORT
+XRAY_INTERNAL_PORT=${XRAY_INTERNAL_PORT:-44444}
+
+read -p "  7. BadVPN UDPGW 端口 (本地) [7300]: " UDPGW_PORT
+UDPGW_PORT=${UDPGW_PORT:-7300}
+
+read -p "  8. Web 面板端口 [54321]: " PANEL_PORT
 PANEL_PORT=${PANEL_PORT:-54321}
 
-read -p "  7. 内部 SSH (WSS) 转发端口 [22]: " INTERNAL_FORWARD_PORT
+read -p "  9. 内部 SSH (转发) 端口 [22]: " INTERNAL_FORWARD_PORT
 INTERNAL_FORWARD_PORT=${INTERNAL_FORWARD_PORT:-22}
 
-read -p "  8. 内部 SSH (Stunnel) 转发端口 [2222]: " SSHD_STUNNEL_PORT
+read -p "  10. 内部 Stunnel SSHD 端口 [2222]: " SSHD_STUNNEL_PORT
 SSHD_STUNNEL_PORT=${SSHD_STUNNEL_PORT:-2222}
 
-read -p "  9. Panel 服务用户名 [admin]: " panel_user
+read -p "  11. Panel 服务用户名 [admin]: " panel_user
 panel_user=${panel_user:-admin}
 
 INTERNAL_API_PORT=54322 
+WSS_TLS_PORT=$NGINX_EXTERNAL_PORT # WSS TLS 公网端口被 Nginx 占用
 PANEL_API_URL="http://127.0.0.1:$PANEL_PORT/internal"
 PROXY_API_URL="http://127.0.0.1:$INTERNAL_API_PORT"
 
 echo "---------------------------------"
 echo "配置确认："
 echo "Panel 用户: $panel_user"
-echo "WSS (80/443) -> $WSS_HTTP_PORT/$WSS_TLS_PORT"
-echo "Stunnel (444) -> $STUNNEL_PORT"
-echo "BadVPN UDPGW (127.0.0.1) -> $UDPGW_PORT"
-echo "SSH-UDP Auth (0.0.0.0) -> $SSH_UDP_PORT (1-65535 流量汇聚点)"
+echo "WSS HTTP -> $WSS_HTTP_PORT"
+echo "Stunnel (SSH/TLS) -> $STUNNEL_PORT"
+echo "SSH-UDP (Raw TCP) -> $SSH_UDP_PORT"
+echo "Nginx/Xray (TLS/WS) -> $NGINX_EXTERNAL_PORT (公网)"
+echo "WSS Proxy 内部监听: 127.0.0.1:$INTERNAL_WSS_PORT"
+echo "Xray Core 内部监听: 127.0.0.1:$XRAY_INTERNAL_PORT"
+echo "BadVPN UDPGW (本地) -> $UDPGW_PORT"
 echo "Web Panel (HTTP) & IPC -> $PANEL_PORT"
+echo "内部 SSH 转发: $INTERNAL_FORWARD_PORT"
 echo "---------------------------------"
 
 if [ -f "$ROOT_HASH_FILE" ]; then
@@ -137,7 +159,7 @@ fi
 # =============================
 echo "----------------------------------"
 echo "==== 系统清理与依赖检查 ===="
-systemctl stop wss stunnel4 udpgw ssh_udp wss_panel sshd_stunnel || true
+systemctl stop wss stunnel4 udpgw ssh_udp xray wss_panel sshd_stunnel nginx || true
 systemctl disable udp_server 2>/dev/null || true 
 rm -f /etc/systemd/system/udp_server.service
 
@@ -147,6 +169,19 @@ if ! command -v node >/dev/null; then
     curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
     apt install -y nodejs
 fi
+
+# [V6.0 新增] 安装 Nginx
+if ! command -v nginx >/dev/null; then
+    echo "正在安装 Nginx..."
+    apt install -y nginx
+fi
+
+# [V6.0 新增] 安装 Xray
+if ! command -v xray >/dev/null; then
+    echo "正在下载和安装 Xray Core..."
+    bash -c "$(curl -L https://github.com/XTLS/Xray-core/raw/main/install-release.sh)" || echo "警告: Xray Core 安装失败，将跳过 Xray 服务配置。"
+fi
+
 
 apt install -y wget curl git net-tools cmake build-essential openssl stunnel4 iproute2 iptables procps libsqlite3-dev passwd sudo || echo "警告: 部分依赖安装失败。"
 
@@ -179,18 +214,23 @@ INTERNAL_SECRET=$(cat "$INTERNAL_SECRET_PATH")
 
 chmod 600 "$ROOT_HASH_FILE" "$SECRET_KEY_FILE" "$INTERNAL_SECRET_PATH"
 
+
 echo "正在创建 config.json..."
 tee "$CONFIG_PATH" > /dev/null <<EOF
 {
   "panel_user": "$panel_user",
   "panel_port": $PANEL_PORT,
   "wss_http_port": $WSS_HTTP_PORT,
-  "wss_tls_port": $WSS_TLS_PORT,
+  "wss_tls_port": $NGINX_EXTERNAL_PORT,
   "stunnel_port": $STUNNEL_PORT,
   "udpgw_port": $UDPGW_PORT,
   "ssh_udp_port": $SSH_UDP_PORT,
   "internal_forward_port": $INTERNAL_FORWARD_PORT,
   "internal_api_port": $INTERNAL_API_PORT,
+  "internal_wss_port": $INTERNAL_WSS_PORT,
+  "xray_internal_port": $XRAY_INTERNAL_PORT,
+  "nginx_external_port": $NGINX_EXTERNAL_PORT,
+  "nginx_enabled": 1,
   "internal_api_secret": "$INTERNAL_SECRET",
   "panel_api_url": "$PANEL_API_URL",
   "proxy_api_url": "$PROXY_API_URL"
@@ -216,6 +256,7 @@ CMD_JOURNALCTL=$(command -v journalctl)
 CMD_SYSTEMCTL=$(command -v systemctl)
 CMD_GETENT=$(command -v getent)
 CMD_SED=$(command -v sed)
+CMD_NGINX=$(command -v nginx) # Nginx 命令
 
 tee "$SUDOERS_FILE" > /dev/null <<EOF
 $panel_user ALL=(ALL) NOPASSWD: $CMD_USERADD
@@ -231,12 +272,15 @@ $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart wss
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart stunnel4
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart udpgw
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart ssh_udp
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart xray
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart wss_panel
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart nginx
 $panel_user ALL=(ALL) NOPASSWD: $CMD_GETENT
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active wss
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active stunnel4
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active udpgw
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active ssh_udp
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active xray
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active wss_panel
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SED
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL daemon-reload
@@ -272,16 +316,10 @@ cp "$PANEL_HTML_SRC" "$PANEL_HTML_DEST"
 cp "$PANEL_JS_SRC" "$PANEL_JS_DEST"
 cp "$LOGIN_HTML_SRC" "$LOGIN_HTML_DEST"
 cp "$UDP_SERVER_SRC" "$UDP_SERVER_DEST" 
+cp "$SSH_UDP_SRC" "$SSH_UDP_DEST"
+cp "$XRAY_CONFIG_TEMPLATE" "$XRAY_CONFIG_DEST"
 
-# [NEW] 部署 SSH-UDP JS
-if [ -f "$SSH_UDP_SRC" ]; then
-    cp "$SSH_UDP_SRC" "$SSH_UDP_DEST"
-    chmod +x "$SSH_UDP_DEST"
-else
-    echo "警告: $SSH_UDP_SRC 未找到，SSH-UDP 服务将无法运行。"
-fi
-
-chmod +x "$WSS_PROXY_DEST" "$PANEL_BACKEND_DEST"
+chmod +x "$WSS_PROXY_DEST" "$PANEL_BACKEND_DEST" "$SSH_UDP_DEST"
 
 if [ ! -f "$DB_PATH" ]; then echo "Database will be initialized on start."; fi
 [ ! -f "$PANEL_DIR/audit.log" ] && touch "$PANEL_DIR/audit.log"
@@ -289,14 +327,15 @@ if [ ! -f "$DB_PATH" ]; then echo "Database will be initialized on start."; fi
 chown -R "$panel_user:$panel_user" "$PANEL_DIR"
 
 # =============================
-# 7. 安装 Stunnel4
+# 7. 安装 Stunnel4, Nginx, Xray 配置
 # =============================
-echo "==== 配置 Stunnel4 ===="
+echo "==== 配置 Stunnel4, Nginx, Xray ===="
 if ! getent group shell_users >/dev/null; then groupadd shell_users; fi
 openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/stunnel/certs/stunnel.key -out /etc/stunnel/certs/stunnel.crt -days 1095 -subj "/CN=example.com" > /dev/null 2>&1
 cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem
 chmod 600 /etc/stunnel/certs/*.key /etc/stunnel/certs/*.pem
 
+# 7.1 Stunnel 配置
 tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
 pid=/var/run/stunnel.pid
 setuid=root
@@ -314,6 +353,26 @@ connect = 127.0.0.1:$SSHD_STUNNEL_PORT
 EOF
 systemctl enable stunnel4
 systemctl restart stunnel4
+
+# 7.2 Xray 核心配置 (替换占位符)
+sed -i "s/@XRAY_INTERNAL_PORT@/$XRAY_INTERNAL_PORT/g" "$XRAY_CONFIG_DEST"
+sed -i "s/@INTERNAL_FORWARD_PORT@/$INTERNAL_FORWARD_PORT/g" "$XRAY_CONFIG_DEST"
+
+# 7.3 Nginx 配置 (替换占位符并启用)
+if [ -f "$NGINX_CONF_TEMPLATE" ]; then
+    cp "$NGINX_CONF_TEMPLATE" "$NGINX_CONF_DEST"
+    sed -i "s/@NGINX_EXTERNAL_PORT@/$NGINX_EXTERNAL_PORT/g" "$NGINX_CONF_DEST"
+    sed -i "s/@INTERNAL_WSS_PORT@/$INTERNAL_WSS_PORT/g" "$NGINX_CONF_DEST"
+    sed -i "s/@XRAY_INTERNAL_PORT@/$XRAY_INTERNAL_PORT/g" "$NGINX_CONF_DEST"
+    
+    # 启用 Nginx 配置
+    if [ -e /etc/nginx/sites-enabled/default ]; then rm -f /etc/nginx/sites-enabled/default; fi
+    ln -sf "$NGINX_CONF_DEST" "$NGINX_SYMLINK"
+    systemctl enable nginx || true
+else
+    echo "警告: Nginx 配置文件模板未找到，将跳过 Nginx 配置。"
+fi
+
 
 # =============================
 # 8. 编译并部署 BadVPN (C++ Version)
@@ -350,7 +409,15 @@ else
     echo "错误: ssh_udp 模板未找到。"
 fi
 
-# 3. wss
+# 3. xray
+if [ -f "$XRAY_TEMPLATE" ]; then
+    cp "$XRAY_TEMPLATE" "$XRAY_SERVICE_PATH"
+    systemctl enable xray
+else
+    echo "警告: Xray 模板未找到，跳过 Xray 服务配置。"
+fi
+
+# 4. wss
 if [ -f "$WSS_TEMPLATE" ]; then
     cp "$WSS_TEMPLATE" "$WSS_SERVICE_PATH"
     sed -i "s|@WSS_LOG_FILE_PATH@|$WSS_LOG_FILE|g" "$WSS_SERVICE_PATH"
@@ -359,7 +426,7 @@ else
     echo "错误: wss 模板未找到。"
 fi
 
-# 4. wss_panel
+# 5. wss_panel
 if [ -f "$PANEL_TEMPLATE" ]; then
     cp "$PANEL_TEMPLATE" "$PANEL_SERVICE_PATH"
     sed -i "s|@PANEL_DIR@|$PANEL_DIR|g" "$PANEL_SERVICE_PATH"
@@ -370,7 +437,7 @@ else
 fi
 
 systemctl daemon-reload
-systemctl enable wss_panel wss udpgw ssh_udp
+systemctl enable wss_panel wss udpgw ssh_udp xray || true # 启用所有服务
 
 # =============================
 # 10. IPTABLES 全端口转发 (1-65535)
@@ -388,7 +455,7 @@ fi
 # --- 1. 排除关键端口 (不转发) ---
 iptables -t nat -A PREROUTING -p tcp --dport 22 -j RETURN
 iptables -t nat -A PREROUTING -p tcp --dport $WSS_HTTP_PORT -j RETURN
-iptables -t nat -A PREROUTING -p tcp --dport $WSS_TLS_PORT -j RETURN
+iptables -t nat -A PREROUTING -p tcp --dport $NGINX_EXTERNAL_PORT -j RETURN # 排除 Nginx 外部端口
 iptables -t nat -A PREROUTING -p tcp --dport $STUNNEL_PORT -j RETURN
 iptables -t nat -A PREROUTING -p tcp --dport $PANEL_PORT -j RETURN
 iptables -t nat -A PREROUTING -p tcp --dport $SSH_UDP_PORT -j RETURN
@@ -398,6 +465,7 @@ iptables -t nat -A PREROUTING -p tcp -j REDIRECT --to-port $SSH_UDP_PORT
 
 # --- 3. 放行规则 ---
 iptables -A INPUT -p tcp --dport $SSH_UDP_PORT -j ACCEPT
+iptables -A INPUT -p tcp --dport $NGINX_EXTERNAL_PORT -j ACCEPT # 放行 Nginx 端口
 iptables -A INPUT -p tcp -j ACCEPT 
 iptables -A INPUT -p udp --dport $UDPGW_PORT -j ACCEPT
 iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
@@ -419,11 +487,14 @@ systemctl restart sshd_stunnel
 systemctl restart stunnel4
 systemctl restart udpgw
 systemctl restart ssh_udp
+systemctl restart xray # 重启 Xray
 systemctl restart wss_panel
 systemctl restart wss
+systemctl restart nginx # 重启 Nginx
 
 echo "=================================================="
-echo "✅ 部署完成！(Axiom V2.4 - Full Port Forwarding)"
+echo "✅ 部署完成！(Axiom V6.0 - Full Port Forwarding + Nginx/Xray)"
+echo "Web Panel 地址: http://[YOUR_IP]:$PANEL_PORT"
+echo "Nginx/Xray 混淆端口: $NGINX_EXTERNAL_PORT"
 echo "SSH-UDP 监听端口: $SSH_UDP_PORT (已接管 1-65535 空闲端口)"
-echo "BadVPN UDPGW 监听: 127.0.0.1:$UDPGW_PORT"
 echo "=================================================="
