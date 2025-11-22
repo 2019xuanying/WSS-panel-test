@@ -1,9 +1,9 @@
 <!DOCTYPE html>
 <!-- 
-  V8.3.1 (Axiom Refactor V5.2 - Live Connection Metadata UI)
-  - [AXIOM V5.2] 新增连接详情模态框 (connection-details-modal)。
-  - 在用户列表的操作列中新增“连接详情”按钮。
-  - 更新了日志按钮中的服务名称，以匹配新的 'udp_server'。
+  V8.3.2 (Axiom Refactor V5.6 - BadVPN UI Integration)
+  [AXIOM V5.6 CHANGELOG]
+  - [UI FIX] 将硬编码的日志按钮从 'udp_server' (Node.js) 更新为 'udpgw' (BadVPN)。
+  - 确保静态 HTML 结构与后端 V9.1.0 的服务映射一致。
 -->
 <html lang="zh-CN" data-theme="light">
 <head>
@@ -534,7 +534,8 @@
                                     <div class="btn-group flex-wrap gap-1">
                                         <button onclick="fetchServiceLogs('wss')" class="btn btn-ghost btn-sm">WSS Proxy</button>
                                         <button onclick="fetchServiceLogs('stunnel4')" class="btn btn-ghost btn-sm">Stunnel4</button>
-                                        <button onclick="fetchServiceLogs('udp_server')" class="btn btn-ghost btn-sm">Native UDPGW</button> <!-- V5.1.1 FIX -->
+                                        <!-- [AXIOM V5.6 FIX] Updated from 'udp_server' to 'udpgw' and label -->
+                                        <button onclick="fetchServiceLogs('udpgw')" class="btn btn-ghost btn-sm">BadVPN UDPGW</button> 
                                         <button onclick="fetchServiceLogs('wss_panel')" class="btn btn-ghost btn-sm">Web Panel</button>
                                     </div >
                                     <div class="mockup-code bg-gray-800 text-gray-200 text-xs">
