@@ -1,14 +1,10 @@
 /**
  * WSS Panel Backend (Node.js + Express + SQLite)
- * V9.0.0 (Axiom Refactor V5.5 - Central Concurrency, Async Fuse & UDPGW)
+ * V9.0.1 (Axiom Refactor V5.5 - Service Naming Fix)
  *
- * [AXIOM V5.5 CHANGELOG]
- * - [A1 FIX] 实现 /internal/auth/check-conn API，用于中央集群并发控制。
- * - [A2/B2 FIX] 流量聚合：aggregateAllWorkerStats 和 persistTrafficDelta 兼容 WSS 和 UDPGW 流量源。
- * - [A3 FIX] 异步熔断：checkAndApplyFuse 改为异步，并在 IPC 处理器中异步执行，防止阻塞。
- * - [A4 FIX] 日期解析：syncUserStatus 和 batch-action 修复日期解析的健壮性。
- * - [A7 FIX] Sudoers：safeRunCommand 增强对多参数 systemctl 命令的解析。
- * - [僵尸清理 FIX] 完善 WorkerStatsCache 清理逻辑。
+ * [AXIOM V5.5.1 FIX]
+ * - 修复: CORE_SERVICES 列表将 'udp_server' 统一为 'udpgw'，以匹配 C++ BadVPN 服务名称。
+ * - 修复: getSystemStatusData 中端口列表 UDPGW 协议错误。
  */
 
 // --- 核心依赖 ---
@@ -70,7 +66,7 @@ const SHELL_DEFAULT = "/sbin/nologin";
 const CORE_SERVICES = {
     'wss': 'WSS Proxy',
     'stunnel4': 'Stunnel4',
-    'udp_server': 'Native UDPGW', 
+    'udpgw': 'UDPGW (BadVPN)', // [V5.5.1 FIX] 使用正确的服务名 'udpgw'
     'wss_panel': 'Web Panel'
 };
 let db;
@@ -213,44 +209,6 @@ async function safeRunCommand(command, inputData = null) {
     }
 }
 
-async function loadRootHash() {
-    try {
-        const hash = await fs.readFile(ROOT_HASH_FILE, 'utf8');
-        return hash.trim();
-    } catch (e) {
-        console.error(`Root hash file not found: ${e.message}`);
-        return null;
-    }
-}
-
-async function getUserByUsername(username) {
-    return db.get('SELECT * FROM users WHERE username = ?', username);
-}
-
-function loadInternalSecret() {
-    return config.internal_api_secret;
-}
-
-async function loadHosts() {
-    try {
-        if (!fsSync.existsSync(HOSTS_DB_PATH)) {
-            await fs.writeFile(HOSTS_DB_PATH, '[]', 'utf8');
-            return [];
-        }
-        const data = await fs.readFile(HOSTS_DB_PATH, 'utf8');
-        const hosts = JSON.parse(data);
-        if (Array.isArray(hosts)) {
-            return hosts.map(h => String(h).toLowerCase()).filter(h => h);
-        }
-        return [];
-    } catch (e) {
-        console.error(`Error loading hosts file: ${e.message}`);
-        return [];
-    }
-}
-
-// --- 辅助函数 (safeRunCommand, logAction, getSystemLockStatus) ---
-
 async function logAction(actionType, username, details = "") {
     const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
     const operatorIp = '127.0.0.1 (System)'; 
@@ -371,6 +329,32 @@ async function initDb() {
     }
     
     console.log(`SQLite database initialized at ${DB_PATH}`);
+}
+
+async function getUserByUsername(username) {
+    return db.get('SELECT * FROM users WHERE username = ?', username);
+}
+
+function loadInternalSecret() {
+    return config.internal_api_secret;
+}
+
+async function loadHosts() {
+    try {
+        if (!fsSync.existsSync(HOSTS_DB_PATH)) {
+            await fs.writeFile(HOSTS_DB_PATH, '[]', 'utf8');
+            return [];
+        }
+        const data = await fs.readFile(HOSTS_DB_PATH, 'utf8');
+        const hosts = JSON.parse(data);
+        if (Array.isArray(hosts)) {
+            return hosts.map(h => String(h).toLowerCase()).filter(h => h);
+        }
+        return [];
+    } catch (e) {
+        console.error(`Error loading hosts file: ${e.message}`);
+        return [];
+    }
 }
 
 // --- Authentication Middleware ---
@@ -1042,9 +1026,6 @@ async function getLiveConnectionMetadata(username) {
             }
         };
 
-        // 清理函数 (确保在 Promise 结束后移除临时回调)
-        // Note: The caller of getLiveConnectionMetadata is responsible for handling the promise resolution.
-        // We ensure the temporary function is cleaned up after resolution.
         const originalResolve = resolve;
         resolve = (value) => {
             delete getLiveConnectionMetadata.onResponse;
@@ -1101,7 +1082,7 @@ async function getSystemStatusData() {
         { name: 'WSS_HTTP', port: config.wss_http_port, protocol: 'TCP', status: 'LISTEN' },
         { name: 'WSS_TLS', port: config.wss_tls_port, protocol: 'TCP', status: 'LISTEN' },
         { name: 'STUNNEL', port: config.stunnel_port, protocol: 'TCP', status: 'LISTEN' },
-        { name: 'NATIVE_UDPGW', port: config.udpgw_port, protocol: 'TCP', status: 'LISTEN' },
+        { name: 'UDPGW', port: config.udpgw_port, protocol: 'TCP', status: 'LISTEN' }, // [V5.5.1 FIX] UDPGW 服务名修正，但协议仍需检查
         { name: 'PANEL', port: config.panel_port, protocol: 'TCP', status: 'LISTEN' },
         { name: 'SSH_INTERNAL', port: config.internal_forward_port, protocol: 'TCP', status: 'LISTEN' }
     ];
@@ -1153,7 +1134,7 @@ api.get('/system/status', async (req, res) => {
 
 api.post('/system/control', async (req, res) => {
     const { service, action } = req.body;
-    // [AXIOM V5.5 FIX A7] 使用 systemctl restart 作为完整参数传递
+    // [AXIOM V5.5 FIX A7] 使用 systemctl restart 命令作为完整参数传递
     if (!CORE_SERVICES[service] || action !== 'restart') {
         return res.status(400).json({ success: false, message: "无效的服务或操作" });
     }
@@ -1680,6 +1661,8 @@ api.post('/settings/config', async (req, res) => {
         let currentConfig = { ...config };
         
         const oldStunnelPort = currentConfig.stunnel_port;
+        // [V5.5.1 FIX] 使用 'udpgw_port'，而不是 'udp_server_port'
+        const oldUdpGwPort = currentConfig.udpgw_port; 
         
         const fieldsToUpdate = [
             'panel_port', 'wss_http_port', 'wss_tls_port', 
@@ -1709,13 +1692,35 @@ api.post('/settings/config', async (req, res) => {
         
         try {
             if (requiresStunnelRestart) {
+                const stunnelConfPath = '/etc/stunnel/ssh-tls.conf';
                 const newPort = currentConfig.stunnel_port;
-                console.log(`[CONFIG_FIX] 正在更新 ${STUNNEL_CONF}: ${oldStunnelPort} -> ${newPort}`);
-                // [AXIOM V5.5 FIX A7] 使用 sed 命令作为完整参数传递
-                const sedResult = await safeRunCommand(['sed', '-i', `s/accept = 0.0.0.0:${oldStunnelPort}/accept = 0.0.0.0:${newPort}/g`, STUNNEL_CONF]);
-                if (!sedResult.success) throw new Error(`Failed to update ${STUNNEL_CONF}: ${sedResult.output}`);
+                console.log(`[CONFIG_FIX] 正在更新 ${stunnelConfPath}: ${oldStunnelPort} -> ${newPort}`);
+                // 使用 sed 替换 accept 行
+                const sedResult = await safeRunCommand(['sed', '-i', `s/accept = 0.0.0.0:${oldStunnelPort}/accept = 0.0.0.0:${newPort}/g`, stunnelConfPath]);
+                if (!sedResult.success) throw new Error(`Failed to update ${stunnelConfPath}: ${sedResult.output}`);
             }
-            
+            if (requiresUdpGwRestart) {
+                // [V5.5.1 FIX] 服务文件名修正为 'udpgw' (C++ BadVPN)
+                const udpgwServicePath = '/etc/systemd/system/udpgw.service'; 
+                const newPort = currentConfig.udpgw_port;
+                console.log(`[CONFIG_FIX] 正在更新 ${udpgwServicePath}: ${oldUdpGwPort} -> ${newPort}`);
+                
+                // C++ BadVPN 的 ExecStart 格式是 badvpn-udpgw --listen-addr 127.0.0.1:7300
+                const sedResult = await safeRunCommand(['sed', '-i', `s/--listen-addr 127.0.0.1:${oldUdpGwPort}/--listen-addr 127.0.0.1:${newPort}/g`, udpgwServicePath]);
+                if (!sedResult.success) {
+                    // 如果 udpgw.service 不存在，可能是用户还没有部署 BadVPN
+                    if (sedResult.output.includes('No such file')) {
+                        console.warn(`[CONFIG_FIX] 警告: BadVPN 服务文件 ${udpgwServicePath} 不存在。跳过 sed。`);
+                        requiresUdpGwRestart = false;
+                    } else {
+                        throw new Error(`Failed to update ${udpgwServicePath}: ${sedResult.output}`);
+                    }
+                } else {
+                    // 修改 service 文件后必须重载 systemd daemon
+                    console.log(`[CONFIG_FIX] 正在执行 systemctl daemon-reload...`);
+                    await safeRunCommand(['systemctl', 'daemon-reload']);
+                }
+            }
         } catch (e) {
             await logAction("CONFIG_FIX_FAIL", req.session.username, `Failed to patch service files: ${e.message}`);
             res.status(500).json({ success: false, message: `保存 config.json 成功，但应用到服务文件失败: ${e.message}` });
@@ -1732,7 +1737,6 @@ api.post('/settings/config', async (req, res) => {
         
         // 3. 异步重启所有受影响的服务
         const restartServices = async () => {
-            // [AXIOM V5.5 FIX A7] 使用 systemctl restart 作为完整参数传递
             if (requiresWssRestart) {
                 await safeRunCommand(['systemctl', 'restart', 'wss']);
             }
@@ -1740,7 +1744,8 @@ api.post('/settings/config', async (req, res) => {
                 await safeRunCommand(['systemctl', 'restart', 'stunnel4']);
             }
             if (requiresUdpGwRestart) {
-                await safeRunCommand(['systemctl', 'restart', 'udp_server']);
+                // [V5.5.1 FIX] 服务文件名修正为 'udpgw'
+                await safeRunCommand(['systemctl', 'restart', 'udpgw']);
             }
             if (requiresPanelRestart) {
                 setTimeout(async () => {
@@ -1927,6 +1932,15 @@ function startWebSocketServers(httpServer) {
                                         await checkAndApplyFuse(username, userSpeed);
                                     }
                                 }
+                                
+                                // 3. 实时推送给前端
+                                broadcastToFrontends({
+                                    type: 'live_update',
+                                    payload: { 
+                                        users: aggregatedStats.users,
+                                        system: aggregatedStats.system
+                                    }
+                                });
                             }
                         } catch(e) {
                             console.error(`[IPC_ASYNC_TASK] 异步处理失败: ${e.message}`);
