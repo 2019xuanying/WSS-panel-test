@@ -12,6 +12,8 @@
   "xray_internal_port": 44444,
   "nginx_external_port": 443,
   "nginx_enabled": 0,
+  "server_domain": "example.com",
+  "xray_uuid": "e4567890-1234-5678-9012-345678901234",
   "internal_api_secret": "default-secret-key-please-change",
   "panel_api_url": "http://127.0.0.1:54321/internal",
   "proxy_api_url": "http://127.0.0.1:54322"
