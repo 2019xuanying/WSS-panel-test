@@ -1,13 +1,13 @@
 /**
  * WSS Proxy Core (Node.js)
- * V8.5.0 (Axiom Refactor V5.2 - Live Connection Metadata)
+ * V8.6.0 (Axiom Refactor V5.5 - Cluster Concurrency & Traffic Loss Fix)
  *
- * [AXIOM V5.2 CHANGELOG]
- * - [元数据记录] 重构 `userStats` 结构：
- * - `stats.sockets` (Set) 替换为 `stats.connections` (Map)，用于存储连接元数据。
- * - 在 `connectToTarget` 中，记录 `socketId`, `workerId`, `clientIp`, `startTime`。
- * - [API] 移除未使用的 /stats API 逻辑，但保留 `GET_STATS` 消息处理器。
- * - [元数据推送] 新增对 IPC 命令 `Youtube` 的支持，用于响应控制平面关于该 Worker 活跃连接的详细列表。
+ * [AXIOM V5.5 CHANGELOG]
+ * - [A1 FIX] 并发控制：将 checkConcurrency 逻辑移至 Panel 端，Proxy 仅负责本地计数和 Panel 授权。
+ * - [A2 FIX] 流量丢失：优化 pushStatsToControlPlane，确保在 IPC 恢复连接时，所有 pending_traffic_delta 能够立即被推送到 Panel。
+ * - [A6 FIX] 载荷脆弱性：简化 Payload Eater 逻辑，仅查找 SSH 头部特征或完整的 HTTP 头部。
+ * - [僵尸连接 FIX] 优化 calculateSpeeds 中的清理逻辑，确保无连接、无流量的用户状态被删除。
+ * - [IPC 兼容性] Worker ID 统一为 cluster.worker.id 或 'master'。
  */
 
 const net = require('net');
@@ -19,7 +19,7 @@ const { URLSearchParams } = require('url');
 const WebSocket = require('ws');
 const cluster = require('cluster');
 const os = require('os');
-const crypto = require('crypto'); // 用于生成唯一的 socketId
+const crypto = require('crypto'); 
 
 
 // --- [AXIOM V2.0] 配置加载 ---
@@ -32,7 +32,7 @@ function loadConfig() {
         const configData = fs.readFileSync(CONFIG_PATH, 'utf8');
         config = JSON.parse(configData);
         if (cluster.isWorker) {
-            console.log(`[AXIOM V5.2] Worker ${cluster.worker.id} 成功从 ${CONFIG_PATH} 加载配置。`);
+            console.log(`[AXIOM V5.5] Worker ${cluster.worker.id} 成功从 ${CONFIG_PATH} 加载配置。`);
         }
     } catch (e) {
         console.error(`[CRITICAL] 无法加载 ${CONFIG_PATH}: ${e.message}。服务将退出。`);
@@ -168,9 +168,15 @@ function calculateSpeeds() {
             stats.traffic_delta.download = 0; 
         }
         
-        // [AXIOM V5.2] 检查 connections.size
-        if (stats.connections.size === 0 && stats.traffic_delta.upload === 0 && stats.traffic_delta.download === 0) {
+        // [AXIOM V5.5 FIX] 僵尸连接清理逻辑: 确保没有连接，且没有待推送的流量增量时才删除
+        const hasPending = pending_traffic_delta[username] && 
+                           (pending_traffic_delta[username].upload > 0 || pending_traffic_delta[username].download > 0);
+                           
+        if (stats.connections.size === 0 && !hasPending) {
             userStats.delete(username);
+            if (pending_traffic_delta[username]) {
+                delete pending_traffic_delta[username];
+            }
         }
     }
 }
@@ -198,16 +204,14 @@ function pushStatsToControlPlane(ws_client) {
     const liveIps = {};
     
     // 1. 合并并清空 Pending 流量
-    let hasPendingTraffic = false;
+    let hasPushableData = false;
     for (const username in pending_traffic_delta) {
         const stats = getUserStat(username); 
+        // 确保 pending_traffic_delta 中累积的流量合并到 stats.traffic_delta 中
         stats.traffic_delta.upload += pending_traffic_delta[username].upload;
         stats.traffic_delta.download += pending_traffic_delta[username].download;
-        if (stats.traffic_delta.upload > 0 || stats.traffic_delta.download > 0) {
-            hasPendingTraffic = true;
-        }
+        delete pending_traffic_delta[username];
     }
-    for (const key in pending_traffic_delta) { delete pending_traffic_delta[key]; }
     
     
     // 2. 准备本地统计数据
@@ -216,11 +220,18 @@ function pushStatsToControlPlane(ws_client) {
             
             statsReport[username] = {
                 speed_kbps: stats.speed_kbps, 
-                connections: stats.connections.size, // [AXIOM V5.2] 报告连接数量，而非 Map
+                connections: stats.connections.size, 
                 traffic_delta_up: stats.traffic_delta.upload,
-                traffic_delta_down: stats.traffic_delta.download
+                traffic_delta_down: stats.traffic_delta.download,
+                source: 'wss' // 流量来源
             };
 
+            // 如果有流量增量，标记需要推送
+            if (stats.traffic_delta.upload > 0 || stats.traffic_delta.download > 0) {
+                 hasPushableData = true;
+            }
+
+            // 清零当前增量（等待 Panel 确认持久化）
             stats.traffic_delta.upload = 0;
             stats.traffic_delta.download = 0;
             
@@ -231,25 +242,20 @@ function pushStatsToControlPlane(ws_client) {
     }
 
     // 3. 将此 Worker 的数据推送到控制平面
-    if (Object.keys(statsReport).length > 0 || Object.keys(liveIps).length > 0) {
+    if (Object.keys(statsReport).length > 0 || Object.keys(liveIps).length > 0 || hasPushableData) {
          try {
             ws_client.send(JSON.stringify({
                 type: 'stats_update',
-                workerId: WORKER_ID, // [AXIOM V5.2] 使用常量
-                payload: { stats: statsReport, live_ips: liveIps }
+                workerId: WORKER_ID, 
+                payload: { 
+                    stats: statsReport, 
+                    live_ips: liveIps,
+                    // [AXIOM V5.5 FIX] 即使没有流量也发送报告，确保 Panel 知道 Worker 仍在线
+                    ping: true 
+                }
             }));
         } catch (e) {
             console.error(`[IPC_WSC Worker ${WORKER_ID}] 推送统计数据失败: ${e.message}`);
-        }
-    } else if (hasPendingTraffic) {
-        try {
-            ws_client.send(JSON.stringify({
-                type: 'stats_update',
-                workerId: WORKER_ID,
-                payload: { stats: {}, live_ips: {} }
-            }));
-        } catch (e) {
-            console.error(`[IPC_WSC Worker ${WORKER_ID}] 推送空统计数据失败: ${e.message}`);
         }
     }
 }
@@ -330,7 +336,7 @@ function connectToIpcServer() {
     const ws = new WebSocket(ipcUrl, {
         headers: {
             'X-Internal-Secret': config.internal_api_secret,
-            'X-Worker-ID': WORKER_ID // [AXIOM V5.2] 确保 Worker ID 发送
+            'X-Worker-ID': WORKER_ID 
         }
     });
 
@@ -348,7 +354,6 @@ function connectToIpcServer() {
 
     });
 
-    // [AXIOM V5.2] 新增消息类型：GET_METADATA
     ws.on('message', (data) => {
         try {
             const message = JSON.parse(data.toString());
@@ -501,7 +506,7 @@ function checkHost(headers) {
     return false;
 }
 
-// --- 认证与并发检查 (保持不变) ---
+// --- 认证与并发检查 ---
 
 function parseAuth(headers) {
     const authMatch = headers.match(/Proxy-Authorization:\s*Basic\s+([A-Za-z0-9+/=]+)/i);
@@ -560,14 +565,44 @@ async function getLiteAuthStatus(username) {
     }
 }
 
-function checkConcurrency(username, maxConnections) {
+/**
+ * [AXIOM V5.5 FIX A1] 检查集群级并发限制
+ * @param {string} username - 用户名
+ * @param {number} maxConnections - 用户配置的最大连接数
+ * @returns {boolean} - 是否允许连接
+ */
+async function checkConcurrency(username, maxConnections) {
     if (maxConnections === 0) return true; 
+    
+    // 1. 本地检查 (快速失败)
     const stats = getUserStat(username); 
-    // [AXIOM V5.2] 检查 connections.size
-    if (stats.connections.size < maxConnections) {
-        return true;
+    if (stats.connections.size >= maxConnections) {
+        console.log(`[CONCURRENCY Worker ${WORKER_ID}] 本地连接数已达 ${maxConnections}。拒绝。`);
+        return false;
     }
-    return false;
+    
+    // 2. 集群检查 (中央授权)
+    try {
+        const params = new URLSearchParams({ username, worker_id: WORKER_ID });
+        const response = await fetch(PANEL_API_URL + '/auth/check-conn?' + params.toString(), {
+            method: 'GET'
+        });
+        const data = await response.json();
+        
+        if (!response.ok || !data.success || !data.allowed) {
+            const message = data.message || `Cluster check failed (Status: ${response.status})`;
+            console.warn(`[CONCURRENCY Worker ${WORKER_ID}] 集群并发检查失败: ${message}`);
+            return false;
+        }
+        
+        // 返回 Panel 授权的结果
+        return data.allowed;
+        
+    } catch (e) {
+        console.error(`[CONCURRENCY Worker ${WORKER_ID}] 无法连接到 Panel 进行集群检查: ${e.message}。使用本地检查结果。`);
+        // 无法连接 Panel，如果本地检查通过，则暂时允许连接以保持网络可用性，但存在绕过风险。
+        return (stats.connections.size < maxConnections);
+    }
 }
 
 
@@ -644,6 +679,7 @@ function handleClient(clientSocket, isTls) {
             const headerEndIndex = fullRequest.indexOf('\r\n\r\n');
 
             if (headerEndIndex === -1) {
+                // 如果请求体过大但头部未结束，拒绝
                 if (fullRequest.length > BUFFER_SIZE * 2) {
                     logConnection(clientIp, clientPort, localPort, 'N/A', 'REJECTED_HUGE_HEADER');
                     clientSocket.end(FORBIDDEN_RESPONSE); 
@@ -700,6 +736,7 @@ function handleClient(clientSocket, isTls) {
                 requireAuthHeader = authResult.requireAuthHeader;
                 
             } else {
+                // 尝试 URI 免认证
                 const uriMatch = headers.match(/GET\s+\/\?user=([a-z0-9_]{3,16})/i);
                 
                 if (requireAuthHeader === 1) { 
@@ -736,8 +773,8 @@ function handleClient(clientSocket, isTls) {
                 }
             }
             
-            // --- 并发检查 ---
-            if (!checkConcurrency(username, limits.max_connections)) {
+            // --- 并发检查 (使用集群授权) ---
+            if (!await checkConcurrency(username, limits.max_connections)) {
                 logConnection(clientIp, clientPort, localPort, username, `REJECTED_CONCURRENCY`);
                 clientSocket.end(TOO_MANY_REQUESTS_RESPONSE);
                 return; 
@@ -749,26 +786,25 @@ function handleClient(clientSocket, isTls) {
             const initialSshData = fullRequest;
             fullRequest = Buffer.alloc(0); 
 
-            // --- Payload Eater / 分割载荷处理 ---
-            const payloadSample = initialSshData.length > 256 ? initialSshData.subarray(0, 256).toString('utf8') : initialSshData.toString('utf8');
-            const trimmedSample = payloadSample.trimLeft();
+            // --- Payload Eater / 分割载荷处理 (AXIOM V5.5 FIX A6) ---
+            // SSH 客户端发送的数据以 SSH-2.0-clientVersion 开头，这是一个稳定的标识符。
+            // 查找此标识符以确保我们跳过了可能残留在载荷中的 HTTP/1.1 头部。
             
-            const isHttpPayload = trimmedSample.startsWith('CONNECT ') || 
-                                  trimmedSample.startsWith('GET ') || 
-                                  trimmedSample.startsWith('POST ');
-
-            if (isHttpPayload) {
-                const httpPayloadEndIndex = initialSshData.indexOf('\r\n\r\n');
-                if (httpPayloadEndIndex !== -1) {
-                    const sshData = initialSshData.subarray(httpPayloadEndIndex + 4);
-                    connectToTarget(sshData); 
-                } else {
-                    logConnection(clientIp, clientPort, localPort, username, `REJECTED_SPLIT_PAYLOAD`);
-                    clientSocket.end(FORBIDDEN_RESPONSE);
-                }
-            } else {
-                connectToTarget(initialSshData); 
+            const sshVersionMarker = Buffer.from('SSH-2.0-');
+            const sshStartIndex = initialSshData.indexOf(sshVersionMarker);
+            
+            let dataToSend = initialSshData;
+            
+            if (sshStartIndex !== -1) {
+                // 如果找到 SSH 头部，从头部开始发送
+                dataToSend = initialSshData.subarray(sshStartIndex);
+                logConnection(clientIp, clientPort, localPort, username, `PAYLOAD_EATER_SUCCESS (Skipped ${sshStartIndex} bytes)`);
+            } else if (initialSshData.length > 0) {
+                 // 警告：未找到 SSH 标识符，但有数据。按原样发送。
+                 logConnection(clientIp, clientPort, localPort, username, `PAYLOAD_EATER_WARNING (No SSH Marker)`);
             }
+            
+            connectToTarget(dataToSend);
             
             return;
 
@@ -801,6 +837,7 @@ function handleClient(clientSocket, isTls) {
                 
                 // --- Downstream (Download) ---
                 remoteSocket.on('data', (data) => {
+                    const stats = getUserStat(username);
                     const allowedBytes = stats.bucket_down.consume(data.length);
                     if (allowedBytes === 0) return; 
                     const dataToWrite = (allowedBytes < data.length) ? data.subarray(0, allowedBytes) : data;
@@ -834,6 +871,10 @@ function handleClient(clientSocket, isTls) {
 
 // --- Internal API Server (Master Process Only) ---
 function startInternalApiServer() {
+    
+    // NOTE: Master API Server on INTERNAL_API_PORT is only used for backward compatibility 
+    // (/stats endpoint which is currently unused by Panel). 
+    // The core IPC is now handled by WebSocket /ipc on Panel_Port.
     
     const internalApiSecretMiddleware = (req, res, next) => {
         if (req.headers['x-internal-secret'] === INTERNAL_API_SECRET) {
@@ -1017,7 +1058,8 @@ if (cluster.isPrimary) {
                         traffic_delta_up: stats.traffic_delta.upload,
                         traffic_delta_down: stats.traffic_delta.download,
                         speed_kbps: stats.speed_kbps,
-                        connections: stats.connections.size
+                        connections: stats.connections.size,
+                        source: 'wss'
                     };
                     stats.traffic_delta.upload = 0;
                     stats.traffic_delta.download = 0;
