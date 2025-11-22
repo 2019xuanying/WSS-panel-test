@@ -5,15 +5,13 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V2.4.1 (Axiom - 1-65535 Port Forwarding + C++ BadVPN)
+# V2.4.2 (Axiom - Final Release)
 # ==========================================================
 
 # =============================
 # 1. 基础变量与路径定义
 # =============================
 REPO_ROOT=$(dirname "$0")
-
-# 安装目录
 PANEL_DIR="/etc/wss-panel"
 WSS_LOG_FILE="/var/log/wss.log" 
 CONFIG_PATH="$PANEL_DIR/config.json"
@@ -30,8 +28,8 @@ PANEL_HTML_SRC="$REPO_ROOT/index.html"
 PANEL_JS_SRC="$REPO_ROOT/app.js"
 LOGIN_HTML_SRC="$REPO_ROOT/login.html"
 PACKAGE_JSON_SRC="$REPO_ROOT/package.json"
-UDP_SERVER_SRC="$REPO_ROOT/udp_server.js" # 用于 Node.js 版 UDPGW (虽然这里用 C++，但保留文件是个好习惯)
-SSH_UDP_SRC="$REPO_ROOT/ssh_udp.js"       # [NEW] SSH-UDP 鉴权服务
+UDP_SERVER_SRC="$REPO_ROOT/udp_server.js"
+SSH_UDP_SRC="$REPO_ROOT/ssh_udp.js"
 
 # 目标文件路径
 WSS_PROXY_DEST="/usr/local/bin/wss_proxy.js"
@@ -44,24 +42,22 @@ PACKAGE_JSON_DEST="$PANEL_DIR/package.json"
 UDP_SERVER_DEST="$PANEL_DIR/udp_server.js"
 SSH_UDP_DEST="$PANEL_DIR/ssh_udp.js"
 
-# Systemd 服务模板与路径
+# Systemd 服务模板
 WSS_TEMPLATE="$REPO_ROOT/wss.service.template"
-WSS_SERVICE_PATH="/etc/systemd/system/wss.service"
-
 PANEL_TEMPLATE="$REPO_ROOT/wss_panel.service.template"
-PANEL_SERVICE_PATH="/etc/systemd/system/wss_panel.service"
-
 UDPGW_TEMPLATE="$REPO_ROOT/udpgw.service.template"
-UDPGW_SERVICE_PATH="/etc/systemd/system/udpgw.service"
-BADVPN_SRC_DIR="/root/badvpn"
-
 SSH_UDP_TEMPLATE="$REPO_ROOT/ssh_udp.service.template"
+
+# Systemd 服务目标路径
+WSS_SERVICE_PATH="/etc/systemd/system/wss.service"
+PANEL_SERVICE_PATH="/etc/systemd/system/wss_panel.service"
+UDPGW_SERVICE_PATH="/etc/systemd/system/udpgw.service"
 SSH_UDP_SERVICE_PATH="/etc/systemd/system/ssh_udp.service"
 
+BADVPN_SRC_DIR="/root/badvpn"
 SSHD_STUNNEL_CONFIG="/etc/ssh/sshd_config_stunnel"
 SSHD_STUNNEL_SERVICE="/etc/systemd/system/sshd_stunnel.service"
 
-# 创建基础目录
 mkdir -p "$PANEL_DIR" 
 mkdir -p /etc/stunnel/certs
 mkdir -p /var/log/stunnel4
@@ -74,7 +70,6 @@ echo "----------------------------------"
 echo "==== WSS 基础设施配置 (V2.4) ===="
 echo "请确认或修改以下端口和服务用户设置 (回车以使用默认值)。"
 
-# 默认端口定义
 read -p "  1. WSS HTTP 端口 [80]: " WSS_HTTP_PORT
 WSS_HTTP_PORT=${WSS_HTTP_PORT:-80}
 
@@ -116,7 +111,6 @@ echo "SSH-UDP Auth (0.0.0.0) -> $SSH_UDP_PORT (1-65535 流量汇聚点)"
 echo "Web Panel (HTTP) & IPC -> $PANEL_PORT"
 echo "---------------------------------"
 
-# 交互式设置 ROOT 密码
 if [ -f "$ROOT_HASH_FILE" ]; then
     echo "使用已保存的面板 Root 密码。"
 else
@@ -144,7 +138,6 @@ fi
 echo "----------------------------------"
 echo "==== 系统清理与依赖检查 ===="
 systemctl stop wss stunnel4 udpgw ssh_udp wss_panel sshd_stunnel || true
-# 清理旧的 UDP Server 服务（如果存在）
 systemctl disable udp_server 2>/dev/null || true 
 rm -f /etc/systemd/system/udp_server.service
 
@@ -155,7 +148,6 @@ if ! command -v node >/dev/null; then
     apt install -y nodejs
 fi
 
-# 安装 BadVPN 编译依赖和其他工具
 apt install -y wget curl git net-tools cmake build-essential openssl stunnel4 iproute2 iptables procps libsqlite3-dev passwd sudo || echo "警告: 部分依赖安装失败。"
 
 if ! id -u "$panel_user" >/dev/null 2>&1; then
@@ -169,9 +161,8 @@ if ! npm install --production; then
     echo "严重警告: Node.js 核心依赖安装失败。"
     exit 1
 fi
-cd "$REPO_ROOT" # 切回
+cd "$REPO_ROOT"
 
-# 生成/加载密钥
 if [ ! -f "$ROOT_HASH_FILE" ] && [ -n "${PANEL_ROOT_PASS_RAW:-}" ]; then
     PANEL_ROOT_PASS_HASH=$(node -e "const bcrypt = require('bcrypt'); const hash = bcrypt.hashSync('$PANEL_ROOT_PASS_RAW', 12); console.log(hash);")
     echo "$PANEL_ROOT_PASS_HASH" > "$ROOT_HASH_FILE"
@@ -188,7 +179,6 @@ INTERNAL_SECRET=$(cat "$INTERNAL_SECRET_PATH")
 
 chmod 600 "$ROOT_HASH_FILE" "$SECRET_KEY_FILE" "$INTERNAL_SECRET_PATH"
 
-# 生成配置文件
 echo "正在创建 config.json..."
 tee "$CONFIG_PATH" > /dev/null <<EOF
 {
@@ -214,7 +204,6 @@ chmod 600 "$CONFIG_PATH"
 # =============================
 echo "==== 配置 Sudoers ===="
 SUDOERS_FILE="/etc/sudoers.d/99-wss-panel"
-# 获取命令绝对路径
 CMD_USERADD=$(command -v useradd)
 CMD_USERMOD=$(command -v usermod)
 CMD_USERDEL=$(command -v userdel)
@@ -282,7 +271,7 @@ cp "$PANEL_BACKEND_SRC" "$PANEL_BACKEND_DEST"
 cp "$PANEL_HTML_SRC" "$PANEL_HTML_DEST"
 cp "$PANEL_JS_SRC" "$PANEL_JS_DEST"
 cp "$LOGIN_HTML_SRC" "$LOGIN_HTML_DEST"
-cp "$UDP_SERVER_SRC" "$UDP_SERVER_DEST" # 复制 UDP Server JS 备用
+cp "$UDP_SERVER_SRC" "$UDP_SERVER_DEST" 
 
 # [NEW] 部署 SSH-UDP JS
 if [ -f "$SSH_UDP_SRC" ]; then
@@ -337,7 +326,7 @@ mkdir -p "$BADVPN_SRC_DIR/badvpn-build"
 cd "$BADVPN_SRC_DIR/badvpn-build"
 cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
 make -j$(nproc) > /dev/null 2>&1
-cd "$REPO_ROOT" # 回到仓库根目录
+cd "$REPO_ROOT" 
 
 # =============================
 # 9. 部署 Systemd 服务
@@ -347,7 +336,6 @@ echo "==== 部署 Systemd 服务 ===="
 # 1. udpgw (BadVPN C++)
 if [ -f "$UDPGW_TEMPLATE" ]; then
     cp "$UDPGW_TEMPLATE" "$UDPGW_SERVICE_PATH"
-    # 替换端口占位符
     sed -i "s|@UDPGW_PORT@|$UDPGW_PORT|g" "$UDPGW_SERVICE_PATH"
     systemctl enable udpgw
 else
@@ -388,9 +376,7 @@ systemctl enable wss_panel wss udpgw ssh_udp
 # 10. IPTABLES 全端口转发 (1-65535)
 # =============================
 echo "==== 配置 IPTABLES (全端口转发 -> SSH_UDP) ===="
-# 清理旧的 NAT 规则
 iptables -t nat -F
-# 清理 INPUT 规则 (保留 WSS_IP_BLOCK 链)
 iptables -D INPUT -j WSS_IP_BLOCK 2>/dev/null || true
 iptables -F INPUT
 iptables -I INPUT 1 -j WSS_IP_BLOCK 2>/dev/null || true
@@ -400,7 +386,6 @@ if ! iptables -L WSS_IP_BLOCK >/dev/null 2>&1; then
 fi
 
 # --- 1. 排除关键端口 (不转发) ---
-# 本地 SSH, WSS, Stunnel, Panel, SSH-UDP 自身
 iptables -t nat -A PREROUTING -p tcp --dport 22 -j RETURN
 iptables -t nat -A PREROUTING -p tcp --dport $WSS_HTTP_PORT -j RETURN
 iptables -t nat -A PREROUTING -p tcp --dport $WSS_TLS_PORT -j RETURN
@@ -409,23 +394,16 @@ iptables -t nat -A PREROUTING -p tcp --dport $PANEL_PORT -j RETURN
 iptables -t nat -A PREROUTING -p tcp --dport $SSH_UDP_PORT -j RETURN
 
 # --- 2. 重定向其余流量 -> SSH_UDP ---
-# 将所有其他 TCP 流量重定向到 SSH-UDP 鉴权服务
 iptables -t nat -A PREROUTING -p tcp -j REDIRECT --to-port $SSH_UDP_PORT
 
 # --- 3. 放行规则 ---
 iptables -A INPUT -p tcp --dport $SSH_UDP_PORT -j ACCEPT
-# 允许所有进入的 TCP (因为 NAT 发生在 PREROUTING，INPUT 看到的是目的端口为 SSH_UDP_PORT 的包)
 iptables -A INPUT -p tcp -j ACCEPT 
-# 放行 UDPGW
 iptables -A INPUT -p udp --dport $UDPGW_PORT -j ACCEPT
-# 放行相关连接
 iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
-# 放行 ICMP
 iptables -A INPUT -p icmp -j ACCEPT
-# 放行回环
 iptables -A INPUT -i lo -j ACCEPT
 
-# 持久化
 if command -v netfilter-persistent >/dev/null; then
     /sbin/iptables-save > "$IPTABLES_RULES"
     systemctl enable netfilter-persistent || true
