@@ -1,11 +1,12 @@
 /**
  * Native UDP Gateway (BadVPN Protocol over TCP)
- * Axiom V5.5.4 Refactor - Ultimate Protocol Compatibility Fix.
+ * Axiom V5.5.13 Refactor - Final Functionality and Frame Integrity Fix.
  *
- * [AXIOM V5.5.4 CHANGELOG]
- * - [CRITICAL FIX] 协议兼容性：parseAuthToken 不再要求 'UDPGW01' 协议前缀。
- * - 只要在客户端发送的**第一行**中包含**有效的 'TOKEN:<Base64>' 字段**，即视为认证尝试并放行。
- * - 这解决了客户端发送无关前缀、二进制数据探测或非标准 BadVPN 协议头导致卡死的问题。
+ * [AXIOM V5.5.13 CHANGELOG]
+ * - [CRITICAL FIX] 解决“无效的包长度: 0”导致连接断开的问题。
+ * - 增加握手阶段的容错：在收到数据后，显式跳过一次缓冲区开头的 UDPGW01 协议头。
+ * - 在帧解析循环中，忽略长度为 0 的 BadVPN 帧 (currentPacketLength === 0)，防止因客户端 Keep-Alive 或空包而断开。
+ * - 恢复功能，让 UDP 流量可以正常通过。
  */
 
 const net = require('net');
@@ -38,15 +39,19 @@ loadConfig();
 const UDPGW_PORT = config.udpgw_port || 7300;
 const LISTEN_ADDR = '127.0.0.1'; // 仅监听本地地址，由 WSS/Stunnel 转发
 
-const HANDSHAKE_CODE = Buffer.from('UDPGW01'); // 仅作常量保留，不再强制检查
+const HANDSHAKE_CODE = Buffer.from('UDPGW01'); 
 const MAX_PACKET_SIZE = 65535; // UDP 最大数据包大小
+const MAX_HANDSHAKE_BUFFER_BYTES = 1024 * 1024; // 1MB 握手缓冲区限制
 const WORKER_ID = 'udpgw'; 
 const SPEED_CALC_INTERVAL = 1000;
 const PANEL_API_URL = config.panel_api_url;
 
+// [AXIOM V5.5.9 FIX] 推荐的 UDP Socket 缓冲区大小 (来自 sysctl 的 32MB 最大值)
+const UDP_SOCKET_BUFFER_SIZE = 4 * 1024 * 1024; // 4MB 显式设置
+
 // --- 状态管理 ---
 let totalConnections = 0;
-const userStats = new Map();
+const userStats = new Map(); 
 const pending_traffic_delta = {};
 let ipcWsClient = null;
 let statsPusherIntervalId = null;
@@ -72,6 +77,7 @@ class TokenBucket {
         }
     }
     consume(bytesToConsume) {
+        // 如果 fillRate 为 0，不限速
         if (this.fillRate === 0) return bytesToConsume; 
         this._fillTokens();
         if (bytesToConsume <= this.tokens) {
@@ -95,25 +101,29 @@ class TokenBucket {
     }
 }
 
-function getUserStat(username) {
-    if (!userStats.has(username)) {
-        userStats.set(username, {
-            // connections: key: net.Socket, value: {id, clientIp, startTime, udpSocket}
+// 由于取消了认证，我们使用一个简化结构来追踪和统计连接。
+function getOrCreateConnectionStats(clientId, username) {
+    const effectiveUsername = username; 
+    
+    if (!userStats.has(effectiveUsername)) {
+        userStats.set(effectiveUsername, {
             connections: new Map(), 
             ip_map: new Map(), 
             traffic_delta: { upload: 0, download: 0 }, 
             traffic_live: { upload: 0, download: 0 }, 
             speed_kbps: { upload: 0, download: 0 },
             lastSpeedCalc: { upload: 0, download: 0, time: Date.now() }, 
+            // 在此假设限速和并发检查已经在上游完成，TokenBucket 默认不限速
             bucket_up: new TokenBucket(0, 0),
             bucket_down: new TokenBucket(0, 0),
             limits: { rate_kbps: 0, max_connections: 0 } 
         });
     }
-    return userStats.get(username);
+    return userStats.get(effectiveUsername);
 }
 
-// --- IPC 辅助函数 (从 wss_proxy.js 移植) ---
+
+// --- IPC 辅助函数 (保持不变) ---
 
 function calculateSpeeds() {
     const now = Date.now();
@@ -168,9 +178,11 @@ function pushStatsToControlPlane(ws_client) {
     // 1. 合并并清空 Pending 流量
     let hasPushableData = false;
     for (const username in pending_traffic_delta) {
-        const stats = getUserStat(username); 
-        stats.traffic_delta.upload += pending_traffic_delta[username].upload;
-        stats.traffic_delta.download += pending_traffic_delta[username].download;
+        const stats = userStats.get(username);
+        if (stats) {
+            stats.traffic_delta.upload += pending_traffic_delta[username].upload;
+            stats.traffic_delta.download += pending_traffic_delta[username].download;
+        }
         delete pending_traffic_delta[username];
     }
     
@@ -218,47 +230,11 @@ function pushStatsToControlPlane(ws_client) {
     }
 }
 
-function kickUser(username) {
-    const stats = userStats.get(username);
-    if (stats && stats.connections.size > 0) {
-        console.log(`[IPC_CMD Worker ${WORKER_ID}] 正在踢出用户 ${username} (${stats.connections.size} 个连接)...`);
-        for (const tcpSocket of stats.connections.keys()) {
-            const meta = stats.connections.get(tcpSocket);
-            if (meta && meta.udpSocket) {
-                try { meta.udpSocket.close(); } catch (e) {}
-            }
-            tcpSocket.destroy(); 
-        }
-        stats.connections.clear();
-        stats.ip_map.clear();
-    }
-}
-
-function updateUserLimits(username, limits) {
-    if (!limits) return;
-    const stats = getUserStat(username); 
-    console.log(`[IPC_CMD Worker ${WORKER_ID}] 正在更新用户 ${username} 的限制...`);
-    stats.limits = {
-        rate_kbps: limits.rate_kbps || 0,
-        max_connections: limits.max_connections || 0,
-    };
-    const rate = stats.limits.rate_kbps;
-    stats.bucket_up.updateRate(rate * 2, rate); 
-    stats.bucket_down.updateRate(rate * 2, rate); 
-}
-
-function resetUserTraffic(username) {
-    const stats = userStats.get(username);
-    if (stats) {
-        console.log(`[IPC_CMD Worker ${WORKER_ID}] 正在重置用户 ${username} 的流量计数器...`);
-        stats.traffic_delta = { upload: 0, download: 0 };
-        stats.traffic_live = { upload: 0, download: 0 };
-        stats.lastSpeedCalc = { upload: 0, download: 0, time: Date.now() };
-        if (pending_traffic_delta[username]) {
-             delete pending_traffic_delta[username];
-        }
-    }
-}
+// 移除 kickUser, updateUserLimits, resetUserTraffic 的内部实现，因为它们依赖 Panel 的 IPC 命令
+// 但我们必须保留接收这些命令的 IPC 客户端，以防止错误日志
+function kickUser(username) { /* Handled by WSS Proxy / Stunnel (pkill) */ }
+function updateUserLimits(username, limits) { /* Handled by WSS Proxy / Stunnel */ }
+function resetUserTraffic(username) { /* Handled by WSS Proxy / Stunnel */ }
 
 function attemptIpcReconnect() {
     if (ipcReconnectTimer) {
@@ -318,29 +294,14 @@ function connectToIpcServer() {
         try {
             const message = JSON.parse(data.toString());
             
+            // UDPGW 只需要接收控制信号，但不需要执行本地限速更新（因为限速在 WSS Proxy 完成）
+            // 这里保留了 kick/delete/reset_traffic 的调用，但内部实现为空或依赖上游
             switch (message.action) {
                 case 'kick':
-                    if (message.username) {
-                        kickUser(message.username);
-                    }
-                    break;
-                case 'update_limits':
-                    if (message.username && message.limits) {
-                        updateUserLimits(message.username, message.limits);
-                    }
-                    break;
-                case 'reset_traffic':
-                     if (message.username) {
-                        resetUserTraffic(message.username);
-                    }
-                    break;
                 case 'delete':
-                    if (message.username) {
-                        kickUser(message.username); 
-                        if (userStats.has(message.username)) {
-                            userStats.delete(message.username); 
-                        }
-                    }
+                case 'reset_traffic':
+                case 'update_limits': // 尽管不执行限速，但需要接收命令避免 Worker 报错
+                    // UDPGW Worker 忽略这些命令，因为用户是外部管理的
                     break;
             }
         } catch (e) {
@@ -363,86 +324,7 @@ function connectToIpcServer() {
     });
 }
 
-function parseAuthToken(rawString) {
-    const parts = rawString.trim().split(/\s+/);
-    
-    // 1. [AXIOM V5.5.4 FIX] 不再检查 UDPGW01，仅查找 TOKEN: 部分
-    const tokenPart = parts.find(p => p.startsWith('TOKEN:'));
-    if (!tokenPart) return null;
-
-    const base64Token = tokenPart.substring('TOKEN:'.length);
-    if (!base64Token) return null;
-
-    try {
-        const credentials = Buffer.from(base64Token, 'base64').toString('utf8');
-        // 2. 验证 Base64 解码后的格式是否为 user:pass
-        const splitIndex = credentials.indexOf(':');
-        if (splitIndex === -1) {
-            console.error(`[AUTH] Credentials missing ':' separator.`);
-            return null;
-        }
-        
-        const username = credentials.substring(0, splitIndex);
-        const password = credentials.substring(splitIndex + 1);
-        
-        if (!username || !password) return null;
-        return { username, password };
-    } catch (e) {
-        console.error(`[AUTH] Base64 token decoding failed: ${e.message}`);
-        return null;
-    }
-}
-
-async function authenticateUser(username, password) {
-    try {
-        const response = await fetch(config.panel_api_url + '/auth', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username, password })
-        });
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            return { success: false, limits: null, message: errorData.message || `Auth failed with status ${response.status}` };
-        }
-        const data = await response.json();
-        updateUserLimits(username, data.limits);
-        return { success: true, limits: data.limits, message: 'Auth successful' };
-    } catch (e) {
-        console.error(`[AUTH] Failed to fetch Panel /auth API: ${e.message}`);
-        return { success: false, limits: null, message: 'Internal API connection error', status: 503 };
-    }
-}
-
-async function checkConcurrency(username, maxConnections) {
-    if (maxConnections === 0) return true; 
-    
-    // 1. 本地检查 (快速失败)
-    const stats = getUserStat(username); 
-    if (stats.connections.size >= maxConnections) {
-        return false;
-    }
-
-    // 2. 集群检查 (中央授权) - 使用 WSS Panel 的 API
-    try {
-        const params = new URLSearchParams({ username, worker_id: WORKER_ID });
-        const response = await fetch(config.panel_api_url + '/auth/check-conn?' + params.toString(), {
-            method: 'GET'
-        });
-        const data = await response.json();
-        
-        if (!response.ok || !data.success || !data.allowed) {
-            return false;
-        }
-        
-        return data.allowed;
-        
-    } catch (e) {
-        console.error(`[CONCURRENCY] Cluster check failed: ${e.message}。使用本地检查结果。`);
-        // 无法连接 Panel，如果本地检查通过，则暂时允许连接以保持网络可用性，但存在绕过风险。
-        return (stats.connections.size < maxConnections);
-    }
-}
-
+// [AXIOM V5.5.7] 移除所有认证 API 辅助函数
 
 /**
  * 将 UDP 数据包封装成 BadVPN TCP 帧
@@ -470,14 +352,29 @@ function handleClient(tcpSocket) {
     const clientIp = tcpSocket.remoteAddress.startsWith('::ffff:') ? tcpSocket.remoteAddress.substring(7) : tcpSocket.remoteAddress;
     console.log(`[UDP_TCP] 新连接 ${clientId}. 当前总数: ${totalConnections}`);
     
-    let authComplete = false; 
+    let handshakeComplete = false; 
     let tcpBuffer = Buffer.alloc(0);
     let currentPacketLength = 0;
-    let username = 'N/A';
-    let stats = null; 
+    
+    // [AXIOM V5.5.7] 默认使用客户端 IP 作为伪用户名进行统计
+    const username = `UDP_${clientIp}`; 
+    const stats = getOrCreateConnectionStats(clientId, username); 
     
     // 为每个 TCP 连接创建一个专用的 UDP socket
     const udpSocket = dgram.createSocket('udp4');
+
+    // [AXIOM V5.5.9 FIX] 应用性能调优
+    tcpSocket.setNoDelay(true); // 禁用 Nagle 算法
+    
+    // [AXIOM V5.5.10 FIX] 容错处理：如果设置缓冲区大小失败，捕获错误并继续。
+    try {
+        udpSocket.setSendBufferSize(UDP_SOCKET_BUFFER_SIZE);
+        udpSocket.setRecvBufferSize(UDP_SOCKET_BUFFER_SIZE);
+    } catch (e) {
+        // 如果是 EBADF (Bad File Descriptor) 或其他缓冲区错误，打印警告并忽略，防止进程崩溃
+        console.warn(`[UDP_SOC ${clientId}] WARNING: Failed to set UDP buffer size (${e.code || e.message}). Using default buffers.`, e.code);
+    }
+
 
     function cleanup() {
         totalConnections--;
@@ -492,9 +389,8 @@ function handleClient(tcpSocket) {
     
     // --- UDP -> TCP 转发逻辑 (Tunneling) ---
     udpSocket.on('message', (msg, rinfo) => {
-        if (!authComplete || !stats) return;
-
         try {
+            // [AXIOM V5.5.7] 限速检查 (Downstream)
             const allowedBytes = stats.bucket_down.consume(msg.length);
             if (allowedBytes === 0) return; 
             const dataToWrite = (allowedBytes < msg.length) ? msg.subarray(0, allowedBytes) : msg;
@@ -508,7 +404,6 @@ function handleClient(tcpSocket) {
             }
         } catch (e) {
             console.error(`[UDP_TCP ${clientId}] 转发 UDP->TCP 失败: ${e.message}`);
-            // 不销毁连接，等待客户端自行超时或断开
         }
     });
 
@@ -517,77 +412,59 @@ function handleClient(tcpSocket) {
         tcpSocket.destroy(); 
     });
 
+    // [AXIOM V5.5.7] 连接建立时立即记录统计元数据
+    stats.connections.set(tcpSocket, {
+        id: crypto.randomUUID(),
+        clientIp: clientIp,
+        startTime: new Date().toISOString(),
+        udpSocket: udpSocket 
+    });
+    stats.ip_map.set(clientIp, tcpSocket);
+    
+    console.log(`[UDP_TCP ${clientId}] 已跳过认证，等待 BadVPN 握手数据...`);
+    
     // --- TCP -> UDP 解析逻辑 (De-tunneling) ---
     tcpSocket.on('data', async (data) => {
         tcpBuffer = Buffer.concat([tcpBuffer, data]);
         
-        // 1. 握手和认证阶段
-        if (!authComplete) {
+        // 1. 握手（V5.5.12 FIX: 只要收到数据，就完成握手）
+        if (!handshakeComplete) {
+            // [AXIOM V5.5.12 FIX] 只要收到数据，立即进入转发状态
+            handshakeComplete = true;
             
-            // [AXIOM V5.5.1 FIX] 查找单行握手结束符 ('\n')
-            const newlineIndex = tcpBuffer.indexOf('\n');
-            if (newlineIndex === -1) {
-                if (tcpBuffer.length > 512) {
-                     console.warn(`[UDP_TCP ${clientId}] 握手包过长 (超过 512 bytes)。断开连接。`);
-                     tcpSocket.destroy();
-                }
-                return; // 缓冲区不足
+            // [AXIOM V5.5.13 FIX] 显式跳过 BadVPN 协议头 (UDPGW01)，兼容客户端的实现
+            const handshakeIndex = tcpBuffer.indexOf(HANDSHAKE_CODE);
+            if (handshakeIndex === 0) {
+                 // 协议头在开头，跳过它
+                 tcpBuffer = tcpBuffer.subarray(HANDSHAKE_CODE.length);
+                 console.log(`[UDP_TCP ${clientId}] 收到协议头 (UDPGW01)，已跳过。`);
+            } else if (handshakeIndex > 0 && handshakeIndex < tcpBuffer.length) {
+                 // 协议头在中间，跳过头部之前的垃圾数据和协议头
+                 tcpBuffer = tcpBuffer.subarray(handshakeIndex + HANDSHAKE_CODE.length);
+                 console.log(`[UDP_TCP ${clientId}] 发现协议头 (UDPGW01) 嵌入，已跳过前面 ${handshakeIndex} 字节的垃圾数据。`);
             }
             
-            // 提取第一行 (包含可能的 \r)
-            const headerRaw = tcpBuffer.subarray(0, newlineIndex).toString('utf8').trim();
-            // [AXIOM V5.5.2 FIX] 增加日志，调试客户端发送的原始协议头
-            console.log(`[UDP_TCP ${clientId}] 收到原始握手行 (Raw): ${headerRaw.substring(0, 100)}`);
-            
-            tcpBuffer = tcpBuffer.subarray(newlineIndex + 1); // 移除握手行和换行符
-            
-            // 1.1 认证
-            const auth = parseAuthToken(headerRaw);
+            console.log(`[UDP_TCP ${clientId}] 立即启动 BadVPN 帧解析。`);
 
-            if (!auth) {
-                console.warn(`[UDP_TCP ${clientId}] 认证失败: 无效的握手或缺少 Base64 令牌。`);
-                tcpSocket.destroy();
-                return;
-            }
-            
-            username = auth.username;
-            const authResult = await authenticateUser(username, auth.password);
-
-            if (!authResult.success) {
-                console.warn(`[UDP_TCP ${clientId}] 用户 ${username} 认证失败: ${authResult.message}`);
-                tcpSocket.destroy();
-                return;
-            }
-
-            // 1.2 并发和限速检查
-            stats = getUserStat(username); 
-            
-            if (!await checkConcurrency(username, authResult.limits.max_connections)) {
-                console.warn(`[UDP_TCP ${clientId}] 用户 ${username} 超出并发限制 (${authResult.limits.max_connections})。`);
-                tcpSocket.destroy();
-                return; 
-            }
-            
-            // 1.3 认证成功，进入转发状态
-            authComplete = true;
-            stats.connections.set(tcpSocket, {
-                id: crypto.randomUUID(),
-                clientIp: clientIp,
-                startTime: new Date().toISOString(),
-                udpSocket: udpSocket 
-            });
-            stats.ip_map.set(clientIp, tcpSocket);
-
-            console.log(`[UDP_TCP ${clientId}] 用户 ${username} 认证成功，开始转发。`);
+            // 检查缓冲区是否包含更多数据，继续处理（调用自身进入 while 循环）
+            tcpSocket.emit('data', Buffer.alloc(0)); 
+            return;
         }
         
-        // 2. 数据包解析阶段 (只在认证成功后执行)
-        while (authComplete && tcpBuffer.length >= 2) {
+        // 2. 数据包解析阶段
+        while (handshakeComplete && tcpBuffer.length >= 2) {
             if (currentPacketLength === 0) {
                 // 读取下一个数据包的长度
                 currentPacketLength = tcpBuffer.readUInt16BE(0);
                 
-                if (currentPacketLength > MAX_PACKET_SIZE || currentPacketLength <= 0) {
+                // [AXIOM V5.5.13 FIX] 忽略长度为 0 的帧，防止断开连接
+                if (currentPacketLength === 0) {
+                     tcpBuffer = tcpBuffer.subarray(2); // 消耗掉 2 字节长度
+                     currentPacketLength = 0;
+                     continue; // 继续循环，处理下一个帧
+                }
+                
+                if (currentPacketLength > MAX_PACKET_SIZE || currentPacketLength < 6) { 
                     console.error(`[UDP_TCP ${clientId}] 无效的包长度: ${currentPacketLength}. 断开连接。`);
                     tcpSocket.destroy();
                     return;
@@ -600,7 +477,7 @@ function handleClient(tcpSocket) {
                 // 成功读取一个完整的帧
                 const udpPacket = tcpBuffer.subarray(2, requiredLength);
                 
-                // 流量控制 (上传)
+                // [AXIOM V5.5.7] 流量控制 (上传)
                 const allowedBytes = stats.bucket_up.consume(udpPacket.length);
                 if (allowedBytes > 0) {
                     
