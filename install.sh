@@ -4,12 +4,13 @@
 set -eu
 
 # ==========================================================
-# WSS 基础设施配置 (Axiom V5.5 - Final Deployment Script)
+# WSS 隧道与用户管理面板模块化部署脚本
+# V2.1.0 (Axiom - Revert to BadVPN C++ UDPGW)
 #
-# [AXIOM V5.5 CHANGELOG]
-# - 确保 Sysctl 网络参数在安装时立即生效。
-# - 确保 Native UDPGW 服务配置正确。
-# - 清理和启动顺序优化。
+# [CHANGELOG]
+# - 回归 BadVPN (C++) 方案以确保 UDP 转发的绝对稳定性。
+# - 移除了实验性的 Node.js UDP Server 部署逻辑。
+# - 自动编译并安装 badvpn-udpgw。
 # ==========================================================
 
 
@@ -32,8 +33,6 @@ DB_PATH="$PANEL_DIR/wss_panel.db"
 WSS_PROXY_PATH="/usr/local/bin/wss_proxy.js"
 PANEL_BACKEND_FILE="wss_panel.js"
 PANEL_BACKEND_DEST="$PANEL_DIR/$PANEL_BACKEND_FILE" 
-UDP_SERVER_FILE="udp_server.js"
-UDP_SERVER_DEST="$PANEL_DIR/$UDP_SERVER_FILE" 
 PANEL_HTML_DEST="$PANEL_DIR/index.html"
 PANEL_JS_DEST="$PANEL_DIR/app.js"
 LOGIN_HTML_DEST="$PANEL_DIR/login.html" 
@@ -43,12 +42,10 @@ PACKAGE_JSON_DEST="$PANEL_DIR/package.json"
 SSHD_STUNNEL_CONFIG="/etc/ssh/sshd_config_stunnel"
 SSHD_STUNNEL_SERVICE="/etc/systemd/system/sshd_stunnel.service"
 
-# [AXIOM V5.0] 新服务文件路径
-UDP_SERVICE_PATH="/etc/systemd/system/udp_server.service" 
-WSS_SERVICE_PATH="/etc/systemd/system/wss.service"
-PANEL_SERVICE_PATH="/etc/systemd/system/wss_panel.service"
-PANEL_TEMPLATE="$REPO_ROOT/wss_panel.service.template"
-WSS_TEMPLATE="$REPO_ROOT/wss.service.template"
+# BadVPN 路径
+BADVPN_SRC_DIR="/root/badvpn"
+UDPGW_SERVICE_PATH="/etc/systemd/system/udpgw.service"
+UDPGW_TEMPLATE="$REPO_ROOT/udpgw.service.template"
 
 
 # 创建基础目录
@@ -61,7 +58,7 @@ touch "$WSS_LOG_FILE"
 # [AXIOM V2.0] 交互式端口和用户配置
 # =============================
 echo "----------------------------------"
-echo "==== WSS 基础设施配置 (V5.5) ===="
+echo "==== WSS 基础设施配置 (V2.1 - BadVPN Edition) ===="
 echo "请确认或修改以下端口和服务用户设置 (回车以使用默认值)。"
 
 # 1. 端口
@@ -74,8 +71,7 @@ WSS_TLS_PORT=${WSS_TLS_PORT:-443}
 read -p "  3. Stunnel (SSH/TLS) 端口 [444]: " STUNNEL_PORT
 STUNNEL_PORT=${STUNNEL_PORT:-444}
 
-# [AXIOM V5.0] Native UDPGW 端口
-read -p "  4. Native UDPGW 端口 [7300]: " UDPGW_PORT
+read -p "  4. BadVPN UDPGW 端口 [7300]: " UDPGW_PORT
 UDPGW_PORT=${UDPGW_PORT:-7300}
 
 read -p "  5. Web 面板端口 [54321]: " PANEL_PORT
@@ -101,7 +97,7 @@ echo "配置确认："
 echo "Panel 用户: $panel_user"
 echo "WSS (80/443) -> $WSS_HTTP_PORT/$WSS_TLS_PORT (转发至 $INTERNAL_FORWARD_PORT)"
 echo "Stunnel (444) -> $STUNNEL_PORT (转发至 $SSHD_STUNNEL_PORT)"
-echo "Native UDPGW (TCP) -> $UDPGW_PORT"
+echo "BadVPN UDPGW (127.0.0.1) -> $UDPGW_PORT"
 echo "Web Panel (HTTP) & IPC (WS) -> $PANEL_PORT"
 echo "---------------------------------"
 
@@ -131,9 +127,11 @@ fi
 
 
 echo "----------------------------------"
-echo "==== 系统清理与依赖检查 (V5.5) ===="
-# 停止所有相关服务并清理旧文件
+echo "==== 系统清理与依赖检查 (V2.1) ===="
+# 停止所有相关服务并清理旧文件 (包括可能的 Node.js udp_server)
 systemctl stop wss stunnel4 udpgw udp_server wss_panel sshd_stunnel || true
+systemctl disable udp_server || true # 禁用旧的 Node.js UDP 服务
+rm -f /etc/systemd/system/udp_server.service
 
 # 依赖检查和安装
 apt update -y
@@ -143,8 +141,8 @@ if ! command -v node >/dev/null; then
     apt install -y nodejs
 fi
 
-# [AXIOM V5.0] 移除 badvpn 相关依赖（如 cmake, build-essential）
-apt install -y wget curl git net-tools openssl stunnel4 iproute2 iptables procps libsqlite3-dev passwd sudo || echo "警告: 依赖安装失败，可能影响功能。"
+# 安装编译 BadVPN 所需的工具
+apt install -y wget curl git net-tools cmake build-essential openssl stunnel4 iproute2 iptables procps libsqlite3-dev passwd sudo || echo "警告: 依赖安装失败，可能影响功能。"
 
 if ! id -u "$panel_user" >/dev/null 2>&1; then
     echo "正在创建系统用户 '$panel_user'..."
@@ -223,7 +221,6 @@ CMD_GETENT=$(command -v getent)
 CMD_SED=$(command -v sed)
 
 tee "$SUDOERS_FILE" > /dev/null <<EOF
-# [AXIOM V5.5] 修正 systemctl 的 NOPASSWD 条目，与 safeRunCommand 保持一致
 $panel_user ALL=(ALL) NOPASSWD: $CMD_USERADD
 $panel_user ALL=(ALL) NOPASSWD: $CMD_USERMOD
 $panel_user ALL=(ALL) NOPASSWD: $CMD_USERDEL
@@ -235,12 +232,12 @@ $panel_user ALL=(ALL) NOPASSWD: $CMD_IPTABLES_SAVE
 $panel_user ALL=(ALL) NOPASSWD: $CMD_JOURNALCTL
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart wss
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart stunnel4
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart udp_server 
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart udpgw
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart wss_panel
 $panel_user ALL=(ALL) NOPASSWD: $CMD_GETENT
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active wss
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active stunnel4
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active udp_server 
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active udpgw
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active wss_panel
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SED
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL daemon-reload
@@ -259,7 +256,6 @@ echo "----------------------------------"
 # 内核调优 (Buffer Tuning)
 # =============================
 echo "==== 配置内核网络参数 (Buffer Tuning) ===="
-# [AXIOM V4.6] 终极缓冲区调优：支持 8MB 默认缓冲和 32MB 最大缓冲
 sed -i '/# WSS_NET_START/,/# WSS_NET_END/d' /etc/sysctl.conf
 cat >> /etc/sysctl.conf <<EOF
 # WSS_NET_START
@@ -271,14 +267,13 @@ net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_keepalive_time = 60
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_keepalive_intvl = 5
-# [AXIOM V4.6] UDPGW Buffer Tuning (Max 32MB, Default 8MB)
+# BadVPN UDPGW Buffer Tuning (Max 32MB, Default 8MB)
 net.core.rmem_max = 33554432
 net.core.wmem_max = 33554432
 net.core.rmem_default = 8388608
 net.core.wmem_default = 8388608
 # WSS_NET_END
 EOF
-# [AXIOM V5.5 FIX] 确保 sysctl -p 在 sed 之后被正确执行
 sysctl -p > /dev/null
 echo "----------------------------------"
 
@@ -290,8 +285,7 @@ cp "$REPO_ROOT/wss_proxy.js" "$WSS_PROXY_PATH"
 chmod +x "$WSS_PROXY_PATH"
 cp "$REPO_ROOT/wss_panel.js" "$PANEL_BACKEND_DEST"
 chmod +x "$PANEL_BACKEND_DEST"
-cp "$REPO_ROOT/udp_server.js" "$UDP_SERVER_DEST" 
-chmod +x "$UDP_SERVER_DEST" 
+# 注意：不再部署 udp_server.js
 cp "$REPO_ROOT/index.html" "$PANEL_HTML_DEST"
 cp "$REPO_ROOT/app.js" "$PANEL_JS_DEST"
 cp "$REPO_ROOT/login.html" "$LOGIN_HTML_DEST"
@@ -340,39 +334,78 @@ echo "----------------------------------"
 
 
 # =============================
-# 部署 Systemd 服务文件 (UDP, WSS, PANEL)
+# 安装 BadVPN UDPGW (Release Mode)
 # =============================
-echo "==== 部署 Native UDPGW Service 文件 ===="
+echo "==== 编译并部署 BadVPN UDPGW (Release Mode) ===="
+# 1. 检查并拉取源码
+if [ ! -d "$BADVPN_SRC_DIR" ]; then
+    echo "正在拉取 BadVPN 源码..."
+    git clone https://github.com/ambrop72/badvpn.git "$BADVPN_SRC_DIR" > /dev/null 2>&1
+fi
 
-# 1. 创建 udp_server.service
-tee "$UDP_SERVICE_PATH" > /dev/null <<EOF
-[Unit]
-Description=WSS Native UDP Gateway (BadVPN Protocol)
-After=network.target
-After=wss_panel.service
-BindsTo=wss_panel.service
+# 2. 创建构建目录
+mkdir -p "$BADVPN_SRC_DIR/badvpn-build"
+cd "$BADVPN_SRC_DIR/badvpn-build"
 
-[Service]
-Type=simple
-Environment=PANEL_DIR_ENV=$PANEL_DIR
-ExecStart=/usr/bin/node $UDP_SERVER_DEST
-Restart=on-failure
-User=root
-StandardOutput=journal
-StandardError=journal
+# 3. Cmake 配置 (只编译 UDPGW, Release 模式)
+echo "正在配置 BadVPN 编译选项..."
+cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
 
-[Install]
-WantedBy=multi-user.target
-EOF
+# 4. 编译
+echo "正在编译 BadVPN (可能需要几分钟)..."
+make -j$(nproc) > /dev/null 2>&1
 
-echo "==== 部署 WSS Proxy 和 Web Panel Service 文件 ===="
+# 5. 部署 Systemd 服务
+cd - > /dev/null
+if [ ! -f "$UDPGW_TEMPLATE" ]; then
+    echo "错误: 找不到 udpgw.service.template 模板文件。"
+    exit 1
+fi
+cp "$UDPGW_TEMPLATE" "$UDPGW_SERVICE_PATH"
+sed -i "s|@UDPGW_PORT@|$UDPGW_PORT|g" "$UDPGW_SERVICE_PATH"
 
-# 2. 创建 wss.service
+systemctl daemon-reload
+systemctl enable udpgw
+systemctl restart udpgw
+echo "BadVPN UDPGW 已启动 (端口: $UDPGW_PORT)。"
+echo "----------------------------------"
+
+# =============================
+# IPTABLES & Systemd (其他服务)
+# =============================
+echo "==== 配置 IPTABLES ===="
+BLOCK_CHAIN="WSS_IP_BLOCK"
+iptables -F $BLOCK_CHAIN 2>/dev/null || true
+iptables -X $BLOCK_CHAIN 2>/dev/null || true
+iptables -N $BLOCK_CHAIN 2>/dev/null || true
+iptables -I INPUT 1 -j $BLOCK_CHAIN 
+
+# 开放所有端口
+iptables -I INPUT -p tcp --dport $WSS_HTTP_PORT -j ACCEPT
+iptables -I INPUT -p tcp --dport $WSS_TLS_PORT -j ACCEPT
+iptables -I INPUT -p tcp --dport $STUNNEL_PORT -j ACCEPT
+iptables -I INPUT -p tcp --dport $PANEL_PORT -j ACCEPT
+iptables -I INPUT -p tcp --dport $UDPGW_PORT -j ACCEPT # 开放 UDPGW 端口 (TCP协议)
+
+if ! command -v netfilter-persistent >/dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt install -y netfilter-persistent iptables-persistent || true
+fi
+if command -v netfilter-persistent >/dev/null; then
+    /sbin/iptables-save > "$IPTABLES_RULES"
+    systemctl enable netfilter-persistent || true
+    systemctl start netfilter-persistent || true
+fi
+echo "----------------------------------"
+
+echo "==== 部署其他 Systemd 服务 ===="
+WSS_SERVICE_PATH="/etc/systemd/system/wss.service"
+WSS_TEMPLATE="$REPO_ROOT/wss.service.template"
 cp "$WSS_TEMPLATE" "$WSS_SERVICE_PATH"
 sed -i "s|@WSS_LOG_FILE_PATH@|$WSS_LOG_FILE|g" "$WSS_SERVICE_PATH"
 sed -i "s|@WSS_PROXY_SCRIPT_PATH@|$WSS_PROXY_PATH|g" "$WSS_SERVICE_PATH"
 
-# 3. 创建 wss_panel.service
+PANEL_SERVICE_PATH="/etc/systemd/system/wss_panel.service"
+PANEL_TEMPLATE="$REPO_ROOT/wss_panel.service.template"
 cp "$PANEL_TEMPLATE" "$PANEL_SERVICE_PATH"
 sed -i "s|@PANEL_DIR@|$PANEL_DIR|g" "$PANEL_SERVICE_PATH"
 sed -i "s|@PANEL_USER@|$panel_user|g" "$PANEL_SERVICE_PATH"
@@ -383,60 +416,18 @@ chown "$panel_user:$panel_user" "$WSS_LOG_FILE"
 chown "$panel_user:$panel_user" "$CONFIG_PATH"
 chmod 600 "$CONFIG_PATH"
 
-
-# =============================
-# IPTABLES 规则设置 (FIXED)
-# =============================
-echo "==== 配置 IPTABLES (开放外部端口) ===="
-# 1. 设置 IP 阻断链 (WSS Proxy 内部使用)
-BLOCK_CHAIN="WSS_IP_BLOCK"
-# 清理旧链
-iptables -F $BLOCK_CHAIN 2>/dev/null || true
-iptables -X $BLOCK_CHAIN 2>/dev/null || true
-# 创建新链并插入到 INPUT 链的第 1 位
-iptables -N $BLOCK_CHAIN 2>/dev/null || true
-iptables -I INPUT 1 -j $BLOCK_CHAIN 
-
-# 2. 开放所有 WSS 基础设施使用的外部端口
-echo "正在开放 WSS/Panel/Stunnel/UDPGW 所需的端口..."
-
-# WSS HTTP/TLS 端口 (TCP)
-iptables -I INPUT -p tcp --dport $WSS_HTTP_PORT -j ACCEPT
-iptables -I INPUT -p tcp --dport $WSS_TLS_PORT -j ACCEPT
-
-# Stunnel/SSH 端口 (TCP)
-iptables -I INPUT -p tcp --dport $STUNNEL_PORT -j ACCEPT
-
-# Panel 端口 (TCP/IPC)
-iptables -I INPUT -p tcp --dport $PANEL_PORT -j ACCEPT
-
-# Native UDPGW 端口 (TCP/UDP for client compatibility)
-# 开放 TCP 和 UDP，以确保 BadVPN 客户端的兼容性
-iptables -I INPUT -p tcp --dport $UDPGW_PORT -j ACCEPT
-iptables -I INPUT -p udp --dport $UDPGW_PORT -j ACCEPT
-
-
-# 3. 启用并保存规则 (这是关键，确保规则持久化)
-if ! command -v netfilter-persistent >/dev/null; then
-    DEBIAN_FRONTEND=noninteractive apt install -y netfilter-persistent iptables-persistent || true
-fi
-if command -v netfilter-persistent >/dev/null; then
-    echo "正在保存 IPTABLES 规则..."
-    /sbin/iptables-save > "$IPTABLES_RULES"
-    systemctl enable netfilter-persistent || true
-    systemctl start netfilter-persistent || true
-fi
-echo "IPTABLES 规则配置完成，相关端口已开放。"
+systemctl daemon-reload
+systemctl enable wss_panel
+systemctl restart wss_panel
+systemctl enable wss
+systemctl restart wss
 echo "----------------------------------"
-
 
 # =============================
 # SSHD 配置
 # =============================
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_SERVICE=$(systemctl list-units --full -all | grep -q "sshd.service" && echo "sshd" || echo "ssh")
-
-# [AXIOM V5.5 FIX] 还原主 SSHD 配置
 sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
 if ! grep -q "^Port $INTERNAL_FORWARD_PORT" "$SSHD_CONFIG" && [ "$INTERNAL_FORWARD_PORT" != "22" ]; then
     sed -i -E "/^[#\s]*Port /d" "$SSHD_CONFIG"
@@ -489,31 +480,9 @@ systemctl restart "$SSHD_SERVICE"
 systemctl enable sshd_stunnel
 systemctl restart sshd_stunnel
 
-echo "----------------------------------"
-
-
-# =============================
-# Systemd 重载与启动 (FIXED SEQUENCE)
-# =============================
-echo "==== Systemd 重载配置并按依赖顺序启动服务 ===="
-systemctl daemon-reload
-echo "Systemd 配置已重载。开始启动..."
-
-# 1. 启动 WSS Panel (主控平面 - 其他服务的依赖)
-systemctl enable wss_panel
-systemctl restart wss_panel
-
-# 2. 启动 Native UDPGW (依赖 WSS Panel)
-systemctl enable udp_server 
-systemctl restart udp_server
-
-# 3. 启动 WSS Proxy (依赖 WSS Panel)
-systemctl enable wss
-systemctl restart wss
-
-# Final Restart (确保 stunnel4 也在最后重启)
-systemctl restart stunnel4 
+# Final Restart
+systemctl restart stunnel4 udpgw wss_panel wss
 
 echo "=================================================="
-echo "✅ 部署完成！(Axiom V5.5 - Final Fix)"
+echo "✅ 部署完成！(Axiom V2.1 - BadVPN C++ Edition)"
 echo "=================================================="
