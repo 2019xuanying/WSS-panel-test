@@ -1,14 +1,11 @@
 /**
- * WSS Panel Frontend (Axiom Refactor V5.2 - Live Connection Metadata)
+ * WSS Panel Frontend (Axiom Refactor V5.5 - UDPGW & Zombie Cleanup)
  *
- * [AXIOM V5.2 CHANGELOG]
- * - [功能新增] 实现 `openConnectionDetailsModal(username)` 函数。
- * - 实现 `renderConnectionList(connections)` 函数来渲染模态框内容。
- * - 在 `renderUserList` 中添加 “连接详情” 按钮的调用。
- *
- * [AXIOM V5.1.1 BUGFIX]
- * - [CRITICAL] 修复 ReferenceError: Cannot set properties of null (setting 'textContent') 错误。
- * - 修复方案：确保所有 DOM ID 引用在渲染时都是有效的。
+ * [AXIOM V5.5 CHANGELOG]
+ * - [B2 FIX] 确保 CORE_SERVICES_MAP 包含 'udp_server'，用于日志和状态显示。
+ * - [僵尸清理 FIX] 优化 handleSilentUpdate，确保只有在收到新的活动数据时才更新用户实时速度。
+ * - 确保 fetchAllStaticData 在初始化时正确设置日志按钮。
+ * - [V5.2] 实现 `openConnectionDetailsModal(username)` 函数。
  */
 
 // --- 全局配置 (将由 initializeApp 异步填充) ---
@@ -39,11 +36,11 @@ let lastUserStats = { total: -1, total_traffic_gb: -1 };
 
 const TOKEN_PLACEHOLDER = "[*********]";
 
-// [AXIOM V5.0] CORE_SERVICES 映射，用于 UI 日志和状态显示
+// [AXIOM V5.5 FIX] CORE_SERVICES 映射，用于 UI 日志和状态显示
 const CORE_SERVICES_MAP = {
     'wss': 'WSS Proxy',
     'stunnel4': 'Stunnel4',
-    'udp_server': 'Native UDPGW', // [AXIOM V5.0] 新增服务名
+    'udp_server': 'Native UDPGW', // [AXIOM V5.5] 确保包含 UDPGW
     'wss_panel': 'Web Panel'
 };
 
@@ -495,10 +492,11 @@ function buildUserCard(user, statusColor, statusText, toggleAction, toggleText, 
     if (user.status === 'expired' || user.status === 'exceeded') borderColor = 'border-error';
     const isChecked = selectedUsers.includes(user.username) ? 'checked' : '';
     
-    // [AXIOM V3.1] 骨架渲染: 速度和连接数默认为 '...'，等待静默更新
-    const speedUp = '...';
-    const speedDown = '...';
-    const activeConnections = user.active_connections !== undefined ? user.active_connections : 0;
+    // [AXIOM V5.5 FIX] 确保从缓存读取最新的实时速度和连接数
+    const cachedUser = allUsersCache.find(u => u.username === user.username);
+    const speedUp = formatSpeedUnits(cachedUser?.realtime_speed_up || 0);
+    const speedDown = formatSpeedUnits(cachedUser?.realtime_speed_down || 0);
+    const activeConnections = cachedUser?.active_connections !== undefined ? cachedUser.active_connections : 0;
     
     const shellStatus = user.allow_shell === 1;
     const shellColor = shellStatus ? 'text-secondary' : 'text-gray-500';
@@ -604,9 +602,9 @@ function renderUserList(users) {
         const maxConnections = user.max_connections !== undefined ? user.max_connections : 0; 
         const fuseThreshold = user.fuse_threshold_kbps !== undefined ? user.fuse_threshold_kbps : 0; 
         
-        // [AXIOM V3.1] 骨架渲染: 速度和连接数默认为 '...'
-        const speedUp = '...';
-        const speedDown = '...';
+        // [AXIOM V5.5 FIX] 确保从缓存读取最新的实时速度和连接数
+        const speedUp = formatSpeedUnits(user.realtime_speed_up || 0);
+        const speedDown = formatSpeedUnits(user.realtime_speed_down || 0);
         const activeConnections = user.active_connections !== undefined ? user.active_connections : 0;
         
         const allowShell = user.allow_shell || 0;
@@ -1328,7 +1326,7 @@ function updateRealtimeTrafficChart(liveUpdatePayload) {
 
 
 /**
- * [AXIOM V5.0] 优雅的静默更新处理器 (1秒)
+ * [AXIOM V5.5 FIX 僵尸清理] 优雅的静默更新处理器 (1秒)
  * @param {object} userStats - 仅包含有变化的用户数据
  */
 function handleSilentUpdate(userStats) {
@@ -1342,7 +1340,16 @@ function handleSilentUpdate(userStats) {
         const speedDownText = formatSpeedUnits(stats.speed_kbps.download || 0);
         const connectionsText = stats.connections || 0;
         
-        // 1. 更新 PC 列表 (只修改 textContent)
+        // 找到用户在缓存中的索引
+        const userIndex = allUsersCache.findIndex(u => u.username === username);
+        if (userIndex === -1) continue; 
+
+        // 1. 更新 allUsersCache 中的实时数据 (确保列表排序和移动端卡片使用最新值)
+        allUsersCache[userIndex].realtime_speed_up = stats.speed_kbps.upload;
+        allUsersCache[userIndex].realtime_speed_down = stats.speed_kbps.download;
+        allUsersCache[userIndex].active_connections = connectionsText;
+        
+        // 2. 更新 PC 列表 (只修改 textContent)
         const speedCell = document.getElementById(`speed-cell-${username}`);
         const connCell = document.getElementById(`conn-cell-${username}`); 
 
@@ -1355,7 +1362,7 @@ function handleSilentUpdate(userStats) {
             connCell.textContent = connectionsText;
         }
 
-        // 2. 更新移动端卡片 (只修改 textContent)
+        // 3. 更新移动端卡片 (只修改 textContent)
         const speedUpMobile = document.getElementById(`speed-up-mobile-${username}`);
         const speedDownMobile = document.getElementById(`speed-down-mobile-${username}`);
         const connMobile = document.getElementById(`conn-mobile-${username}`);
@@ -1363,10 +1370,6 @@ function handleSilentUpdate(userStats) {
         if (speedUpMobile) speedUpMobile.textContent = `↑ ${speedUpText}`;
         if (speedDownMobile) speedDownMobile.textContent = `↓ ${speedDownText}`;
         if (connMobile) connMobile.textContent = connectionsText;
-        
-        // 3. 更新流量使用量 (这个更新频率较低，但为了应对流量超额熔断，最好保持实时性)
-        // 注意：这里的 usage_gb 需要从 allUsersCache 中获取或后端全量推送。
-        // 由于后端不再推送 usage_gb，这里我们只能更新连接数和速度。
     }
 }
 
@@ -1391,7 +1394,20 @@ function handleDashboardConnectionSilentUpdate(systemStats) {
 async function fetchAllStaticData() {
     console.log("[AXIOM V5.0] 正在加载一次性静态数据...");
     try {
-        // 1. 加载仪表盘数据 (将触发全量渲染)
+        // 1. 异步获取配置 (确保 CORE_SERVICES_MAP 是最新的)
+        const data = await fetchData('/settings/config');
+        if (data && data.config) {
+            FLASK_CONFIG = {
+                WSS_HTTP_PORT: data.config.wss_http_port,
+                WSS_TLS_PORT: data.config.wss_tls_port,
+                STUNNEL_PORT: data.config.stunnel_port,
+                UDPGW_PORT: data.config.udpgw_port,
+                INTERNAL_FORWARD_PORT: data.config.internal_forward_port,
+                PANEL_PORT: data.config.panel_port
+            };
+        }
+        
+        // 2. 加载仪表盘数据 (将触发全量渲染)
         const statusData = await fetchData('/system/status');
         if (statusData) {
             renderSystemStatus(statusData);
@@ -1399,32 +1415,33 @@ async function fetchAllStaticData() {
             initRealtimeTrafficChart();
         }
 
-        // 2. 加载用户列表
+        // 3. 加载用户列表
         await fetchAllUsersAndRender();
         
-        // 3. (可选) 预加载其他视图的数据
+        // 4. (可选) 预加载其他视图的数据
         if (currentView === 'live-ips') { fetchActiveIPs(); }
-        if (currentView === 'settings') { 
-            // 首次加载时需要确保 CORE_SERVICES 是最新的
+        
+        // 4.1. 确保日志按钮与 CORE_SERVICES_MAP 同步
+        const btnGroup = document.querySelector('#view-settings .btn-group');
+        if (btnGroup) {
+             // 清空旧按钮
+            btnGroup.innerHTML = '';
+            
             Object.keys(CORE_SERVICES_MAP).forEach(key => {
-                 const button = document.querySelector(`#view-settings .btn-group button[onclick*="fetchServiceLogs('${key}')"]`);
-                 if (!button) {
-                     // 动态添加按钮以兼容新的服务名称
-                     const btnGroup = document.querySelector('#view-settings .btn-group');
-                     if (btnGroup) {
-                          const newButton = document.createElement('button');
-                          newButton.setAttribute('onclick', `fetchServiceLogs('${key}')`);
-                          newButton.className = 'btn btn-ghost btn-sm';
-                          newButton.textContent = CORE_SERVICES_MAP[key];
-                          btnGroup.appendChild(newButton);
-                     }
-                 }
+                const newButton = document.createElement('button');
+                newButton.setAttribute('onclick', `fetchServiceLogs('${key}')`);
+                newButton.className = 'btn btn-ghost btn-sm';
+                newButton.textContent = CORE_SERVICES_MAP[key];
+                btnGroup.appendChild(newButton);
             });
+        }
+        
+        if (currentView === 'settings') { 
             fetchAuditLogs(); 
         }
         if (currentView === 'security') { fetchGlobalBans(); }
         
-        // 4. 隐藏骨架屏, 显示真实卡片
+        // 5. 隐藏骨架屏, 显示真实卡片
         const skeleton = document.getElementById('dashboard-skeleton-loader');
         const card1 = document.getElementById('system-status-card');
         const card2 = document.getElementById('user-stats-card');
