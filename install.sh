@@ -5,12 +5,13 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V3.4 (Axiom V6.0 - Fix Nginx Syntax & Regex Logic)
+# V3.5 (Axiom V6.0 - Fix Sudoers Syntax & Xray Port Logic)
 #
 # [CHANGELOG]
-# - [FIX] 修复 Nginx 配置文件可能缺失闭合符号的问题。
-# - [FIX] 优化 Host 正则逻辑：如果白名单为空，默认允许所有 (.*)，避免正则报错。
-# - [FIX] 自动生成自签名 SSL 证书。
+# - [FIX] 移除 sudoers 中导致语法错误的 chown 规则。
+# - [FIX] 强制 Xray 配置文件生成时的端口默认值，防止 "missing port" 错误。
+# - [FIX] 更新 Xray WS 配置格式，消除 deprecated 警告。
+# - [FIX] 使用 Node.js 健壮生成 Nginx Regex。
 # ==========================================================
 
 # =============================
@@ -73,8 +74,8 @@ WSS_TEMPLATE="$REPO_ROOT/wss.service.template"
 PANEL_TEMPLATE="$REPO_ROOT/wss_panel.service.template"
 UDPGW_TEMPLATE="$REPO_ROOT/udpgw.service.template"
 UDP_CUSTOM_TEMPLATE="$REPO_ROOT/wss-udp-custom.service.template"
-XRAY_TEMPLATE="$REPO_ROOT/xray.service.template" # Xray 模板 (假设存在)
-NGINX_TEMPLATE="$REPO_ROOT/nginx.conf.template" # Nginx 模板 (假设存在)
+XRAY_TEMPLATE="$REPO_ROOT/xray.service.template" 
+NGINX_TEMPLATE="$REPO_ROOT/nginx.conf.template" 
 
 # 创建日志目录
 mkdir -p /etc/stunnel/certs
@@ -85,7 +86,7 @@ touch "$WSS_LOG_FILE"
 # 2. 交互式端口和用户配置
 # =============================
 echo "----------------------------------"
-echo "==== WSS 基础设施配置 (V3.4) ===="
+echo "==== WSS 基础设施配置 (V3.5) ===="
 echo "请确认或修改以下端口和服务用户设置 (回车以使用默认值)。"
 
 # 1. 端口/域名
@@ -133,14 +134,12 @@ panel_user=${panel_user:-admin}
 INTERNAL_API_PORT=54322 
 PANEL_API_URL="http://127.0.0.1:$PANEL_PORT/internal"
 PROXY_API_URL="http://127.0.0.1:$INTERNAL_API_PORT"
-WSS_HTTP_PORT=80 # Nginx 监听，但保留配置项
-WSS_TLS_PORT=443 # Nginx 监听，但保留配置项
+WSS_HTTP_PORT=80 # Nginx 监听
+WSS_TLS_PORT=443 # Nginx 监听
 
 echo "---------------------------------"
 echo "配置确认："
 echo "Nginx 域名: $NGINX_DOMAIN"
-echo "Nginx (80/443) -> Panel/Xray/WSS Proxy"
-echo "WSS Proxy (内部) -> $WSS_PROXY_PORT_INTERNAL"
 echo "Xray Core (内部) -> $XRAY_PORT_INTERNAL (API: $XRAY_API_PORT)"
 echo "Panel 用户: $panel_user"
 echo "---------------------------------"
@@ -173,7 +172,7 @@ echo "----------------------------------"
 echo "==== 3. 系统清理与依赖安装 ===="
 systemctl stop wss stunnel4 udpgw wss-udp-custom wss_panel sshd_stunnel nginx xray || true
 
-# 核心依赖安装 (新增 nginx, curl)
+# 核心依赖安装
 apt update -y
 if ! command -v node >/dev/null; then
     echo "正在安装 Node.js..."
@@ -260,7 +259,7 @@ echo "----------------------------------"
 
 
 # =============================
-# 4. 配置 Sudoers
+# 4. 配置 Sudoers (FIXED)
 # =============================
 echo "==== 配置 Sudoers ===="
 SUDOERS_FILE="/etc/sudoers.d/99-wss-panel"
@@ -276,7 +275,7 @@ CMD_JOURNALCTL=$(command -v journalctl)
 CMD_SYSTEMCTL=$(command -v systemctl)
 CMD_GETENT=$(command -v getent)
 CMD_SED=$(command -v sed)
-CMD_CERTBOT=$(command -v certbot || echo "/usr/bin/certbot") # Certbot/acme.sh 路径
+CMD_CERTBOT=$(command -v certbot || echo "/usr/bin/certbot") 
 
 tee "$SUDOERS_FILE" > /dev/null <<EOF
 $panel_user ALL=(ALL) NOPASSWD: $CMD_USERADD
@@ -307,12 +306,11 @@ $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active nginx
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active xray
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SED
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL daemon-reload
-# [V6.0 NEW] Certbot 和文件操作权限，用于证书申请和 Nginx 配置
 $panel_user ALL=(ALL) NOPASSWD: $CMD_CERTBOT
 $panel_user ALL=(ALL) NOPASSWD: /usr/bin/mkdir -p $NGINX_ROOT_CERTBOT
-$panel_user ALL=(ALL) NOPASSWD: /bin/chown -R $panel_user:$panel_user $XRAY_DIR
 $panel_user ALL=(ALL) NOPASSWD: /bin/rm -f /etc/nginx/sites-enabled/default
 EOF
+# [FIX] 移除了导致语法错误的 chown 规则，该操作由 install.sh 直接执行
 
 chmod 440 "$SUDOERS_FILE"
 echo "Sudoers 配置完成。"
@@ -360,7 +358,7 @@ if [ ! -f "$DB_PATH" ]; then echo "Database will be initialized on start."; fi
 [ ! -f "$PANEL_DIR/audit.log" ] && touch "$PANEL_DIR/audit.log"
 [ ! -f "$PANEL_DIR/hosts.json" ] && echo '[]' > "$PANEL_DIR/hosts.json"
 
-# [FIX] 部署 UDP Custom (使用 GitHub Raw 直链)
+# [FIX] 部署 UDP Custom
 echo "正在下载 UDP Custom 二进制文件..."
 if wget "https://raw.githubusercontent.com/http-custom/udp-custom/main/bin/udp-custom-linux-amd64" -O "$UDP_CUSTOM_BIN_PATH"; then
     chmod +x "$UDP_CUSTOM_BIN_PATH"
@@ -376,7 +374,7 @@ echo "----------------------------------"
 # 7. Xray 部署 (V6.0 NEW)
 # =============================
 echo "==== 部署 Xray Core ===="
-XRAY_VERSION="1.8.6" # 使用一个稳定版本
+XRAY_VERSION="1.8.6" 
 if [ ! -f "$XRAY_BIN_PATH" ]; then
     echo "正在下载 Xray Core $XRAY_VERSION..."
     XRAY_TEMP_FILE=$(mktemp)
@@ -388,10 +386,13 @@ if [ ! -f "$XRAY_BIN_PATH" ]; then
     echo "Xray Core $XRAY_VERSION 部署成功。"
 fi
 
-# 部署 Xray 配置文件 (使用预设模板，假设 VLESS+WS+TLS)
-if [ ! -f "$XRAY_CONFIG_PATH" ]; then
-    echo "正在生成 Xray 初始配置 ($XRAY_CONFIG_PATH)..."
-    tee "$XRAY_CONFIG_PATH" > /dev/null <<EOF
+# 部署 Xray 配置文件
+# [FIX] 强制确保端口变量已定义，防止 "missing port" 错误
+_XRAY_API_PORT=${XRAY_API_PORT:-10085}
+_XRAY_PORT_INTERNAL=${XRAY_PORT_INTERNAL:-10081}
+
+echo "正在生成 Xray 初始配置 ($XRAY_CONFIG_PATH)..."
+tee "$XRAY_CONFIG_PATH" > /dev/null <<EOF
 {
   "log": {
     "access": "/var/log/xray/access.log",
@@ -402,12 +403,12 @@ if [ ! -f "$XRAY_CONFIG_PATH" ]; then
     "tag": "api",
     "inboundTag": ["api"],
     "listen": "127.0.0.1",
-    "port": $XRAY_API_PORT,
+    "port": $_XRAY_API_PORT,
     "stats": true
   },
   "inbounds": [
     {
-      "port": $XRAY_PORT_INTERNAL,
+      "port": $_XRAY_PORT_INTERNAL,
       "listen": "127.0.0.1",
       "protocol": "vless",
       "settings": {
@@ -418,9 +419,7 @@ if [ ! -f "$XRAY_CONFIG_PATH" ]; then
         "network": "ws",
         "wsSettings": {
           "path": "$XRAY_WS_PATH",
-          "headers": {
-            "Host": "$NGINX_DOMAIN"
-          }
+          "host": "$NGINX_DOMAIN" 
         }
       },
       "sniffing": {
@@ -455,21 +454,31 @@ if [ ! -f "$XRAY_CONFIG_PATH" ]; then
   ]
 }
 EOF
-    chown "$panel_user:$panel_user" "$XRAY_CONFIG_PATH" # Panel 需要权限来修改用户列表
-fi
+# [FIX] 直接设置所有权，避免 Sudo 权限问题
+mkdir -p /var/log/xray
+chown "$panel_user:$panel_user" "$XRAY_CONFIG_PATH"
+chown -R "$panel_user:$panel_user" "$XRAY_DIR"
+chown -R "$panel_user:$panel_user" /var/log/xray
 
 # 部署 Xray Systemd 服务
-tee "$XRAY_SERVICE_PATH" > /dev/null <<EOF
+if [ -f "$XRAY_TEMPLATE" ]; then
+    cp "$XRAY_TEMPLATE" "$XRAY_SERVICE_PATH"
+else
+    # Fallback template generation inside install.sh if file missing
+    echo "Xray 模板文件未找到，使用内置默认模板..."
+    tee "$XRAY_SERVICE_PATH" > /dev/null <<EOF
 [Unit]
 Description=Xray Service (Axiom V6.0)
-After=network.target
+After=network.target nss-lookup.target
 Wants=network.target
 
 [Service]
 Type=simple
 User=root
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+LimitNOFILE=65536
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
 ExecStart=$XRAY_BIN_PATH run -c $XRAY_CONFIG_PATH
 Restart=on-failure
 RestartSec=3s
@@ -477,13 +486,15 @@ RestartSec=3s
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
+
 systemctl daemon-reload
 systemctl enable xray || true
 systemctl restart xray || true
 echo "----------------------------------"
 
 # =============================
-# 8. 安装 Stunnel4 (保持不变)
+# 8. 安装 Stunnel4
 # =============================
 echo "==== 重新安装 Stunnel4 ===="
 if ! getent group shell_users >/dev/null; then groupadd shell_users; fi
@@ -520,7 +531,7 @@ echo "----------------------------------"
 
 
 # =============================
-# 9. 安装 BadVPN UDPGW (保持不变)
+# 9. 安装 BadVPN UDPGW
 # =============================
 echo "==== 编译并部署 BadVPN UDPGW ===="
 if [ ! -d "$BADVPN_SRC_DIR" ]; then
@@ -601,11 +612,11 @@ systemctl restart wss-udp-custom
 echo "----------------------------------"
 
 # =============================
-# 11. Nginx Gateway 配置 (V6.0 NEW - Fixed SSL)
+# 11. Nginx Gateway 配置
 # =============================
 echo "==== 配置 Nginx 网关 ===="
 
-# 1. SSL 证书预检与自动生成 (CRITICAL FIX)
+# 1. SSL 证书预检与自动生成
 CERT_DIR="/etc/letsencrypt/live/$NGINX_DOMAIN"
 CERT_PATH="$CERT_DIR/fullchain.pem"
 KEY_PATH="$CERT_DIR/privkey.pem"
@@ -631,7 +642,7 @@ if [ ! -f "$NGINX_TEMPLATE" ]; then
 else
     cp "$NGINX_TEMPLATE" "$NGINX_CONF_PATH"
     
-    # [CRITICAL FIX] 使用 Node.js 安全生成 Regex，并设置默认值
+    # [FIX] 使用 Node.js 安全生成 Regex
     echo "正在生成 Nginx Host 匹配规则..."
     REGEX_GEN_SCRIPT=$(mktemp)
     cat > "$REGEX_GEN_SCRIPT" <<'NODEEOF'
@@ -639,7 +650,6 @@ const fs = require('fs');
 try {
     const data = fs.readFileSync(process.argv[2], 'utf8');
     const hosts = JSON.parse(data);
-    // [FIX] 如果列表为空，输出 ".*" 匹配所有 Host，作为默认允许行为。
     if (!Array.isArray(hosts) || hosts.length === 0) {
         console.log(".*"); 
     } else {
@@ -652,7 +662,7 @@ try {
     }
 } catch (e) {
     console.error("Error parsing hosts.json:", e.message);
-    console.log(".*"); // Fallback to allow all
+    console.log(".*"); // Fallback
 }
 NODEEOF
     
@@ -665,21 +675,18 @@ NODEEOF
     sed -i "s|@PANEL_PORT@|$PANEL_PORT|g" "$NGINX_CONF_PATH"
     sed -i "s|@XRAY_WSPATH@|$XRAY_WS_PATH|g" "$NGINX_CONF_PATH"
     sed -i "s|@WSS_WSPATH@|$WSS_WS_PATH|g" "$NGINX_CONF_PATH"
-    sed -i "s|@XRAY_PORT_INTERNAL@|$XRAY_PORT_INTERNAL|g" "$NGINX_CONF_PATH"
+    sed -i "s|@XRAY_PORT_INTERNAL@|$_XRAY_PORT_INTERNAL|g" "$NGINX_CONF_PATH"
     sed -i "s|@WSS_PROXY_PORT_INTERNAL@|$WSS_PROXY_PORT_INTERNAL|g" "$NGINX_CONF_PATH"
     sed -i "s|@PANEL_DIR@|$PANEL_DIR|g" "$NGINX_CONF_PATH"
     
-    # 替换证书路径
     sed -i "s|@CERT_PATH@|$CERT_PATH|g" "$NGINX_CONF_PATH"
     sed -i "s|@KEY_PATH@|$KEY_PATH|g" "$NGINX_CONF_PATH"
     
     sed -i "s|@HOST_WHITELIST_REGEX@|$HOSTS_REGEX|g" "$NGINX_CONF_PATH"
 
-    # 3. 启用站点并清理旧配置
     ln -sf "$NGINX_CONF_PATH" "$NGINX_CONF_SYMLINK"
     rm -f /etc/nginx/sites-enabled/default
 
-    # 4. 检查配置并重启 Nginx
     nginx -t || echo "警告: Nginx 配置测试失败，但将尝试重启。"
     systemctl restart nginx || true
 fi
@@ -688,48 +695,33 @@ echo "----------------------------------"
 
 
 # =============================
-# 12. IPTABLES & 全端口转发 (核心逻辑)
+# 12. IPTABLES & 全端口转发
 # =============================
 echo "==== 配置 IPTABLES (全端口 UDP 劫持 -> $UDP_CUSTOM_PORT) ===="
 BLOCK_CHAIN="WSS_IP_BLOCK"
 UDP_REDIR_CHAIN="WSS_UDP_REDIR" 
 
-# 1. 清理旧规则
 iptables -F $BLOCK_CHAIN 2>/dev/null || true
 iptables -X $BLOCK_CHAIN 2>/dev/null || true
 iptables -N $BLOCK_CHAIN 2>/dev/null || true
 iptables -I INPUT 1 -j $BLOCK_CHAIN 
 
-# 清理 NAT 表旧规则
 iptables -t nat -F $UDP_REDIR_CHAIN 2>/dev/null || true
 iptables -t nat -X $UDP_REDIR_CHAIN 2>/dev/null || true
 iptables -t nat -N $UDP_REDIR_CHAIN 2>/dev/null || true
 
-# 2. 注入 NAT 规则 (PREROUTING)
 iptables -t nat -D PREROUTING -p udp -j $UDP_REDIR_CHAIN 2>/dev/null || true
 iptables -t nat -I PREROUTING -p udp -j $UDP_REDIR_CHAIN
 
-# 3. [排除规则] 保护关键服务端口
-echo "  - 排除 BadVPN UDPGW ($UDPGW_PORT)"
 iptables -t nat -A $UDP_REDIR_CHAIN -p udp --dport $UDPGW_PORT -j RETURN
-
-echo "  - 排除 UDP Custom 自身 ($UDP_CUSTOM_PORT)"
 iptables -t nat -A $UDP_REDIR_CHAIN -p udp --dport $UDP_CUSTOM_PORT -j RETURN
-
-echo "  - 排除 DNS (53)"
 iptables -t nat -A $UDP_REDIR_CHAIN -p udp --dport 53 -j RETURN
-
-# 排除其他潜在的 UDP 监听端口 (TCP端口也排除以防协议误判)
-# [V6.0 FIX] 移除 80/443 的排除，因为 Nginx 负责 80/443 TCP。
 iptables -t nat -A $UDP_REDIR_CHAIN -p udp --dport $PANEL_PORT -j RETURN
 iptables -t nat -A $UDP_REDIR_CHAIN -p udp --dport 22 -j RETURN
 
-# 4. [核心] 实施重定向
 echo "  - 启用全端口劫持 (REDIRECT -> $UDP_CUSTOM_PORT)"
 iptables -t nat -A $UDP_REDIR_CHAIN -p udp -j REDIRECT --to-ports $UDP_CUSTOM_PORT
 
-# 5. 放行规则
-# [V6.0 FIX] 仅放行 Nginx (80/443) 和 Stunnel/UDP 网关
 iptables -I INPUT -p tcp --dport 80 -j ACCEPT
 iptables -I INPUT -p tcp --dport 443 -j ACCEPT
 iptables -I INPUT -p tcp --dport $STUNNEL_PORT -j ACCEPT
@@ -749,7 +741,7 @@ fi
 echo "----------------------------------"
 
 # =============================
-# 13. SSHD 配置 (保持不变)
+# 13. SSHD 配置
 # =============================
 SSHD_CONFIG="/etc/ssh/sshd_config"
 sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
@@ -809,9 +801,7 @@ systemctl restart sshd_stunnel
 systemctl restart stunnel4 udpgw wss_panel wss wss-udp-custom nginx xray
 
 echo "=================================================="
-echo "✅ 部署完成！(Axiom V6.0 - Xray/Nginx Multi-Protocol)"
-echo "   - Nginx 网关: 0.0.0.0:80/443 (已生成自签名证书)"
-echo "   - Web Panel: 0.0.0.0:$PANEL_PORT"
-echo "   - Xray Core: 127.0.0.1:$XRAY_PORT_INTERNAL (API: $XRAY_API_PORT)"
-echo "   - SSH WSS Proxy: 127.0.0.1:$WSS_PROXY_PORT_INTERNAL"
+echo "✅ 部署完成！(Axiom V6.0 - Final Fixes)"
+echo "   - Sudoers: 语法已修复"
+echo "   - Xray: 配置已重置并强制默认端口"
 echo "=================================================="
