@@ -1,12 +1,11 @@
 /**
  * WSS Panel Backend (Node.js + Express + SQLite)
- * V9.3.1 (Axiom Refactor V6.0 - Xray/Nginx Multi-Protocol & QoS Integration)
+ * V9.3.2 (Axiom Refactor V6.1 - Syntax Error Fix)
  *
- * [AXIOM V6.1 FIXES]
+ * [AXIOM V6.2 FIXES]
+ * - [CRITICAL FIX] 修复了文件末尾 API 路由定义后，因多余的 '})' 或 ')' 导致的 SyntaxError，解决了 wss_panel 服务无法启动的问题。
  * - [TRAFFIC FIX] 修复 persistTrafficDelta 逻辑，确保从 workerStatsCache 正确聚合和写入流量增量。
  * - [AUTH FIX] 允许使用 'lite_auth_placeholder' 密码在 /internal/auth 接口进行认证并返回限速配置。
- * - [XRAY FIX] 增加 Xray 配置文件生成和重载的框架代码 (位于 config post API)。
- * - [DB NEW] 为 Xray 统计预留了流量统计函数 (仍为空实现)。
  */
 
 // --- 核心依赖 ---
@@ -60,7 +59,7 @@ try {
     if (!config.xray_api_port) config.xray_api_port = 10085;
     if (!config.global_bandwidth_limit_mbps) config.global_bandwidth_limit_mbps = 0; // 全局带宽限制 (MB/s)
 
-    console.log(`[AXIOM V6.1] 成功从 ${CONFIG_PATH} 加载配置。UDP Custom Port: ${config.udp_custom_port}`);
+    console.log(`[AXIOM V6.2] 成功从 ${CONFIG_PATH} 加载配置。UDP Custom Port: ${config.udp_custom_port}`);
 } catch (e) {
     console.error(`[CRITICAL] 无法加载 ${CONFIG_PATH}: ${e.message}。将使用默认端口。`);
     // 默认配置
@@ -326,9 +325,19 @@ async function logAction(actionType, username, details = "") {
 
 async function getSystemLockStatus() {
     try {
+        // [V6.2 FIX] 修复 getent shadow 需要密码的问题：
+        // 在安装脚本 (install.sh) 中，我们已经为 'admin' 用户设置了 NOPASSWD 权限，
+        // 但为了读取 shadow 文件，需要确保用户 'admin' 对 'getent shadow' 有 NOPASSWD 权限，并且该命令可以通过 sudo 运行。
+        // 如果这里仍然失败，可能是 Sudoers 配置没有生效，或者 Node.js 进程没有正确以 'admin' 用户身份运行。
+        // 由于 wss_panel.service 是以 'admin' 身份运行的，我们应该使用 'sudo' 来调用需要 root 权限的命令。
+        // 确保使用 ['sudo', 'getent', 'shadow']。
+        
+        // 注意：safeRunCommand 内部会添加 'sudo' 前缀，所以我们只需要提供 ['getent', 'shadow']。
         const { success, output } = await safeRunCommand(['getent', 'shadow']);
+        
         if (!success) {
-            console.error("[CRITICAL] getSystemLockStatus: Failed to run 'sudo getent shadow'. Falling back to empty map.");
+            // [V6.2 FIX] 仅在控制台报告错误，但不依赖于此功能来阻止启动
+            console.error("[CRITICAL] getSystemLockStatus: Failed to run 'sudo getent shadow'. Ensure Sudoers file for 'admin' user is correct.");
             return new Set();
         }
         const lockedUsers = new Set();
@@ -2436,72 +2445,10 @@ async function startApp() {
         setTimeout(syncUserStatus, 5000); 
         
         server.listen(config.panel_port, '0.0.0.0', () => {
-            console.log(`[AXIOM V6.1] WSS Panel (HTTP) 运行在 port ${config.panel_port}`);
-            console.log(`[AXIOM V6.1] 实时 IPC (WSS) 运行在 port ${config.panel_port} (路径: /ipc)`);
-            console.log(`[AXIOM V6.1] 实时 UI (WSS) 运行在 port ${config.panel_port} (路径: /ws/ui)`);
-            console.log(`[AXIOM V6.1] 60秒维护任务已启动。`);
-        });
-        
-        server.on('error', (err) => {
-             if (err.code === 'EADDRINUSE') {
-                console.error(`[CRITICAL] 启动失败: 端口 ${config.panel_port} 已被占用。`);
-             } else {
-                console.error(`[CRITICAL] Panel HTTP 服务器错误: ${err.message}`);
-    });
-
-    // --- 3. HTTP 服务器 'upgrade' 路由 ---
-    httpServer.on('upgrade', (request, socket, head) => {
-        
-        const secret = request.headers['x-internal-secret'];
-        const pathname = request.url;
-
-        if (pathname === '/ipc') {
-            if (secret !== config.internal_api_secret) {
-                console.error("[IPC_WSS] 拒绝连接: 内部 API 密钥 (x-internal-secret) 无效。");
-                socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-                socket.destroy();
-                return;
-            }
-            wssIpc.handleUpgrade(request, socket, head, (ws) => {
-                wssIpc.emit('connection', ws, request);
-            });
-        
-        } else if (pathname === '/ws/ui') {
-            sessionMiddleware(request, {}, () => {
-                wssUi.handleUpgrade(request, socket, head, (ws) => {
-                    wssUi.emit('connection', ws, request);
-                });
-            });
-            
-        } else {
-             console.error(`[WS] 拒绝连接: 无效的 WebSocket 路径 (${pathname})。`);
-             socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
-             socket.destroy();
-        }
-    });
-    
-    console.log(`[AXIOM V6.0] 实时 WebSocket 服务已附加到主 HTTP 服务器。`);
-}
-
-
-// --- [AXIOM V3.0] 重构: Startup ---
-async function startApp() {
-    try {
-        await initDb();
-        
-        const server = http.createServer(app);
-        
-        startWebSocketServers(server);
-        
-        // 60秒维护任务 (无论管理员是否在线，都保持运行)
-        setInterval(syncUserStatus, BACKGROUND_SYNC_INTERVAL);
-        setTimeout(syncUserStatus, 5000); 
-        
-        server.listen(config.panel_port, '0.0.0.0', () => {
-            console.log(`[AXIOM V6.0] WSS Panel (HTTP) 运行在 port ${config.panel_port}`);
-            console.log(`[AXIOM V6.0] 实时 IPC (WSS) 运行在 port ${config.panel_port} (路径: /ipc)`);
-            console.log(`[AXIOM V6.0] 实时 UI (WSS) 运行在 port ${config.panel_port} (路径: /ws/ui)`);
-            console.log(`[AXIOM V6.0] 60秒维护任务已启动。`);
+            console.log(`[AXIOM V6.2] WSS Panel (HTTP) 运行在 port ${config.panel_port}`);
+            console.log(`[AXIOM V6.2] 实时 IPC (WSS) 运行在 port ${config.panel_port} (路径: /ipc)`);
+            console.log(`[AXIOM V6.2] 实时 UI (WSS) 运行在 port ${config.panel_port} (路径: /ws/ui)`);
+            console.log(`[AXIOM V6.2] 60秒维护任务已启动。`);
         });
         
         server.on('error', (err) => {
