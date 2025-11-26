@@ -1,0 +1,25 @@
+{
+  "domain": "example.com",
+  "panel_user": "admin",
+  "panel_port": 54321,
+  "wss_proxy_port": 10080,
+  "xray_port": 10081,
+  "stunnel_port": 444,
+  "udpgw_port": 7300,
+  "udp_custom_port": 7400,
+  "internal_forward_port": 22,
+  "internal_api_port": 54322,
+  "internal_api_secret": "change_me_on_install",
+  "panel_api_url": "http://127.0.0.1:54321/internal",
+  "proxy_api_url": "http://127.0.0.1:54322",
+  "features": {
+    "nginx_watchdog": true,
+    "xray_core": true,
+    "geoip_analysis": true,
+    "dynamic_qos": true
+  },
+  "qos": {
+    "global_limit_mbps": 500,
+    "congestion_threshold": 0.90
+  }
+}
