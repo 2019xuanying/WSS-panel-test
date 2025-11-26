@@ -1,65 +1,57 @@
 {
-    "log": {
-        "loglevel": "warning",
-        "access": "/var/log/xray/access.log",
-        "error": "/var/log/xray/error.log"
-    },
-    "api": {
-        "tag": "api",
-        "inboundTag": ["api"],
+// ==========================================================
+// Xray Core VLESS + WebSocket 配置模板 (NG Style)
+// 配置路径: /etc/wss-panel/xray_config.json
+// ==========================================================
+
+"log": {
+    "loglevel": "warning",
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log"
+},
+
+// Xray Inbound: 接收来自 Nginx 的 WebSocket 流量
+"inbounds": [
+    {
+        "port": @XRAY_INTERNAL_PORT@,
+        "protocol": "vless",
         "listen": "127.0.0.1",
-        "port": @XRAY_API_PORT@,
-        "stats": true
-    },
-    "inbounds": [
-        {
-            "port": @XRAY_INTERNAL_PORT@,
-            "protocol": "vless",
-            "listen": "127.0.0.1",
-            "settings": {
-                "clients": [
-                    {
-                        "id": "@XRAY_UUID@",
-                        "level": 0
-                    }
-                ],
-                "decryption": "none"
-            },
-            "streamSettings": {
-                "network": "ws",
-                "wsSettings": {
-                    "path": "@XRAY_WS_PATH@"
+        "settings": {
+            "clients": [
+                {
+                    "id": "@XRAY_UUID@",
+                    "level": 0
                 }
-            },
-            "sniffing": {
-                "enabled": true,
-                "destOverride": ["http", "tls"]
-            },
-            "tag": "vless_in"
-        }
-    ],
-    "outbounds": [
-        {
-            "protocol": "freedom",
-            "settings": {
-                "domainStrategy": "AsIs"
-            },
-            "tag": "direct"
+            ],
+            "decryption": "none"
         },
-        {
-            "protocol": "blackhole",
-            "tag": "blocked"
-        }
-    ],
-    "routing": {
-        "domainStrategy": "AsIs",
-        "rules": [
-            {
-                "type": "field",
-                "inboundTag": ["api"],
-                "outboundTag": "api"
+        "streamSettings": {
+            "network": "ws",
+            "wsSettings": {
+                // Xray 的 WebSocket 路径，与 Nginx 配置保持一致
+                "path": "/vless-ws" 
             }
-        ]
+        }
+    }
+],
+
+// Xray Outbound: 流量出口，freedom 表示直接出网
+"outbounds": [
+    {
+        "protocol": "freedom",
+        "settings": {},
+        "tag": "direct"
     },
-    "stats": {}
+    {
+        "protocol": "blackhole",
+        "tag": "blocked"
+    }
+],
+
+"routing": {
+    "domainStrategy": "AsIs",
+    "rules": []
+}
+
+
 }
