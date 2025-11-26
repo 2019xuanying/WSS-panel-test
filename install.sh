@@ -5,12 +5,13 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V3.7 (Axiom V6.0 - Fix Xray Log Permissions Final)
+# V3.8 (Axiom V6.0 - Fix Xray Deployment & Assets)
 #
 # [CHANGELOG]
+# - [FIX] 修复 Xray 部署逻辑：现在正确使用 xray.service.template 模板。
+# - [FIX] 修复 Xray 资源缺失：现在会安装 geoip.dat 和 geosite.dat。
 # - [FIX] 移除 Systemd LogsDirectory 指令，避免权限冲突。
 # - [FIX] 手动创建日志文件并赋予 666 权限 (rw-rw-rw-) 以确保绝对可写。
-# - [FIX] 简化 Xray 服务权限限制，确保其拥有必要的文件操作能力。
 # ==========================================================
 
 # =============================
@@ -87,7 +88,7 @@ touch "$WSS_LOG_FILE"
 # 2. 交互式端口和用户配置
 # =============================
 echo "----------------------------------"
-echo "==== WSS 基础设施配置 (V3.7) ===="
+echo "==== WSS 基础设施配置 (V3.8) ===="
 echo "请确认或修改以下端口和服务用户设置 (回车以使用默认值)。"
 
 # 1. 端口/域名
@@ -297,7 +298,6 @@ $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart nginx
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart xray
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL start nginx
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL stop nginx
-$panel_user ALL=(ALL) NOPASSWD: $CMD_GETENT
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active wss
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active stunnel4
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active udpgw
@@ -379,11 +379,19 @@ if [ ! -f "$XRAY_BIN_PATH" ]; then
     echo "正在下载 Xray Core $XRAY_VERSION..."
     XRAY_TEMP_FILE=$(mktemp)
     curl -L "https://github.com/XTLS/Xray-core/releases/download/v$XRAY_VERSION/Xray-linux-64.zip" -o "$XRAY_TEMP_FILE"
-    unzip -j "$XRAY_TEMP_FILE" "xray" -d /tmp/ > /dev/null
+    
+    # [FIX] 解压 binary 和 assets
+    echo "正在解压 Xray Core 和资源文件..."
+    unzip -j "$XRAY_TEMP_FILE" "xray" "geoip.dat" "geosite.dat" -d /tmp/ > /dev/null
+    
     mv /tmp/xray "$XRAY_BIN_PATH"
+    # [FIX] 安装 GeoIP/GeoSite 资源到 /usr/local/bin (Xray 默认查找路径之一)
+    mv /tmp/geoip.dat /usr/local/bin/
+    mv /tmp/geosite.dat /usr/local/bin/
+    
     chmod +x "$XRAY_BIN_PATH"
     rm "$XRAY_TEMP_FILE"
-    echo "Xray Core $XRAY_VERSION 部署成功。"
+    echo "Xray Core $XRAY_VERSION 部署成功 (含资源文件)。"
 fi
 
 # 部署 Xray 配置文件
@@ -470,30 +478,31 @@ chown "$panel_user:$panel_user" "$XRAY_CONFIG_PATH"
 chown -R "$panel_user:$panel_user" "$XRAY_DIR"
 
 # 部署 Xray Systemd 服务
-# [FIX] 移除 LogsDirectory 指令，避免 systemd 覆盖我们设置的权限
+# [FIX] 修复: 正确使用 xray.service.template，而不是内联生成
 echo "部署 Xray 服务文件..."
-tee "$XRAY_SERVICE_PATH" > /dev/null <<EOF
+if [ ! -f "$XRAY_TEMPLATE" ]; then
+    echo "严重错误: 找不到 xray.service.template ($XRAY_TEMPLATE)。"
+    # Fallback (仅当模板丢失时使用内联生成)
+    tee "$XRAY_SERVICE_PATH" > /dev/null <<EOF
 [Unit]
-Description=Xray Service (Axiom V6.0)
-Documentation=https://github.com/xtls
+Description=Xray Service (Fallback)
 After=network.target nss-lookup.target
-Wants=network.target
-
 [Service]
 Type=simple
 User=root
-LimitNOFILE=65536
-# 简化 Capability 限制，确保没有过度限制
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
-NoNewPrivileges=true
 ExecStart=$XRAY_BIN_PATH run -c $XRAY_CONFIG_PATH
 Restart=on-failure
-RestartSec=3s
-
 [Install]
 WantedBy=multi-user.target
 EOF
+else
+    # 正常流程: 复制模板并替换变量
+    cp "$XRAY_TEMPLATE" "$XRAY_SERVICE_PATH"
+    # 替换模板中的路径变量 (如果有) - 模板中硬编码了 /usr/local/bin/xray，这里以防万一做个替换
+    sed -i "s|/usr/local/bin/xray|$XRAY_BIN_PATH|g" "$XRAY_SERVICE_PATH"
+    # 模板中硬编码了 /etc/xray/config.json，这里也做个替换
+    sed -i "s|/etc/xray/config.json|$XRAY_CONFIG_PATH|g" "$XRAY_SERVICE_PATH"
+fi
 
 systemctl daemon-reload
 systemctl enable xray || true
