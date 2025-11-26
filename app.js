@@ -7,6 +7,10 @@
  * - [UI NEW] 活跃 IP 列表集成 GeoIP 数据 (国家/城市/ISP)。
  * - [FIX] 更新 CORE_SERVICES_MAP，加入 'nginx' 和 'xray'。
  * - [FIX] 统一端口配置逻辑，适配内部端口。
+ * * [BUG FIXES V9.3.0]
+ * - [FIX 1] 修复新增用户时的 ReferenceError: quota_gb is not defined。
+ * - [FIX 2] 修复 fetchGlobalConfig 中由于 DOM 元素缺失或未加载导致的 TypeError。
+ * - [FIX 3] 修复 generateXrayLinkForModal 中由于 FLASK_CONFIG 未完全加载导致的链接生成失败。
  */
 
 // --- 全局配置 (将由 initializeApp 异步填充) ---
@@ -660,7 +664,6 @@ function renderUserList(users) {
                 
                 <td class="px-6 py-4 whitespace-nowrap text-sm font-medium ${xrayColor}" role="cell">${xrayProtocol}</td> <!-- [V6.0 NEW] -->
                 
-                <!-- [AXIOM V3.1] 新增 ID -->
                 <td id="conn-cell-${user.username}" class="px-6 py-4 whitespace-nowrap text-sm font-medium text-primary" role="cell">${activeConnections}</td>
                 
                 <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-base-content" role="cell">${formatConnections(maxConnections)}</td>
@@ -1035,9 +1038,12 @@ async function saveHosts() {
 async function fetchGlobalSettings() {
      const data = await fetchData('/settings/global');
      if (data && data.settings) {
-        document.getElementById('global-fuse-threshold').value = data.settings.fuse_threshold_kbps || 0;
+        // 检查元素是否存在，防止 TypeError
+        const fuseEl = document.getElementById('global-fuse-threshold');
+        const bandEl = document.getElementById('global-bandwidth-limit');
+        if (fuseEl) fuseEl.value = data.settings.fuse_threshold_kbps || 0;
         // [V6.0 NEW] 全局带宽限制
-        document.getElementById('global-bandwidth-limit').value = data.settings.global_bandwidth_limit_mbps || 0;
+        if (bandEl) bandEl.value = data.settings.global_bandwidth_limit_mbps || 0;
      }
 }
 
@@ -1065,28 +1071,38 @@ async function saveGlobalSettings() {
 }
 
 /**
- * [V6.0 FIX] 读取所有配置项
+ * [V6.0 FIX / BUGFIX 2] 读取所有配置项
  */
 async function fetchGlobalConfig() {
      const data = await fetchData('/settings/config');
      if (data && data.config) {
-        document.getElementById('config-panel-port').value = data.config.panel_port;
-        // 80/443 现在是 Nginx 端口，无需在此处修改
-        
-        document.getElementById('config-stunnel-port').value = data.config.stunnel_port;
-        document.getElementById('config-udpgw-port').value = data.config.udpgw_port;
-        document.getElementById('config-udp-custom-port').value = data.config.udp_custom_port || 7400;
-        document.getElementById('config-internal-forward-port').value = data.config.internal_forward_port;
-        document.getElementById('config-internal-api-port').value = data.config.internal_api_port;
+        // [BUGFIX 2] 增强对 DOM 元素的检查，防止 TypeError
+        const setVal = (id, value) => {
+            const el = document.getElementById(id);
+            if (el) el.value = value;
+            else console.warn(`[Config Load] Element not found: ${id}`);
+        };
+        const setChecked = (id, value) => {
+             const el = document.getElementById(id);
+             if (el) el.checked = (value === 1);
+             else console.warn(`[Config Load] Element not found: ${id}`);
+        };
+
+        setVal('config-panel-port', data.config.panel_port);
+        setVal('config-stunnel-port', data.config.stunnel_port);
+        setVal('config-udpgw-port', data.config.udpgw_port);
+        setVal('config-udp-custom-port', data.config.udp_custom_port || 7400);
+        // 此处是导致 TypeError 的位置之一。在 index.html 中确认此 ID 的元素存在。
+        setVal('config-internal-forward-port', data.config.internal_forward_port); 
 
         // [V6.0 NEW] Nginx/Xray 配置
-        document.getElementById('config-nginx-domain').value = data.config.nginx_domain || '';
-        document.getElementById('config-nginx-enable').checked = (data.config.nginx_enable === 1);
-        document.getElementById('config-wss-ws-path').value = data.config.wss_ws_path || '/ssh-ws';
-        document.getElementById('config-xray-ws-path').value = data.config.xray_ws_path || '/vless-ws';
-        document.getElementById('config-wss-proxy-port-internal').value = data.config.wss_proxy_port_internal || 10080;
-        document.getElementById('config-xray-port-internal').value = data.config.xray_port_internal || 10081;
-        document.getElementById('config-xray-api-port').value = data.config.xray_api_port || 10085;
+        setVal('config-nginx-domain', data.config.nginx_domain || '');
+        setChecked('config-nginx-enable', data.config.nginx_enable);
+        setVal('config-wss-ws-path', data.config.wss_ws_path || '/ssh-ws');
+        setVal('config-xray-ws-path', data.config.xray_ws_path || '/vless-ws');
+        setVal('config-wss-proxy-port-internal', data.config.wss_proxy_port_internal || 10080);
+        setVal('config-xray-port-internal', data.config.xray_port_internal || 10081);
+        setVal('config-xray-api-port', data.config.xray_api_port || 10085);
      }
 }
 
@@ -1608,7 +1624,7 @@ function generateBase64Token(username, password) {
 }
 
 /**
- * [V6.0 NEW] Xray 链接生成器
+ * [V6.0 NEW / BUGFIX 1] Xray 链接生成器
  * @param {string} protocol - vmess/vless/trojan
  * @param {string} uuid - 用户UUID
  * @param {string} wsPath - 路径
@@ -1624,6 +1640,11 @@ function generateXrayLink(protocol, uuid, wsPath, domain) {
     let link = "";
 
     try {
+        // [BUGFIX 1] 确保 UUID 是有效的字符串，否则 Xray 链接会失败
+        if (uuid === 'N/A' || uuid.length < 16) {
+             return "UUID 无效或未生成。";
+        }
+        
         if (protocol === 'vless') {
             const VLESS_CONFIG = {
                 v: "0",
@@ -1639,8 +1660,6 @@ function generateXrayLink(protocol, uuid, wsPath, domain) {
                 tls: "tls",
                 sni: domain
             };
-            const jsonString = JSON.stringify(VLESS_CONFIG);
-            // VLESS 链接是 vless://UUID@DOMAIN:PORT?params
             const params = `security=tls&type=ws&host=${domain}&path=${encodeURIComponent(wsPath)}&sni=${domain}`;
             link = `vless://${uuid}@${domain}:${port}?${params}#${VLESS_CONFIG.ps}`;
             
@@ -1660,7 +1679,6 @@ function generateXrayLink(protocol, uuid, wsPath, domain) {
                 sni: domain
             };
             const jsonString = JSON.stringify(VMESS_CONFIG);
-            // VMess 链接是 base64(json)
             link = `vmess://${btoa(jsonString)}`;
         } else {
              return `不支持的协议: ${protocol}`;
@@ -1679,7 +1697,8 @@ document.getElementById('add-user-form').addEventListener('submit', async (e) =>
     const username = document.getElementById('new-username').value;
     const password = document.getElementById('new-password').value;
     const expirationDays = document.getElementById('expiration-days').value;
-    const quotaGb = document.getElementById('quota-gb').value;
+    // [BUGFIX 1] 修复 ReferenceError: quota_gb is not defined
+    const quotaGb = document.getElementById('quota-gb').value; 
     const rateKbps = document.getElementById('rate-kbps').value;
     const maxConnections = document.getElementById('new-max-connections').value;
     const requireAuth = document.getElementById('new-require-auth').checked; 
@@ -1700,7 +1719,7 @@ document.getElementById('add-user-form').addEventListener('submit', async (e) =>
             username: username, 
             password: password, 
             expiration_days: parseInt(expirationDays),
-            quota_gb: parseFloat(quota_gb), 
+            quota_gb: parseFloat(quotaGb), // 使用正确定义的 quotaGb
             rate_kbps: parseInt(rateKbps),
             max_connections: parseInt(maxConnections),
             require_auth_header: requireAuth ? 1 : 0,
@@ -1721,7 +1740,7 @@ document.getElementById('add-user-form').addEventListener('submit', async (e) =>
 });
 
 /**
- * [V6.0 FIX] 增加 UUID 和 Protocol 字段
+ * [V6.0 FIX / BUGFIX 3] 增加 UUID 和 Protocol 字段
  */
 async function openSettingsModal(username, expiry_date, quota_gb, rate_kbps, max_connections, fuse_threshold_kbps, require_auth_header, allow_shell, uuid, xray_protocol) {
     document.getElementById('modal-username-title-settings').textContent = username;
@@ -1741,8 +1760,17 @@ async function openSettingsModal(username, expiry_date, quota_gb, rate_kbps, max
     document.getElementById('modal-xray-protocol').value = xray_protocol || 'none';
     document.getElementById('modal-xray-link-output').value = '点击 [生成连接链接]...';
     
-    // 初始化连接信息显示
-    generateXrayLinkForModal(uuid, xray_protocol);
+    // [BUGFIX 3] 初始化连接信息显示，确保 FLASK_CONFIG 已加载
+    if (FLASK_CONFIG.NGINX_DOMAIN && FLASK_CONFIG.NGINX_DOMAIN !== '...') {
+        generateXrayLinkForModal(uuid, xray_protocol);
+    } else {
+        // 如果 FLASK_CONFIG 尚未加载，则延迟执行，直到 fetchAllStaticData 完成
+        // 由于 fetchAllStaticData 是在 connectWebSocket 成功后立即异步执行的，
+        // 且 openSettingsModal 可以在任何时候被调用，此处需要做延迟处理或依赖用户点击生成按钮。
+        // 为确保用户体验，我们依赖用户点击“生成链接”按钮，或等待下次实时推送加载配置。
+        document.getElementById('modal-xray-link-output').value = '配置加载中，请稍后点击 [生成链接]...';
+    }
+
 
     openModal('settings-modal');
 }
@@ -1767,10 +1795,11 @@ document.getElementById('modal-xray-protocol').addEventListener('change', functi
 
 function generateXrayLinkForModal(uuid, protocol) {
     const linkOutput = document.getElementById('modal-xray-link-output');
+    // 确保 FLASK_CONFIG 已经加载完毕
     const domain = FLASK_CONFIG.NGINX_DOMAIN;
     const wsPath = FLASK_CONFIG.XRAY_WS_PATH;
     
-    if (protocol === 'none' || uuid === 'N/A' || !domain || !wsPath) {
+    if (protocol === 'none' || uuid === 'N/A' || !domain || !wsPath || domain === '...') {
         linkOutput.value = "请在配置中检查域名/路径，并选择协议。";
         return;
     }
