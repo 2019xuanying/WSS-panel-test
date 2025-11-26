@@ -5,14 +5,12 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V3.9 (Axiom V6.1 - Fix Xray Dependencies & Service Fallback)
+# V3.9 (Axiom V7.0 - Revert Xray Deployment to NG Simple Style)
 #
 # [CHANGELOG]
-# - [FIX] 添加 'unzip' 到依赖列表，防止 Xray 资源解压失败。
-# - [FIX] 更新内联 Xray 服务 Fallback，确保包含 Environment 变量。
-# - [FIX] 强化日志目录权限设置。
-# - [FIX] 修复 Sudoers 匹配问题 (放宽 systemctl 权限)。
-# - [FIX] 修复 Xray 端口变量可能为空导致的 "missing port" 错误。
+# - [REVERT] Xray 部署路径改为 /etc/wss-panel。
+# - [REVERT] 移除 GeoIP/GeoSite 资产下载。
+# - [REVERT] 简化 Xray 配置文件生成逻辑。
 # ==========================================================
 
 # =============================
@@ -23,16 +21,17 @@ REPO_ROOT=$(dirname "$0")
 # 核心目录
 PANEL_DIR="/etc/wss-panel"
 UDP_CUSTOM_DIR="$PANEL_DIR/udp-custom"
-XRAY_DIR="/etc/xray" # Xray 配置目录
+XRAY_DIR="/etc/xray" # 保留此变量以清除旧的 Test 风格配置
+XRAY_NG_CONFIG_DIR="$PANEL_DIR" # NG 风格 Xray 配置目录
 mkdir -p "$PANEL_DIR" 
 mkdir -p "$UDP_CUSTOM_DIR"
-mkdir -p "$XRAY_DIR"
+# 不再强制创建 /etc/xray 目录
 
 # 日志与配置
 WSS_LOG_FILE="/var/log/wss.log" 
 CONFIG_PATH="$PANEL_DIR/config.json"
 UDP_CUSTOM_CONFIG_PATH="$UDP_CUSTOM_DIR/config.json"
-XRAY_CONFIG_PATH="$XRAY_DIR/config.json"
+XRAY_CONFIG_PATH="$XRAY_NG_CONFIG_DIR/xray_config.json" # <--- Xray 配置文件新路径
 ROOT_HASH_FILE="$PANEL_DIR/root_hash.txt"
 SECRET_KEY_FILE="$PANEL_DIR/secret_key.txt"
 INTERNAL_SECRET_PATH="$PANEL_DIR/internal_secret.txt" 
@@ -77,6 +76,7 @@ UDPGW_TEMPLATE="$REPO_ROOT/udpgw.service.template"
 UDP_CUSTOM_TEMPLATE="$REPO_ROOT/wss-udp-custom.service.template"
 XRAY_TEMPLATE="$REPO_ROOT/xray.service.template" 
 NGINX_TEMPLATE="$REPO_ROOT/nginx.conf.template" 
+XRAY_CONFIG_TEMPLATE="$REPO_ROOT/xray_config.json.template" # <--- NG 风格 Xray 模板
 
 # 创建日志目录
 mkdir -p /etc/stunnel/certs
@@ -183,8 +183,7 @@ if ! command -v node >/dev/null; then
     apt install -y nodejs
 fi
 
-# [FIX] 添加 unzip 依赖
-apt install -y wget curl git net-tools cmake build-essential openssl stunnel4 iproute2 iptables procps libsqlite3-dev passwd sudo nginx unzip || echo "警告: 依赖安装失败。"
+apt install -y wget curl git net-tools cmake build-essential openssl stunnel4 iproute2 iptables procps libsqlite3-dev passwd sudo nginx || echo "警告: 依赖安装失败。"
 
 if ! id -u "$panel_user" >/dev/null 2>&1; then
     adduser --system --no-create-home "$panel_user"
@@ -218,6 +217,7 @@ chmod 600 "$ROOT_HASH_FILE" "$SECRET_KEY_FILE" "$INTERNAL_SECRET_PATH"
 
 # 生成主配置文件 (config.json)
 echo "正在创建 config.json..."
+XRAY_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)
 tee "$CONFIG_PATH" > /dev/null <<EOF
 {
   "panel_user": "$panel_user",
@@ -239,7 +239,9 @@ tee "$CONFIG_PATH" > /dev/null <<EOF
   "wss_proxy_port_internal": $WSS_PROXY_PORT_INTERNAL,
   "xray_port_internal": $XRAY_PORT_INTERNAL,
   "xray_api_port": $XRAY_API_PORT,
-  "global_bandwidth_limit_mbps": 0
+  "global_bandwidth_limit_mbps": 0,
+  "xray_uuid": "$XRAY_UUID",
+  "sshd_stunnel_port": $SSHD_STUNNEL_PORT
 }
 EOF
 chmod 600 "$CONFIG_PATH"
@@ -281,9 +283,6 @@ CMD_GETENT=$(command -v getent)
 CMD_SED=$(command -v sed)
 CMD_CERTBOT=$(command -v certbot || echo "/usr/bin/certbot") 
 
-# [AXIOM FIX] 放宽 systemctl 权限
-# 之前的限制太严格 (例如限制了参数)，导致如果路径或参数有微小差异，sudo 就会拒绝执行并要求密码。
-# 为了稳定性，允许面板用户执行任意 systemctl 命令。
 tee "$SUDOERS_FILE" > /dev/null <<EOF
 $panel_user ALL=(ALL) NOPASSWD: $CMD_USERADD
 $panel_user ALL=(ALL) NOPASSWD: $CMD_USERMOD
@@ -294,9 +293,22 @@ $panel_user ALL=(ALL) NOPASSWD: $CMD_PKILL
 $panel_user ALL=(ALL) NOPASSWD: $CMD_IPTABLES
 $panel_user ALL=(ALL) NOPASSWD: $CMD_IPTABLES_SAVE
 $panel_user ALL=(ALL) NOPASSWD: $CMD_JOURNALCTL
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL
-$panel_user ALL=(ALL) NOPASSWD: /bin/systemctl
-$panel_user ALL=(ALL) NOPASSWD: /usr/bin/systemctl
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart wss
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart stunnel4
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart udpgw
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart wss_panel
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart wss-udp-custom
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart nginx
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart xray
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL start nginx
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL stop nginx
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active wss
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active stunnel4
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active udpgw
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active wss_panel
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active wss-udp-custom
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active nginx
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active xray
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SED
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL daemon-reload
 $panel_user ALL=(ALL) NOPASSWD: $CMD_CERTBOT
@@ -363,151 +375,61 @@ fi
 echo "----------------------------------"
 
 # =============================
-# 7. Xray 部署 (V6.0 NEW)
+# 7. Xray 部署 (回退到 NG 风格)
 # =============================
-echo "==== 部署 Xray Core ===="
+echo "==== 部署 Xray Core (NG 风格) ===="
 XRAY_VERSION="1.8.6" 
 if [ ! -f "$XRAY_BIN_PATH" ]; then
     echo "正在下载 Xray Core $XRAY_VERSION..."
     XRAY_TEMP_FILE=$(mktemp)
+    # [REVERT] 仅下载核心二进制文件，不下载 Geo 资源
     curl -L "https://github.com/XTLS/Xray-core/releases/download/v$XRAY_VERSION/Xray-linux-64.zip" -o "$XRAY_TEMP_FILE"
     
-    # [FIX] 解压 binary 和 assets
-    # 确保 unzip 已安装
-    echo "正在解压 Xray Core 和资源文件..."
-    unzip -j "$XRAY_TEMP_FILE" "xray" "geoip.dat" "geosite.dat" -d /tmp/ > /dev/null
+    echo "正在解压 Xray Core..."
+    unzip -j "$XRAY_TEMP_FILE" "xray" -d /tmp/ > /dev/null
     
     mv /tmp/xray "$XRAY_BIN_PATH"
-    # [FIX] 安装 GeoIP/GeoSite 资源到 /usr/local/bin (Xray 默认查找路径之一)
-    mv /tmp/geoip.dat /usr/local/bin/
-    mv /tmp/geosite.dat /usr/local/bin/
     
     chmod +x "$XRAY_BIN_PATH"
     rm "$XRAY_TEMP_FILE"
-    echo "Xray Core $XRAY_VERSION 部署成功 (含资源文件)。"
+    # [REVERT] 移除 GeoIP/GeoSite 资源的移动和权限设置
+    echo "Xray Core $XRAY_VERSION 部署成功 (无 Geo 资源)。"
 fi
 
-# 部署 Xray 配置文件
-# [FIX] 强制确保端口变量已定义并清洗非数字字符
-_XRAY_API_PORT=$(echo "${XRAY_API_PORT:-10085}" | tr -cd '0-9')
-_XRAY_PORT_INTERNAL=$(echo "${XRAY_PORT_INTERNAL:-10081}" | tr -cd '0-9')
-
-# 再次检查是否为空，如果为空则赋予默认值
-[ -z "$_XRAY_API_PORT" ] && _XRAY_API_PORT=10085
-[ -z "$_XRAY_PORT_INTERNAL" ] && _XRAY_PORT_INTERNAL=10081
+# 部署 Xray 配置文件 (NG 风格: /etc/wss-panel)
+# [REVERT] 使用 NG 风格模板并替换变量
+_XRAY_PORT_INTERNAL=${XRAY_PORT_INTERNAL:-10081}
+_XRAY_UUID=${XRAY_UUID}
 
 echo "正在生成 Xray 初始配置 ($XRAY_CONFIG_PATH)..."
-tee "$XRAY_CONFIG_PATH" > /dev/null <<EOF
-{
-  "log": {
-    "access": "/var/log/xray/access.log",
-    "error": "/var/log/xray/error.log",
-    "loglevel": "warning"
-  },
-  "api": {
-    "tag": "api",
-    "inboundTag": ["api"],
-    "listen": "127.0.0.1",
-    "port": $_XRAY_API_PORT,
-    "stats": true
-  },
-  "inbounds": [
-    {
-      "port": $_XRAY_PORT_INTERNAL,
-      "listen": "127.0.0.1",
-      "protocol": "vless",
-      "settings": {
-        "clients": [],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "ws",
-        "wsSettings": {
-          "path": "$XRAY_WS_PATH",
-          "host": "$NGINX_DOMAIN" 
-        }
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls"]
-      },
-      "tag": "vless_in"
-    },
-    {
-      "listen": "127.0.0.1",
-      "port": 62078,
-      "protocol": "dokodemo-door",
-      "settings": {
-        "address": "127.0.0.1",
-        "port": 22,
-        "network": "tcp"
-      },
-      "tag": "ssh_out"
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom",
-      "settings": {},
-      "tag": "direct"
-    },
-    {
-      "protocol": "blackhole",
-      "settings": {},
-      "tag": "blocked"
-    }
-  ]
-}
-EOF
+cp "$XRAY_CONFIG_TEMPLATE" "$XRAY_CONFIG_PATH"
 
-# [CRITICAL FIX] 预先创建 Xray 日志目录并赋予最高权限
-# 这是一个暴力修复，确保无论 systemd 如何降权，文件都是可写的
+sed -i "s|@XRAY_INTERNAL_PORT@|$_XRAY_PORT_INTERNAL|g" "$XRAY_CONFIG_PATH"
+# [REVERT] 移除 @INTERNAL_FORWARD_PORT@ 替换，NG 模板中没有此变量
+sed -i "s|@XRAY_UUID@|$_XRAY_UUID|g" "$XRAY_CONFIG_PATH"
+
+
+# [CRITICAL FIX] 预先创建 Xray 日志目录并赋予权限
 mkdir -p /var/log/xray
 touch /var/log/xray/access.log
 touch /var/log/xray/error.log
-# 赋予全局读写权限 (666)，这是解决 "permission denied" 的最快方法
 chmod -R 777 /var/log/xray 
-# 同时确保所有者为 root (Xray user)
 chown -R root:root /var/log/xray
 
 # Panel 需要读取配置，保留配置目录权限
 chown "$panel_user:$panel_user" "$XRAY_CONFIG_PATH"
-chown -R "$panel_user:$panel_user" "$XRAY_DIR"
 
 # 部署 Xray Systemd 服务
+# [REVERT] 使用 NG 风格模板，指向 /etc/wss-panel/xray_config.json
 echo "部署 Xray 服务文件..."
 if [ ! -f "$XRAY_TEMPLATE" ]; then
-    echo "警告: 找不到 xray.service.template。将使用内联 Fallback 生成。"
-    # [FIX] 更新 Fallback 以匹配最新模板 (包含 Environment 和 WorkingDirectory)
-    tee "$XRAY_SERVICE_PATH" > /dev/null <<EOF
-[Unit]
-Description=Xray Service (Fallback)
-Documentation=https://github.com/xtls
-After=network.target nss-lookup.target
-Wants=network.target
-
-[Service]
-Type=simple
-User=root
-# 必须指定资源路径，防止 Xray 找不到 geoip.dat
-Environment="XRAY_LOCATION_ASSET=/usr/local/bin/"
-WorkingDirectory=/usr/local/bin/
-LimitNOFILE=65536
-ExecStart=$XRAY_BIN_PATH run -c $XRAY_CONFIG_PATH
-Restart=on-failure
-RestartSec=3s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-else
-    # 正常流程: 复制模板并替换变量
-    cp "$XRAY_TEMPLATE" "$XRAY_SERVICE_PATH"
-    # 替换模板中的路径变量 (如果有) - 模板中硬编码了 /usr/local/bin/xray，这里以防万一做个替换
-    sed -i "s|/usr/local/bin/xray|$XRAY_BIN_PATH|g" "$XRAY_SERVICE_PATH"
-    # 模板中硬编码了 /etc/xray/config.json，这里也做个替换
-    sed -i "s|/etc/xray/config.json|$XRAY_CONFIG_PATH|g" "$XRAY_SERVICE_PATH"
+    echo "严重错误: 找不到 xray.service.template ($XRAY_TEMPLATE)。"
+    exit 1
 fi
+
+cp "$XRAY_TEMPLATE" "$XRAY_SERVICE_PATH"
+# Xray 模板中已经包含了正确的路径 /usr/local/bin/xray 和 /etc/wss-panel/xray_config.json
+# 无需 sed 替换，除非模板变量名发生变化。这里使用 NG 模板，默认是正确的。
 
 systemctl daemon-reload
 systemctl enable xray || true
@@ -524,7 +446,7 @@ openssl req -x509 -nodes -newkey rsa:2048 \
 -keyout /etc/stunnel/certs/stunnel.key \
 -out /etc/stunnel/certs/stunnel.crt \
 -days 1095 \
--subj "/CN=example.com" > /dev/null 2>&1
+-subj "/CN=$NGINX_DOMAIN" > /dev/null 2>&1
 cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem
 chmod 600 /etc/stunnel/certs/*.key
 chmod 600 /etc/stunnel/certs/*.pem
@@ -696,7 +618,7 @@ NODEEOF
     sed -i "s|@PANEL_PORT@|$PANEL_PORT|g" "$NGINX_CONF_PATH"
     sed -i "s|@XRAY_WSPATH@|$XRAY_WS_PATH|g" "$NGINX_CONF_PATH"
     sed -i "s|@WSS_WSPATH@|$WSS_WS_PATH|g" "$NGINX_CONF_PATH"
-    sed -i "s|@XRAY_PORT_INTERNAL@|$_XRAY_PORT_INTERNAL|g" "$NGINX_CONF_PATH"
+    sed -i "s|@XRAY_PORT_INTERNAL@|$XRAY_PORT_INTERNAL|g" "$NGINX_CONF_PATH"
     sed -i "s|@WSS_PROXY_PORT_INTERNAL@|$WSS_PROXY_PORT_INTERNAL|g" "$NGINX_CONF_PATH"
     sed -i "s|@PANEL_DIR@|$PANEL_DIR|g" "$NGINX_CONF_PATH"
     
@@ -822,6 +744,7 @@ systemctl restart sshd_stunnel
 systemctl restart stunnel4 udpgw wss_panel wss wss-udp-custom nginx xray
 
 echo "=================================================="
-echo "✅ 部署完成！(Axiom V6.1 - Xray Dependencies Fixed)"
-echo "   - 请确保执行 'bash install.sh' 以应用更改。"
+echo "✅ 部署完成！(NG Style - Xray Simplified)"
+echo "Web Panel: http://[YOUR_IP]:$PANEL_PORT"
+echo "Xray UUID: $XRAY_UUID"
 echo "=================================================="
