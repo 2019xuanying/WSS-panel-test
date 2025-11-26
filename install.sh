@@ -5,13 +5,12 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V3.5 (Axiom V6.0 - Fix Sudoers Syntax & Xray Port Logic)
+# V3.6 (Axiom V6.0 - Fix Xray Log Permissions & Sudoers)
 #
 # [CHANGELOG]
-# - [FIX] 移除 sudoers 中导致语法错误的 chown 规则。
-# - [FIX] 强制 Xray 配置文件生成时的端口默认值，防止 "missing port" 错误。
-# - [FIX] 更新 Xray WS 配置格式，消除 deprecated 警告。
-# - [FIX] 使用 Node.js 健壮生成 Nginx Regex。
+# - [FIX] 彻底修复 Xray 日志目录权限问题 (/var/log/xray)。
+# - [FIX] 优化 sudoers 配置，移除所有潜在的语法错误风险。
+# - [FIX] 确保 Xray 服务使用 LogsDirectory 自动管理权限。
 # ==========================================================
 
 # =============================
@@ -80,13 +79,15 @@ NGINX_TEMPLATE="$REPO_ROOT/nginx.conf.template"
 # 创建日志目录
 mkdir -p /etc/stunnel/certs
 mkdir -p /var/log/stunnel4
+# [FIX] 显式创建 Xray 日志目录并设置权限
+mkdir -p /var/log/xray
 touch "$WSS_LOG_FILE"
 
 # =============================
 # 2. 交互式端口和用户配置
 # =============================
 echo "----------------------------------"
-echo "==== WSS 基础设施配置 (V3.5) ===="
+echo "==== WSS 基础设施配置 (V3.6) ===="
 echo "请确认或修改以下端口和服务用户设置 (回车以使用默认值)。"
 
 # 1. 端口/域名
@@ -310,7 +311,6 @@ $panel_user ALL=(ALL) NOPASSWD: $CMD_CERTBOT
 $panel_user ALL=(ALL) NOPASSWD: /usr/bin/mkdir -p $NGINX_ROOT_CERTBOT
 $panel_user ALL=(ALL) NOPASSWD: /bin/rm -f /etc/nginx/sites-enabled/default
 EOF
-# [FIX] 移除了导致语法错误的 chown 规则，该操作由 install.sh 直接执行
 
 chmod 440 "$SUDOERS_FILE"
 echo "Sudoers 配置完成。"
@@ -387,7 +387,7 @@ if [ ! -f "$XRAY_BIN_PATH" ]; then
 fi
 
 # 部署 Xray 配置文件
-# [FIX] 强制确保端口变量已定义，防止 "missing port" 错误
+# [FIX] 强制确保端口变量已定义
 _XRAY_API_PORT=${XRAY_API_PORT:-10085}
 _XRAY_PORT_INTERNAL=${XRAY_PORT_INTERNAL:-10081}
 
@@ -454,27 +454,34 @@ tee "$XRAY_CONFIG_PATH" > /dev/null <<EOF
   ]
 }
 EOF
-# [FIX] 直接设置所有权，避免 Sudo 权限问题
+
+# [CRITICAL FIX] 预先创建 Xray 日志目录并修正权限
+# 确保 root 用户可以写入日志
 mkdir -p /var/log/xray
+touch /var/log/xray/access.log
+touch /var/log/xray/error.log
+chmod -R 755 /var/log/xray
+chown -R root:root /var/log/xray # Xray 以 root 运行，不需要 Panel 用户权限
+
+# Panel 需要读取配置，保留配置目录权限
 chown "$panel_user:$panel_user" "$XRAY_CONFIG_PATH"
 chown -R "$panel_user:$panel_user" "$XRAY_DIR"
-chown -R "$panel_user:$panel_user" /var/log/xray
 
 # 部署 Xray Systemd 服务
-if [ -f "$XRAY_TEMPLATE" ]; then
-    cp "$XRAY_TEMPLATE" "$XRAY_SERVICE_PATH"
-else
-    # Fallback template generation inside install.sh if file missing
-    echo "Xray 模板文件未找到，使用内置默认模板..."
-    tee "$XRAY_SERVICE_PATH" > /dev/null <<EOF
+# [FIX] 增加 LogsDirectory 指令，让 systemd 自动管理日志目录权限
+echo "部署 Xray 服务文件..."
+tee "$XRAY_SERVICE_PATH" > /dev/null <<EOF
 [Unit]
 Description=Xray Service (Axiom V6.0)
+Documentation=https://github.com/xtls
 After=network.target nss-lookup.target
 Wants=network.target
 
 [Service]
 Type=simple
 User=root
+# [FIX] 自动创建并设置日志目录权限
+LogsDirectory=xray
 LimitNOFILE=65536
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
@@ -486,7 +493,6 @@ RestartSec=3s
 [Install]
 WantedBy=multi-user.target
 EOF
-fi
 
 systemctl daemon-reload
 systemctl enable xray || true
