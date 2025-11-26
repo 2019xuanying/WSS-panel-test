@@ -1,2428 +1,2469 @@
 /**
- * WSS Panel Frontend (Axiom Refactor V6.0 - Xray/Nginx Multi-Protocol & QoS Integration)
+ * WSS Panel Backend (Node.js + Express + SQLite)
+ * V9.3.2 (Axiom Refactor V6.1 - Syntax Error Fix)
  *
- * [AXIOM V6.0 CHANGELOG]
- * - [UI NEW] 全局配置/端口配置新增 Nginx/Xray 配置项 (Domain, Ports, Paths, Enable/Disable, QoS Limit)。
- * - [UI NEW] 用户新增/设置模态框支持 UUID 和 Xray 协议选择。
- * - [UI NEW] 活跃 IP 列表集成 GeoIP 数据 (国家/城市/ISP)。
- * - [FIX] 更新 CORE_SERVICES_MAP，加入 'nginx' 和 'xray'。
- * - [FIX] 统一端口配置逻辑，适配内部端口。
- * * [BUG FIXES V9.3.0]
- * - [FIX 1] 修复新增用户时的 ReferenceError: quota_gb is not defined。
- * - [FIX 2] 修复 fetchGlobalConfig 中由于 DOM 元素缺失或未加载导致的 TypeError。
- * - [FIX 3] 修复 generateXrayLinkForModal 中由于 FLASK_CONFIG 未完全加载导致的链接生成失败。
+ * [AXIOM V6.2 FIXES]
+ * - [CRITICAL FIX] 修复了文件末尾 API 路由定义后，因多余的 '})' 或 ')' 导致的 SyntaxError，解决了 wss_panel 服务无法启动的问题。
+ * - [TRAFFIC FIX] 修复 persistTrafficDelta 逻辑，确保从 workerStatsCache 正确聚合和写入流量增量。
+ * - [AUTH FIX] 允许使用 'lite_auth_placeholder' 密码在 /internal/auth 接口进行认证并返回限速配置。
  */
 
-// --- 全局配置 (将由 initializeApp 异步填充) ---
-const API_BASE = '/api';
-let currentView = 'dashboard';
-let FLASK_CONFIG = {
-    // Existing Config
-    WSS_HTTP_PORT: "...",
-    WSS_TLS_PORT: "...",
-    STUNNEL_PORT: "...",
-    UDPGW_PORT: "...",
-    UDP_CUSTOM_PORT: "...",
-    INTERNAL_FORWARD_PORT: "...",
-    PANEL_PORT: "...",
-    // [V6.0 NEW] Nginx/Xray Config
-    NGINX_DOMAIN: "...",
-    NGINX_ENABLE: 0,
-    WSS_WS_PATH: "...",
-    XRAY_WS_PATH: "...",
-    WSS_PROXY_PORT_INTERNAL: "...",
-    XRAY_PORT_INTERNAL: "...",
-    XRAY_API_PORT: "..."
-};
+// --- 核心依赖 ---
+const express = require('express');
+const bodyParser = require('body-parser');
+const session = require('express-session');
+const bcrypt = require('bcrypt');
+const { execFile, spawn, exec } = require('child_process');
+const { promisify } = require('util');
+const path = require('path');
+const fs = require('fs/promises');
+const fsSync = require('fs');
+const os = require('os');
+const sqlite3 = require('sqlite3');
+const { open } = require('sqlite');
+const crypto = require('crypto');
+const rateLimit = require('express-rate-limit');
+const http = require('http');
+const { WebSocketServer } = require('ws');
+const tls = require('tls');
+const dns = require('dns');
+const geoip = require('geoip-lite'); // [V6.0 NEW] GeoIP Dependency
 
-// --- 全局变量 ---
-let selectedUsers = []; 
-let trafficChartInstance = null; 
-let userStatsChartInstance = null;
-let realtimeChartInstance = null; 
-let allUsersCache = []; 
-let currentSortKey = 'username';
-let currentSortDir = 'asc';
+const app = express();
+const asyncExecFile = promisify(execFile);
 
-let panelSocket = null; 
-let wsReconnectTimer = null; 
+// --- [AXIOM V2.0] 配置加载 ---
+let config = {};
+const PANEL_DIR = process.env.PANEL_DIR_ENV || '/etc/wss-panel';
+const CONFIG_PATH = path.join(PANEL_DIR, 'config.json');
+// [AXIOM V5.7] UDP Custom 专属配置路径
+const UDP_CUSTOM_CONFIG_PATH = path.join(PANEL_DIR, 'udp-custom', 'config.json');
+// [V6.1 NEW] Xray 配置模板路径
+const XRAY_CONFIG_TEMPLATE = path.join(PANEL_DIR, 'xray_config.json.template');
+const XRAY_CONFIG_PATH = path.join(PANEL_DIR, 'xray_config.json');
+const NGINX_CONF_PATH = '/etc/nginx/sites-available/wss_gateway.conf';
 
-let lastUserStats = { total: -1, total_traffic_gb: -1 };
+try {
+    const configData = fsSync.readFileSync(CONFIG_PATH, 'utf8');
+    config = JSON.parse(configData);
+    // [AXIOM V5.7] 确保 udp_custom_port 存在，如果旧配置没有，给默认值
+    if (!config.udp_custom_port) config.udp_custom_port = 7400;
 
-const TOKEN_PLACEHOLDER = "[*********]";
+    // [V6.0 NEW] Nginx/Xray 配置默认值
+    if (!config.nginx_domain) config.nginx_domain = 'your.domain.com';
+    if (!config.nginx_enable) config.nginx_enable = 0;
+    if (!config.wss_ws_path) config.wss_ws_path = '/ssh-ws';
+    if (!config.xray_ws_path) config.xray_ws_path = '/vless-ws';
+    if (!config.wss_proxy_port_internal) config.wss_proxy_port_internal = 10080;
+    if (!config.xray_port_internal) config.xray_port_internal = 10081;
+    if (!config.xray_api_port) config.xray_api_port = 10085;
+    if (!config.global_bandwidth_limit_mbps) config.global_bandwidth_limit_mbps = 0; // 全局带宽限制 (MB/s)
+
+    console.log(`[AXIOM V6.2] 成功从 ${CONFIG_PATH} 加载配置。UDP Custom Port: ${config.udp_custom_port}`);
+} catch (e) {
+    console.error(`[CRITICAL] 无法加载 ${CONFIG_PATH}: ${e.message}。将使用默认端口。`);
+    // 默认配置
+    config = {
+        panel_port: 54321,
+        wss_http_port: 80,
+        wss_tls_port: 443,
+        stunnel_port: 444,
+        udpgw_port: 7300,
+        udp_custom_port: 7400,
+        internal_forward_port: 22,
+        internal_api_port: 54322,
+        internal_api_secret: "default-secret-change-me",
+        panel_api_url: "http://127.0.0.1:54321/internal",
+        proxy_api_url: "http://127.0.0.1:54322",
+        
+        // [V6.0 NEW] Default Nginx/Xray Config
+        nginx_domain: "your.domain.com",
+        nginx_enable: 0,
+        wss_ws_path: "/ssh-ws",
+        xray_ws_path: "/vless-ws",
+        wss_proxy_port_internal: 10080,
+        xray_port_internal: 10081,
+        xray_api_port: 10085,
+        global_bandwidth_limit_mbps: 0 // 全局带宽限制 (MB/s)
+    };
+    try {
+        fsSync.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
+    } catch (writeErr) {
+        console.error(`[CRITICAL] 无法写入默认配置: ${writeErr.message}`);
+    }
+}
+// --- 结束配置加载 ---
+
+
+// --- 核心常量 ---
+const DB_PATH = path.join(PANEL_DIR, 'wss_panel.db');
+const ROOT_HASH_FILE = path.join(PANEL_DIR, 'root_hash.txt');
+const AUDIT_LOG_PATH = path.join(PANEL_DIR, 'audit.log');
+const SECRET_KEY_PATH = path.join(PANEL_DIR, 'secret_key.txt');
+const INTERNAL_SECRET_PATH = path.join(PANEL_DIR, 'internal_secret.txt');
+const HOSTS_DB_PATH = path.join(PANEL_DIR, 'hosts.json');
+const STUNNEL_CONF = '/etc/stunnel/ssh-tls.conf';
+const ROOT_USERNAME = "root";
+const GIGA_BYTE = 1024 * 1024 * 1024;
+const BLOCK_CHAIN = "WSS_IP_BLOCK";
+const BACKGROUND_SYNC_INTERVAL = 60000; 
+const SHELL_DEFAULT = "/sbin/nologin";
 
 // [AXIOM V6.0 FIX] 更新服务映射，加入 nginx 和 xray
-const CORE_SERVICES_MAP = {
+const CORE_SERVICES = {
     'wss': 'WSS Proxy',
     'stunnel4': 'Stunnel4',
-    'udpgw': 'BadVPN UDPGW',
-    'wss-udp-custom': 'UDP Custom',
+    'udpgw': 'BadVPN UDPGW', 
+    'wss-udp-custom': 'UDP Custom', 
     'wss_panel': 'Web Panel',
-    'nginx': 'Nginx Gateway', // [V6.0 NEW]
-    'xray': 'Xray Core' // [V6.0 NEW]
+    'nginx': 'Nginx Gateway',
+    'xray': 'Xray Core'
 };
+let db;
 
-// --- 主题切换逻辑 ---
-const themeToggle = document.getElementById('theme-toggle');
-const htmlTag = document.documentElement;
-const savedTheme = localStorage.getItem('theme') || 'light';
-htmlTag.setAttribute('data-theme', savedTheme);
-if (themeToggle) {
-    themeToggle.checked = (savedTheme === 'dark');
-}
-if (themeToggle) {
-    themeToggle.addEventListener('change', (e) => {
-        const newTheme = e.target.checked ? 'dark' : 'light';
-        htmlTag.setAttribute('data-theme', newTheme);
-        localStorage.setItem('theme', newTheme);
-        
-        // [AXIOM V3.1] 修复: 主题切换时重绘所有图表
-        if (userStatsChartInstance) {
-            userStatsChartInstance.destroy();
-            userStatsChartInstance = null;
-        }
-        if (realtimeChartInstance) {
-            realtimeChartInstance.destroy();
-            realtimeChartInstance = null;
-        }
-        lastUserStats = {}; 
-        
-        // 手动请求一次系统状态以重绘图表
-        fetchData('/system/status').then(data => {
-            if (data) {
-                renderSystemStatus(data); // 重新渲染整个系统卡片
-                renderUserQuickStats(data.user_stats);
-                // 重新初始化实时图表 (它将在下次 `live_update` 时填充)
-                initRealtimeTrafficChart();
-            }
-        });
-    });
-}
+// --- [AXIOM V5.0] 实时推送状态管理 ---
+let wssIpc = null;
+let wssUiPool = new Set();
+// [V6.0 NEW] workerStatsCache 现包含 WSS Proxy 和 Xray 统计
+let workerStatsCache = new Map(); 
+let globalFuseLimitKbps = 0;
 
-// --- 辅助工具函数 ---
+// [V6.0 NEW] 全局实时速度缓存，用于 QoS 检查
+let totalRealtimeSpeedKbps = 0;
 
-function showStatus(message, isSuccess) {
-    const statusDiv = document.getElementById('status-message');
-    statusDiv.innerHTML = ''; 
-    const iconName = isSuccess ? 'check-circle' : 'alert-triangle';
-    const icon = document.createElement('i');
-    icon.setAttribute('data-lucide', iconName);
-    icon.className = 'w-6 h-6';
-    const text = document.createElement('span');
-    text.textContent = message;
-    statusDiv.appendChild(icon);
-    statusDiv.appendChild(text);
-    const colorClass = isSuccess ? 'alert-success' : 'alert-error';
-    statusDiv.className = 'alert shadow-lg flex mb-6 ' + colorClass;
-    statusDiv.style.display = 'flex'; 
-    lucide.createIcons({ context: statusDiv });
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-    setTimeout(() => { 
-        statusDiv.style.display = 'none'; 
-    }, 5000);
-}
+// [AXIOM V5.0] 性能优化定时器
+let liveUpdateInterval = null; 
+let systemUpdateInterval = null; 
+let isRealtimePushing = false; 
 
-function openModal(id) {
-    const modal = document.getElementById(id);
-    if (modal && typeof modal.showModal === 'function') {
-        modal.showModal();
-    }
-}
+// [AXIOM V5.0] 智能推送：存储上一次推送的聚合数据，以便比较变化
+let lastAggregatedStats = { users: {}, live_ips: {} };
+let lastSystemStatus = {};
 
-function closeModal(id) {
-    // [AXIOM V5.2] 如果是连接详情模态框，不需要销毁 Chart 实例
-    if (id === 'traffic-chart-modal' && trafficChartInstance) {
-        trafficChartInstance.destroy();
-        trafficChartInstance = null;
-    }
-    const modal = document.getElementById(id);
-    if (modal && typeof modal.close === 'function') {
-        modal.close();
-    }
-}
+// [AXIOM V5.2] 新增：用于临时存储 Worker 元数据响应
+let workerMetadataResponses = new Map();
 
-function logout() {
-    window.location.assign('/logout'); 
-}
 
-function formatSpeedUnits(kbps) {
-    const rate = parseFloat(kbps);
-    if (isNaN(rate) || rate <= 0) return '0.0 KB/s';
-    
-    if (rate < 1024) {
-        return rate.toFixed(1) + ' KB/s';
-    } else {
-        const mbps = rate / 1024;
-        return mbps.toFixed(2) + ' MB/s';
-    }
-}
+const SUDO_COMMANDS = new Set([
+    // ... existing commands
+    'useradd', 'usermod', 'userdel', 'gpasswd', 'chpasswd', 'pkill',
+    'iptables', 'iptables-save', 'journalctl', 
+    'systemctl', // 广义 systemctl, 需要特殊处理
+    'getent', 
+    'sed', 
+    'systemctl daemon-reload',
+    'systemctl is-active',
+    'systemctl restart',
+    'systemctl stop',
+    'systemctl enable',
+    'systemctl disable',
+    // [V6.1 NEW] 添加 certbot 和 mv, cp, rm 等必要的文件操作命令，用于配置更新
+    '/usr/bin/certbot',
+    '/bin/mv',
+    '/bin/cp',
+    '/bin/rm'
+]);
 
-function formatConnections(count) {
-    const num = parseInt(count);
-    return (num === 0) ? '∞' : num;
-}
-
-function copyToClipboard(elementId, message) {
-     const copyTextEl = document.getElementById(elementId);
-     const copyText = copyTextEl.value;
-     if (!copyText || copyText === TOKEN_PLACEHOLDER || copyText.startsWith('[在此输入')) {
-         if (elementId === 'modal-connect-token') {
-             showStatus('请先在下方输入新密码以生成令牌。', false);
-         } else if (elementId === 'new-connect-token') {
-             showStatus('请先在表单中输入用户名和密码。', false);
-         } else if (elementId === 'payload-output') {
-             showStatus('请先生成载荷。', false);
-         } else if (elementId.includes('xray-link')) {
-             showStatus('请先点击 "生成连接链接"。', false);
-         }
-         return;
-     }
-     try {
-        navigator.clipboard.writeText(copyText).then(() => {
-            showStatus(message || '已复制到剪贴板！', true);
-        }).catch(err => {
-            copyTextEl.select();
-            document.execCommand('copy');
-            showStatus(message || '已复制到剪贴板！', true);
-        });
-     } catch (err) {
-         copyTextEl.select();
-         document.execCommand('copy');
-         showStatus(message || '已复制到剪贴板！', true);
-     }
-}
-
-// --- 视图切换逻辑 ---
-
-function switchView(viewId) {
-    const views = ['dashboard', 'users', 'settings', 'security', 'live-ips', 'hosts', 'payload-gen', 'port-config'];
-    views.forEach(id => {
-        const element = document.getElementById('view-' + id);
-        if (element) element.style.display = (id === viewId) ? 'block' : 'none';
-    });
-    
-    document.querySelectorAll('#sidebar-menu .nav-link').forEach(link => {
-        if (link.dataset.view === viewId) {
-            link.classList.add('active');
-        } else {
-            link.classList.remove('active');
-        }
-    });
-
-    currentView = viewId;
-    
-    if (viewId === 'users') {
-        document.getElementById('user-search-input').value = '';
-        currentSortKey = 'username';
-        currentSortDir = 'asc';
-        renderFilteredUserList();
-    } else {
-        clearSelections();
-    }
-    
-    // 按需加载数据
-    if (viewId === 'payload-gen') {
-        if (allUsersCache.length > 0) {
-            populatePayloadUserSelect();
-        } else {
-            fetchAllUsersAndRender(); 
-        }
-    }
-    
-    if (viewId === 'hosts') {
-        fetchHosts();
-    }
-    
-    if (viewId === 'settings') {
-        fetchGlobalSettings();
-        fetchAuditLogs(); 
-    }
-    
-    if (viewId === 'security') {
-        fetchGlobalBans(); 
-    }
-    
-    if (viewId === 'port-config') {
-        fetchGlobalConfig();
-    }
-    
-    if (viewId === 'live-ips') {
-        fetchActiveIPs(); 
-    }
-    
-    if (window.innerWidth < 1024) { 
-        const drawerToggle = document.getElementById('my-drawer-2');
-        if (drawerToggle) {
-            drawerToggle.checked = false;
-        }
-    }
-}
-
-// --- 数据渲染函数 ---
+// =======================================================
+// [AXIOM V5.5 FIX A7] 核心辅助函数：安全执行系统命令
+// =======================================================
 
 /**
- * [AXIOM V6.0] 更新 CORE_SERVICES_MAP 以包含 Nginx/Xray
+ * [AXIOM V5.5 FIX A7] 增强对多参数命令的解析和执行，确保只执行白名单中的命令。
  */
-function renderSystemStatus(data) {
-    const grid = document.getElementById('system-status-grid');
-    grid.innerHTML = ''; 
-    grid.className = "space-y-4"; 
+async function safeRunCommand(command, inputData = null) {
+    
+    let fullCommand = [...command];
+    let baseCommand = command[0];
+    let isSudo = false;
 
-    const fragment = document.createDocumentFragment();
-    
-    // --- 1. 渲染系统状态 (CPU/内存/磁盘) ---
-    const systemItems = [
-        { name: 'CPU 使用率 (LoadAvg)', value: data.cpu_usage.toFixed(1) + '%', color: 'text-blue-500', icon: 'cpu', id: 'stat-cpu' },
-        { name: '内存 (用/总)', value: data.memory_used_gb.toFixed(2) + '/' + data.memory_total_gb.toFixed(2) + 'GB', color: 'text-indigo-500', icon: 'brain', id: 'stat-mem' },
-        { name: '磁盘使用率', value: data.disk_used_percent.toFixed(1) + '%', color: 'text-purple-500', icon: 'database', id: 'stat-disk' },
-    ];
-    
-    const statsGrid = document.createElement('div');
-    statsGrid.className = "stats stats-vertical shadow w-full bg-base-100";
-    
-    systemItems.forEach(item => {
-        const card = document.createElement('div');
-        card.className = 'stat';
-        card.innerHTML = 
-            `<div class="stat-figure ${item.color}"><i data-lucide="${item.icon}" class="w-6 h-6"></i></div>` +
-            `<div class="stat-title text-sm">${item.name}</div>` +
-            `<div class="stat-value text-xl ${item.color} flex items-center" id="${item.id}">` + 
-                 item.value +
-            '</div>';
-        statsGrid.appendChild(card);
-    });
-    fragment.appendChild(statsGrid);
-    
-    // --- 2. 渲染服务状态 (带按钮) ---
-    const servicesTitle = document.createElement('h3');
-    servicesTitle.className = "text-lg font-semibold pt-4 border-t border-base-300";
-    servicesTitle.textContent = "服务控制";
-    fragment.appendChild(servicesTitle);
-    
-    const servicesContainer = document.createElement('div');
-    servicesContainer.className = "space-y-2";
-    
-    Object.keys(data.services).forEach(key => {
-        const item = data.services[key];
-        const status = item.status;
-        let dotClass;
-        if (status === 'running') {
-            dotClass = 'badge-success';
+    // 特殊处理带参数的 systemctl 命令，确保其在白名单内
+    if (baseCommand === 'systemctl' && command.length > 1) {
+        const fullSystemctlCmd = command.slice(0, 2).join(' ');
+        if (SUDO_COMMANDS.has(fullSystemctlCmd)) {
+            baseCommand = fullSystemctlCmd;
+        } else if (command[1] === 'daemon-reload' && SUDO_COMMANDS.has('systemctl daemon-reload')) {
+            baseCommand = 'systemctl daemon-reload';
         } else {
-            dotClass = 'badge-error';
+             // 如果不是已知的 systemctl 二级命令，回退到普通 systemctl 检查
+             if (SUDO_COMMANDS.has(baseCommand)) {
+                 // OK
+             } else {
+                 console.error(`[SUDO_CHECK] Command not whitelisted: ${command.join(' ')}`);
+                 return { success: false, output: "Command not authorized." };
+             }
         }
-        
-        const div = document.createElement('div');
-        div.id = `service-status-${key}`;
-        div.className = 'flex justify-between items-center text-base-content p-2 bg-base-200 rounded-lg border border-base-300';
-        div.innerHTML = 
-            `<div class="flex items-center">
-                <span id="service-dot-${key}" class="badge ${dotClass} badge-xs mr-2 p-1"></span>
-                <span class="font-medium text-sm">${item.name}</span>
-            </div>
-            <div>
-                <button onclick="confirmAction('${key}', 'restart', null, 'serviceControl', '重启 ${item.name}')" 
-                        class="btn ${status === 'running' ? 'btn-primary' : 'btn-error'} btn-xs mr-1">
-                    <i data-lucide="refresh-cw" class="w-3 h-3"></i> 重启
-                </button>
-                <button onclick="confirmAction('${key}', '${status === 'running' ? 'stop' : 'start'}', null, 'serviceControl', '${status === 'running' ? '停止' : '启动'} ${item.name}')" 
-                        class="btn ${status === 'running' ? 'btn-warning' : 'btn-success'} btn-xs">
-                    <i data-lucide="${status === 'running' ? 'square' : 'play'}" class="w-3 h-3"></i> ${status === 'running' ? '停止' : '启动'}
-                </button>
-            </div>`;
-        servicesContainer.appendChild(div);
-    });
-    fragment.appendChild(servicesContainer);
-
-    // --- 3. 渲染端口状态 ---
-    const portsTitle = document.createElement('h3');
-    portsTitle.className = "text-lg font-semibold pt-4 border-t border-base-300";
-    portsTitle.textContent = "端口状态";
-    fragment.appendChild(portsTitle);
-    
-    const portsContainer = document.createElement('div');
-    portsContainer.className = "space-y-2";
-    
-    data.ports.forEach(p => {
-        const isListening = p.status === 'LISTEN';
-        const badgeClass = isListening ? 'badge-success' : 'badge-error';
-        const isInternal = p.name.includes('INTERNAL') || p.name.includes('PROXY_INT') || p.name.includes('XRAY_');
-        const internalLabel = isInternal ? '<span class="text-xs text-gray-500 ml-1">(Internal)</span>' : '';
-
-        const div = document.createElement('div');
-        div.id = `port-status-${p.name}`;
-        div.className = 'flex justify-between items-center text-gray-700 p-2 bg-base-200 rounded-lg shadow-sm border border-base-300';
-        div.innerHTML = 
-            '<span class="font-medium text-sm">' + p.name.replace('_INT', '') + ' (' + p.port + '/' + p.protocol + '):</span>' + internalLabel +
-            `<span class="badge ${badgeClass} badge-sm font-bold" id="port-badge-${p.name}">` + p.status +
-            '</span>';
-        portsContainer.appendChild(div);
-    });
-    fragment.appendChild(portsContainer);
-    
-    // --- 最终渲染 ---
-    grid.appendChild(fragment);
-    lucide.createIcons({ context: grid });
-}
-
-function handleSystemUpdateMessage(data) {
-// ... existing logic (no change needed here)
-    if (currentView !== 'dashboard') return;
-    
-    // 1. 更新系统资源统计
-    const statCpu = document.getElementById('stat-cpu');
-    const statMem = document.getElementById('stat-mem');
-    const statDisk = document.getElementById('stat-disk');
-
-    if (statCpu) statCpu.textContent = data.cpu_usage.toFixed(1) + '%';
-    if (statMem) statMem.textContent = data.memory_used_gb.toFixed(2) + '/' + data.memory_total_gb.toFixed(2) + 'GB';
-    if (statDisk) statDisk.textContent = data.disk_used_percent.toFixed(1) + '%';
-    
-    // 2. 更新服务状态
-    Object.keys(data.services).forEach(key => {
-        const item = data.services[key];
-        const dot = document.getElementById(`service-dot-${key}`);
-        
-        if (dot) {
-            const isRunning = item.status === 'running';
-            dot.className = `badge ${isRunning ? 'badge-success' : 'badge-error'} badge-xs mr-2 p-1`;
+    } else if (!SUDO_COMMANDS.has(baseCommand) && !SUDO_COMMANDS.has(command.join(' '))) {
+        // 检查完整的路径命令
+        if (baseCommand === '/bin/mv' || baseCommand === '/bin/cp' || baseCommand === '/bin/rm' || baseCommand === '/usr/bin/certbot') {
+            // 允许这些完整的路径命令
+        } else {
+             console.error(`[SUDO_CHECK] Command not whitelisted: ${command.join(' ')}`);
+             return { success: false, output: "Command not authorized." };
         }
-    });
-
-    // 3. 更新端口状态
-    data.ports.forEach(p => {
-        const badge = document.getElementById(`port-badge-${p.name}`);
-        if (badge) {
-            const isListening = p.status === 'LISTEN';
-            badge.className = `badge ${isListening ? 'badge-success' : 'badge-error'} badge-sm font-bold`;
-            badge.textContent = p.status;
-        }
-    });
-
-    // 4. 更新用户快速统计卡片 (此更新频率较低，但包含在 3s 推送中以确保数据一致)
-    renderUserQuickStats(data.user_stats);
-}
-
-
-function renderUserQuickStats(stats) {
-// ... existing logic (no change needed here)
-    if (!stats) {
-        console.warn("[Axiom] renderUserQuickStats 收到空 stats");
-        return;
     }
     
-    const total = stats.total;
-    const active = stats.active; 
-    const nonActive = stats.paused + stats.expired + stats.exceeded + (stats.fused || 0);
-    
-    const container = document.getElementById('user-quick-stats-text');
-    
-    // [V5.1.1 FIX] 仅在 total/active/nonActive/traffic 这些统计数据首次加载或结构变化时才更新 innerHTML
-    if (total !== lastUserStats.total || active !== lastUserStats.active || stats.total_traffic_gb !== lastUserStats.total_traffic_gb || lastUserStats.total === -1) {
-         container.innerHTML = 
-            `<div class="stat">
-                <div class="stat-figure text-primary"><i data-lucide="users" class="w-8 h-8"></i></div>
-                <div class="stat-title">账户总数</div>
-                <div class="stat-value" id="stat-total-users">${total}</div>
-            </div>
-            <div class="stat">
-                <div class="stat-figure text-success"><i data-lucide="activity" class="w-8 h-8"></i></div>
-                <div class="stat-title">活跃连接 (IPs)</div>
-                <div class="stat-value text-success" id="stat-active-conns">${active}</div>
-            </div>
-            <div class="stat">
-                <div class="stat-figure text-warning"><i data-lucide="user-x" class="w-8 h-8"></i></div>
-                <div class="stat-title">暂停/不可用账户</div>
-                <div class="stat-value text-warning" id="stat-inactive-users">${nonActive}</div>
-            </div>
-            <div class="stat">
-                <div class="stat-figure text-secondary"><i data-lucide="pie-chart" class="w-8 h-8"></i></div>
-                <div class="stat-title">总用量</div>
-                <div class="stat-value" id="stat-total-traffic">${stats.total_traffic_gb.toFixed(2)} GB</div>
-            </div>`;
-        lucide.createIcons({ context: container });
-    } else {
-         // 仅更新活跃连接数和总用量 (其他字段变化较慢)
-         const activeConnsEl = document.getElementById('stat-active-conns');
-         const totalTrafficEl = document.getElementById('stat-total-traffic');
-         const inactiveUsersEl = document.getElementById('stat-inactive-users');
-
-         if (activeConnsEl) activeConnsEl.textContent = active;
-         if (totalTrafficEl) totalTrafficEl.textContent = stats.total_traffic_gb.toFixed(2) + ' GB';
-         if (inactiveUsersEl) inactiveUsersEl.textContent = nonActive;
+    if (SUDO_COMMANDS.has(baseCommand) || baseCommand.startsWith('systemctl') || baseCommand.startsWith('/usr/bin/certbot') || baseCommand.startsWith('/bin/mv') || baseCommand.startsWith('/bin/cp') || baseCommand.startsWith('/bin/rm')) {
+        fullCommand.unshift('sudo');
+        isSudo = true;
     }
-
-    lastUserStats = stats;
     
-    // 更新饼图
-    const ctx = document.getElementById('user-stats-chart').getContext('2d');
-    const activeAccounts = total - nonActive; 
-    const chartDataValues = [(activeAccounts || 0), (nonActive || 0)];
-    if (total === 0) {
-        chartDataValues[0] = 1;
-        chartDataValues[1] = 0;
-    }
-    const chartData = {
-        labels: ['可连接账户', '不可用账户'], 
-        datasets: [{
-            data: chartDataValues,
-            backgroundColor: [
-                (total > 0) ? '#00a96e' : '#d1d5db', 
-                (total > 0) ? '#fbbd23' : '#d1d5db'  
-            ],
-            borderColor: htmlTag.getAttribute('data-theme') === 'dark' ? '#1d232a' : '#ffffff', 
-            borderWidth: 2,
-            hoverOffset: 4
-        }]
-    };
-    if (userStatsChartInstance) {
-        userStatsChartInstance.data = chartData;
-        userStatsChartInstance.options.plugins.legend.labels.color = htmlTag.getAttribute('data-theme') === 'dark' ? '#a6adbb' : '#4f5664';
-        userStatsChartInstance.options.borderColor = htmlTag.getAttribute('data-theme') === 'dark' ? '#1d232a' : '#ffffff';
-        userStatsChartInstance.update();
-    } else {
-        userStatsChartInstance = new Chart(ctx, {
-            type: 'doughnut',
-            data: chartData,
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                cutout: '70%',
-                plugins: {
-                    legend: {
-                        position: 'bottom',
-                        labels: {
-                            padding: 10,
-                            color: htmlTag.getAttribute('data-theme') === 'dark' ? '#a6adbb' : '#4f5664' 
-                        }
-                    }
+    const commandToExec = fullCommand.join(' ');
+
+    if (command[0] === 'chpasswd' || (isSudo && command[1] === 'chpasswd') && inputData) {
+        return new Promise((resolve, reject) => {
+            const child = spawn(fullCommand[0], fullCommand.slice(1), {
+                stdio: ['pipe', 'pipe', 'pipe'],
+                // [AXIOM V5.5 FIX] 确保 PATH 包含 Node.js 环境所需的路径
+                env: { ...process.env, PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' }
+            });
+            let stdout = '';
+            let stderr = '';
+            child.stdout.on('data', (data) => { stdout += data.toString(); });
+            child.stderr.on('data', (data) => { stderr += data.toString(); });
+            child.on('close', (code) => {
+                if (code === 0) {
+                    resolve({ success: true, output: stdout.trim() });
+                } else {
+                    console.error(`safeRunCommand (spawn) Stderr (Command: ${commandToExec}): ${stderr.trim()}`);
+                    resolve({ success: false, output: stderr.trim() || `Command ${commandToExec} failed with code ${code}` });
                 }
+            });
+             child.on('error', (err) => {
+                 console.error(`safeRunCommand (spawn) Error (Command: ${commandToExec}): ${err.message}`);
+                resolve({ success: false, output: err.message });
+            });
+            try {
+                child.stdin.write(inputData);
+                child.stdin.end();
+            } catch (e) {
+                 resolve({ success: false, output: e.message });
             }
         });
     }
-}
 
-/**
- * [AXIOM V6.0] 重构: buildUserCard (移动端)
- */
-function buildUserCard(user, statusColor, statusText, toggleAction, toggleText, toggleColor, usageText, usageProgressHtml) {
-    let borderColor = 'border-primary';
-    if (user.status === 'active') borderColor = 'border-success';
-    if (user.status === 'paused' || user.status === 'fused') borderColor = 'border-warning';
-    if (user.status === 'expired' || user.status === 'exceeded') borderColor = 'border-error';
-    const isChecked = selectedUsers.includes(user.username) ? 'checked' : '';
-    
-    // [AXIOM V5.5 FIX] 确保从缓存读取最新的实时速度和连接数
-    const cachedUser = allUsersCache.find(u => u.username === user.username);
-    const speedUp = formatSpeedUnits(cachedUser?.realtime_speed_up || 0);
-    const speedDown = formatSpeedUnits(cachedUser?.realtime_speed_down || 0);
-    const activeConnections = cachedUser?.active_connections !== undefined ? cachedUser.active_connections : 0;
-    
-    const shellStatus = user.allow_shell === 1;
-    const shellColor = shellStatus ? 'text-secondary' : 'text-gray-500';
-    const shellText = shellStatus ? '已启用' : '已禁用';
-    
-    // [V6.0 NEW] Xray Protocol Info
-    const xrayProtocol = user.xray_protocol && user.xray_protocol !== 'none' ? user.xray_protocol.toUpperCase() : 'N/A';
-    const xrayColor = xrayProtocol !== 'N/A' ? 'text-info' : 'text-gray-500';
-
-    return `
-    <div id="card-${user.username}" class="card bg-base-100 shadow-lg border-l-4 ${borderColor}">
-        <div class="card-body p-4">
-            <div class="flex justify-between items-center mb-3 pb-2 border-b border-base-300">
-                <div class="flex items-center">
-                    <input type="checkbox" data-username="${user.username}" ${isChecked} class="user-checkbox checkbox checkbox-primary mr-3">
-                    <span class="font-bold text-lg text-base-content font-mono">${user.username}</span>
-                </div>
-                <!-- [AXIOM V3.1] 新增 ID -->
-                <span id="status-card-${user.username}" class="badge ${statusColor} text-xs font-semibold">
-                    ${statusText}
-                </span>
-            </div>
-            <div class="text-sm text-gray-600 space-y-1.5 mb-4">
-                <p><strong>到期日:</strong> <span class="font-medium text-base-content">${user.expiration_date || '永不'}</span></p>
-                
-                <!-- [AXIOM V3.1] 新增 ID -->
-                <div id="usage-card-${user.username}" class="pt-1">
-                    <strong>用量 (GB):</strong> <span id="usage-text-mobile-${user.username}" class="font-medium text-base-content">${usageText}</span>
-                    ${usageProgressHtml}
-                </div>
-                
-                <p><strong>连接/并发:</strong> 
-                    <!-- [AXIOM V3.1] 新增 ID -->
-                    <span id="conn-mobile-${user.username}" class="font-medium text-primary">${activeConnections}</span> / 
-                    <span class="font-medium text-base-content">${formatConnections(user.max_connections)}</span>
-                </p>
-                
-                <p class="speed-mobile"><strong>实时:</strong> 
-                    <span class="speed-up" id="speed-up-mobile-${user.username}">↑ ${speedUp}</span> / 
-                    <span class="speed-down" id="speed-down-mobile-${user.username}">↓ ${speedDown}</span>
-                </p>
-                
-                <p><strong>认证:</strong> <span class="font-medium ${user.require_auth_header === 1 ? 'text-error' : 'text-success'}">${user.require_auth_header === 1 ? '需要头部' : '免认证'}</span></p>
-                
-                <p><strong>Shell (444):</strong> <span class="font-medium ${shellColor}">${shellText}</span></p>
-                
-                <p><strong>Xray 协议:</strong> <span class="font-medium ${xrayColor}">${xrayProtocol}</span></p>
-            </div>
-            <div class="grid grid-cols-3 gap-2">
-                <button onclick="confirmAction('${user.username}', null, null, 'killAll', '强制断开所有')" 
-                        class="btn btn-error btn-xs" aria-label="强制断开 ${user.username}">踢下线</button>
-                <button onclick="openTrafficChartModal('${user.username}')"
-                        class="btn btn-secondary btn-xs" aria-label="流量图 ${user.username}">流量图</button>
-                
-                <button onclick="openSettingsModal('${user.username}', '${user.expiration_date || ''}', ${user.quota_gb}, '${user.rate_kbps}', '${user.max_connections}', '${user.fuse_threshold_kbps}', ${user.require_auth_header}, ${user.allow_shell}, '${user.uuid}', '${user.xray_protocol}')" 
-                        class="btn btn-primary btn-xs" aria-label="设置 ${user.username}">设置</button>
-                        
-                <button onclick="confirmAction('${user.username}', '${toggleAction}', null, 'toggleStatus', '${toggleText}用户')" 
-                        class="btn ${toggleColor} btn-xs" aria-label="${toggleText}用户 ${user.username}">${toggleText}</button>
-                <button onclick="openConnectionDetailsModal('${user.username}')" 
-                        class="btn btn-info btn-xs" aria-label="查看用户连接详情 ${user.username}">详情</button> <!-- [AXIOM V5.2] 新增按钮 -->
-                <button onclick="confirmAction('${user.username}', 'delete', null, 'deleteUser', '删除用户')" 
-                        class="btn btn-error btn-xs" aria-label="删除用户 ${user.username}">删除</button>
-            </div>
-        </div>
-    </div>`;
-}
-
-/**
- * [AXIOM V6.0] 重构: renderUserList (PC/移动端)
- */
-function renderUserList(users) {
-    const tbody = document.getElementById('user-list-tbody');
-    const mobileContainer = document.getElementById('user-list-mobile');
-    let tableHtml = [];
-    let mobileHtml = [];
-    
-    document.querySelectorAll('th.sortable .sort-arrow').forEach(arrow => {
-        const th = arrow.parentElement;
-        if (th.dataset.sortkey === currentSortKey) {
-            arrow.innerHTML = currentSortDir === 'asc' ? '▲' : '▼';
-            arrow.style.opacity = '1';
-        } else {
-            arrow.innerHTML = '▲'; 
-            arrow.style.opacity = '0.4';
-        }
-    });
-
-    if (users.length === 0) {
-        const emptyRow = '<tr><td colspan="10" class="px-6 py-4 text-center text-gray-500">没有找到匹配的用户</td></tr>';
-        tbody.innerHTML = emptyRow;
-        mobileContainer.innerHTML = `<div class="text-center text-gray-500 py-4">没有找到匹配的用户</div>`;
-        return;
-    }
-
-    users.forEach(user => {
-        let statusColor = 'badge-success';
-        if (user.status === 'paused') { statusColor = 'badge-warning'; }
-        if (user.status === 'fused') { statusColor = 'badge-warning'; }
-        if (user.status === 'expired' || user.status === 'exceeded') { statusColor = 'badge-error'; }
-        
-        const statusText = user.status_text;
-        const isLocked = (user.status !== 'active'); 
-        const toggleAction = isLocked ? 'enable' : 'pause';
-        const toggleText = isLocked ? '启用' : '暂停';
-        const toggleColor = isLocked ? 'btn-success' : 'btn-warning';
-        const isChecked = selectedUsers.includes(user.username) ? 'checked' : '';
-        
-        const maxConnections = user.max_connections !== undefined ? user.max_connections : 0; 
-        const fuseThreshold = 0; // Fuse is now global
-        
-        const speedUp = formatSpeedUnits(user.realtime_speed_up || 0);
-        const speedDown = formatSpeedUnits(user.realtime_speed_down || 0);
-        const activeConnections = user.active_connections !== undefined ? user.active_connections : 0;
-        
-        const allowShell = user.allow_shell || 0;
-        
-        // [V6.0 NEW] Xray Protocol Info
-        const xrayProtocol = user.xray_protocol && user.xray_protocol !== 'none' ? user.xray_protocol.toUpperCase() : 'N/A';
-        const xrayColor = xrayProtocol !== 'N/A' ? 'text-info' : 'text-gray-500';
-
-        const quotaLimit = user.quota_gb > 0 ? user.quota_gb : '∞';
-        const usageText = user.usage_gb.toFixed(4) + ' / ' + quotaLimit;
-        const quotaLimitValue = user.quota_gb > 0 ? user.quota_gb : 0;
-        const usagePercent = (quotaLimitValue > 0) ? (user.usage_gb / quotaLimitValue) * 100 : 0;
-        const progressHtml = (quotaLimitValue > 0) 
-            ? `<progress class="progress progress-primary usage-progress" value="${usagePercent}" max="100" id="usage-progress-pc-${user.username}"></progress>` 
-            : `<div class="usage-progress" id="usage-progress-pc-${user.username}"></div>`;
-        
-        tableHtml.push(`
-            <tr id="row-${user.username}" class="hover">
-                <td class="px-4 py-4">
-                    <input type="checkbox" data-username="${user.username}" ${isChecked} class="user-checkbox checkbox checkbox-primary">
-                </td>
-                <td class="px-6 py-4 whitespace-nowrap text-sm font-mono text-base-content" role="cell">${user.username}</td>
-                
-                <!-- [AXIOM V3.1] 新增 ID -->
-                <td id="status-cell-${user.username}" class="px-6 py-4 whitespace-nowrap text-sm" role="cell">
-                    <span class="badge ${statusColor} text-xs font-semibold">
-                        ${statusText}
-                    </span>
-                </td>
-                
-                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" role="cell">${user.expiration_date || '永不'}</td>
-                
-                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium ${xrayColor}" role="cell">${xrayProtocol}</td> <!-- [V6.0 NEW] -->
-                
-                <td id="conn-cell-${user.username}" class="px-6 py-4 whitespace-nowrap text-sm font-medium text-primary" role="cell">${activeConnections}</td>
-                
-                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-base-content" role="cell">${formatConnections(maxConnections)}</td>
-                
-                <!-- [AXIOM V3.1] 新增 ID -->
-                <td id="usage-cell-${user.username}" class="px-6 py-4 whitespace-nowrap text-sm font-medium text-base-content" role="cell">
-                    <div id="usage-text-pc-${user.username}">${usageText} GB</div>
-                    ${progressHtml}
-                </td>
-                
-                <td class="px-6 py-4 whitespace-nowrap text-sm font-mono speed-cell" role="cell" id="speed-cell-${user.username}">
-                    <span class="speed-up">↑ ${speedUp}</span> / 
-                    <span class="speed-down">↓ ${speedDown}</span>
-                </td>
-                
-                <td class="px-6 py-4 text-sm font-medium" role="cell">
-                    <div class="flex flex-wrap gap-1">
-                        <button onclick="confirmAction('${user.username}', null, null, 'killAll', '强制断开所有')" 
-                                class="btn btn-error btn-xs" aria-label="强制断开 ${user.username}">踢下线</button>
-                        <button onclick="openTrafficChartModal('${user.username}')"
-                                class="btn btn-secondary btn-xs" aria-label="流量图 ${user.username}">流量图</button>
-                        
-                        <button onclick="openSettingsModal('${user.username}', '${user.expiration_date || ''}', ${user.quota_gb}, '${user.rate_kbps}', '${maxConnections}', '${fuseThreshold}', ${user.require_auth_header}, ${allowShell}, '${user.uuid}', '${user.xray_protocol}')" 
-                                class="btn btn-primary btn-xs" aria-label="设置 ${user.username}">设置</button>
-                                
-                        <button onclick="confirmAction('${user.username}', '${toggleAction}', null, 'toggleStatus', '${toggleText}用户')" 
-                                class="btn ${toggleColor} btn-xs" aria-label="${toggleText}用户 ${user.username}">${toggleText}</button>
-                        <button onclick="openConnectionDetailsModal('${user.username}')" 
-                                class="btn btn-info btn-xs" aria-label="查看用户连接详情 ${user.username}">详情</button> <!-- [AXIOM V5.2] 新增按钮 -->
-                        <button onclick="confirmAction('${user.username}', 'delete', null, 'deleteUser', '删除用户')" 
-                                class="btn btn-error btn-xs" aria-label="删除用户 ${user.username}">删除</button>
-                    </div>
-                </td>
-            </tr>
-        `);
-        
-        mobileHtml.push(buildUserCard(user, statusColor, statusText, toggleAction, toggleText, toggleColor, usageText, progressHtml));
-    });
-    
-    tbody.innerHTML = tableHtml.join('');
-    mobileContainer.innerHTML = mobileHtml.join('');
-    bindCheckboxEvents();
-}
-
-function renderFilteredUserList() {
-    let usersToRender = [...allUsersCache];
-// ... existing logic (no change needed here)
-    const searchTerm = document.getElementById('user-search-input').value.toLowerCase();
-    if (searchTerm) {
-        usersToRender = usersToRender.filter(user => 
-            user.username.toLowerCase().includes(searchTerm)
-        );
-    }
-    
-    usersToRender.sort((a, b) => {
-        let valA = a[currentSortKey];
-        let valB = b[currentSortKey];
-        
-        if (currentSortKey === 'expiration_date') {
-            valA = valA ? new Date(valA).getTime() : 0;
-            valB = valB ? new Date(valB).getTime() : 0;
-        } else if (currentSortKey === 'max_connections' || currentSortKey === 'active_connections' || currentSortKey === 'usage_gb' || 
-                   currentSortKey === 'realtime_speed_down' || currentSortKey === 'realtime_speed_up') { 
-            valA = parseFloat(valA) || 0;
-            valB = parseFloat(valB) || 0;
-            if (currentSortKey === 'max_connections') {
-                 valA = valA === 0 ? Infinity : valA;
-                 valB = valB === 0 ? Infinity : valB;
-            }
-        } else if (typeof valA === 'string') {
-            valA = valA.toLowerCase();
-            valB = valB.toLowerCase();
-        }
-
-        let comparison = 0;
-        if (valA > valB) comparison = 1;
-        else if (valA < valB) comparison = -1;
-        
-        return currentSortDir === 'asc' ? comparison : -comparison;
-    });
-    
-    renderUserList(usersToRender);
-}
-
-/**
- * [V6.0 FIX] 在 IP 列表中展示 GeoIP 信息
- */
-function renderActiveGlobalIPs(ipData) {
-    const container = document.getElementById('live-ip-list');
-    let htmlContent = '';
-    
-    if (ipData.length === 0) {
-        container.innerHTML = '<p class="text-gray-500 p-2">目前没有活跃的外部连接。</p>';
-        return;
-    }
-
-    ipData.forEach(ipInfo => {
-        const isBanned = ipInfo.is_banned;
-        const action = isBanned ? 'unban' : 'ban';
-        const actionText = isBanned ? '解除封禁' : '全局封禁';
-        const buttonColor = isBanned ? 'btn-success' : 'btn-error';
-        const banTag = isBanned ? '<span class="badge badge-error badge-outline ml-2">已封禁</span>' : '';
-        
-        const usernameSpan = ipInfo.username ? 
-            `<span class="badge badge-primary badge-outline ml-2 font-mono text-xs">${ipInfo.username}</span>` : 
-            `<span class="badge badge-warning badge-outline ml-2 text-xs">未知用户</span>`;
-            
-        // [V6.0 NEW] GeoIP 显示
-        const geoInfo = (ipInfo.country && ipInfo.country !== 'N/A') 
-            ? `<span class="text-xs text-gray-500 ml-4">📍 ${ipInfo.country} (${ipInfo.city || 'N/A'}) | ISP: ${ipInfo.isp || 'N/A'}</span>`
-            : `<span class="text-xs text-gray-500 ml-4">地理位置 N/A</span>`;
-
-        htmlContent += `
-            <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between p-3 bg-base-100 border border-base-300 rounded-lg shadow-sm">
-                <div class="min-w-0 flex-1 flex flex-col sm:flex-row sm:items-center">
-                    <p class="font-mono text-sm text-base-content flex items-center">
-                        <strong>${ipInfo.ip}</strong> ${usernameSpan} ${banTag}
-                    </p>
-                    ${geoInfo}
-                </div>
-                <button onclick="confirmAction(null, '${ipInfo.ip}', null, '${action}Global', '${isBanned ? '解除全局封禁' : '全局封禁 IP'}')" 
-                             class="mt-2 sm:mt-0 w-full sm:w-auto btn ${buttonColor} btn-xs font-semibold flex-shrink-0">
-                    ${actionText}
-                </button>
-            </div>`;
-    });
-    container.innerHTML = htmlContent;
-}
-
-function renderAuditLogs(logs) {
-// ... existing logic (no change needed here)
-    const logContainer = document.getElementById('audit-log-content');
-    const filteredLogs = logs.filter(log => log.trim() !== "" && log !== '读取日志失败或日志文件为空。' && log !== '日志文件不存在。');
-
-    if (filteredLogs.length === 0) {
-        logContainer.innerHTML = '<p class="text-gray-500">目前没有管理员审计活动日志。</p>';
-        return;
-    }
-    logContainer.innerHTML = '';
-    const fragment = document.createDocumentFragment();
-
-    filteredLogs.forEach(log => {
-        const parts = log.match(/^\[(.*?)\] \[USER:(.*?)\] \[IP:(.*?)\] ACTION:(.*?) DETAILS: (.*)$/);
-        const div = document.createElement('div');
-        if (parts) {
-            const [_, timestamp, user, ip, action, details] = parts;
-            const safeDetails = document.createElement('div');
-            safeDetails.textContent = details;
-            div.className = 'text-xs text-base-content font-mono space-y-1 p-1 hover:bg-base-300 rounded-md';
-            div.innerHTML = 
-                '<span class="text-primary">' + timestamp.split(' ')[1] + '</span> ' +
-                '<span class="font-bold">[' + user + ']</span> ' +
-                '<span class="text-sm font-semibold text-base-content">' + action + '</span> ' +
-                '<span class="text-gray-500">' + safeDetails.innerHTML + '</span>'; 
-        } else {
-            div.className = 'text-xs text-base-content font-mono p-1';
-            div.textContent = log;
-        }
-        fragment.appendChild(div);
-    });
-    logContainer.appendChild(fragment);
-}
-
-function renderGlobalBans(bans) {
-// ... existing logic (no change needed here)
-    const container = document.getElementById('global-ban-list');
-    const banKeys = Object.keys(bans);
-    if (banKeys.length === 0) {
-        container.innerHTML = '<p class="text-success font-semibold p-2">目前没有全局封禁的 IP。</p>';
-        return;
-    }
-    container.innerHTML = banKeys.map(ip => {
-        const banInfo = bans[ip];
-        return (
-            '<div class="flex justify-between items-center p-3 bg-error/10 border border-error/20 rounded-lg shadow-sm">' +
-                '<div class="font-mono text-sm text-error-content">' +
-                    '<strong>' + ip + '</strong> ' +
-                    '<span class="text-xs text-gray-500 ml-4">原因: ' + (banInfo.reason || 'N/A') + ' (添加于 ' + banInfo.timestamp + ')</span>' +
-                '</div>' +
-                '<button onclick="confirmAction(null, \'' + ip + '\', null, \'unbanGlobal\', \'解除全局封禁\')" ' +
-                             'class="btn btn-success btn-xs font-semibold flex-shrink-0">解除封禁</button>' +
-            '</div>'
-        );
-    }).join('');
-}
-
-function renderHosts(hosts) {
-// ... existing logic (no change needed here)
-    const textarea = document.getElementById('host-list-textarea');
-    const countInfo = document.getElementById('host-count-info');
-    textarea.value = hosts.join('\n');
-    const validHosts = hosts.filter(h => h.trim() !== '');
-    countInfo.textContent = `当前加载 ${validHosts.length} 个 Host。`;
-}
-
-function renderConnectionList(connections) {
-// ... existing logic (no change needed here)
-    const container = document.getElementById('connection-list-container');
-    if (!container) return;
-
-    if (connections.length === 0) {
-        container.innerHTML = '<div class="text-center text-gray-500 py-4">该用户目前没有活跃的 WSS 连接。</div>';
-        return;
-    }
-
-    let html = `
-        <div class="grid grid-cols-6 gap-2 font-bold text-sm text-base-content/80 p-2 border-b border-base-300 bg-base-200 sticky top-0 rounded-t-lg">
-            <div class="col-span-2">客户端 IP / 地理位置</div>
-            <div class="col-span-1">Worker ID</div>
-            <div class="col-span-3">连接开始时间 (UTC)</div>
-        </div>
-    `;
-
-    connections.forEach(conn => {
-        const startTime = new Date(conn.start);
-        const duration = (Date.now() - startTime.getTime()) / 1000;
-        const uptime = formatUptime(duration);
-
-        html += `
-            <div class="grid grid-cols-6 gap-2 text-xs p-2 bg-base-100 rounded-lg shadow-sm border border-base-300">
-                <div class="col-span-2 font-mono text-primary">${conn.ip}</div>
-                <div class="col-span-1 text-secondary">W-${conn.workerId}</div>
-                <div class="col-span-3 text-gray-500">
-                    ${startTime.toISOString().replace('T', ' ').substring(0, 19)}<br>
-                    <span class="text-xs font-medium text-success">已连接: ${uptime}</span>
-                </div>
-            </div>
-        `;
-    });
-
-    container.innerHTML = html;
-}
-
-function formatUptime(seconds) {
-// ... existing logic (no change needed here)
-    const days = Math.floor(seconds / (3600 * 24));
-    seconds -= days * 3600 * 24;
-    const hrs = Math.floor(seconds / 3600);
-    seconds -= hrs * 3600;
-    const mins = Math.floor(seconds / 60);
-    seconds -= mins * 60;
-    const secs = Math.floor(seconds);
-
-    let parts = [];
-    if (days > 0) parts.push(`${days}天`);
-    if (hrs > 0) parts.push(`${hrs}时`);
-    if (mins > 0) parts.push(`${mins}分`);
-    if (secs > 0 && parts.length < 3) parts.push(`${secs}秒`);
-    
-    return parts.join(' ');
-}
-
-async function openConnectionDetailsModal(username) {
-// ... existing logic (no change needed here)
-    const titleEl = document.getElementById('modal-username-connection');
-    const loadingEl = document.getElementById('connection-loading');
-    const listContainer = document.getElementById('connection-list-container');
-    
-    titleEl.textContent = username;
-    loadingEl.textContent = '正在查询活跃连接...';
-    loadingEl.style.display = 'block';
-    listContainer.innerHTML = '';
-    
-    openModal('connection-details-modal');
-
-    const result = await fetchData(`/users/connections?username=${username}`);
-
-    loadingEl.style.display = 'none';
-
-    if (result && result.success) {
-        renderConnectionList(result.connections);
-        showStatus(result.message, true);
-    } else {
-        listContainer.innerHTML = `<div class="text-center text-error py-4">查询失败: ${result ? result.message : '网络或 API 错误'}</div>`;
-        showStatus(`连接查询失败: ${result ? result.message : 'API 错误'}`, false);
-    }
-}
-
-
-// --- 核心 API 调用函数 ---
-
-async function fetchData(url, options = {}) {
-// ... existing logic (no change needed here)
     try {
-        const response = await fetch(API_BASE + url, options);
-        if (response.status === 401) {
-            showStatus("会话过期或权限不足，请重新登录。", false);
-            if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
-            if (panelSocket) panelSocket.close();
-            window.location.assign('/login.html'); 
-            return null;
-        }
-        if (response.redirected) {
-            window.location.assign(response.url);
-            return null;
-        }
-        const contentType = response.headers.get("content-type");
+        const { stdout, stderr } = await asyncExecFile(fullCommand[0], fullCommand.slice(1), {
+            timeout: 10000,
+            input: inputData,
+            // [AXIOM V5.5 FIX] 确保 PATH 包含 Node.js 环境所需的路径
+            env: { ...process.env, PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' }
+        });
+        const output = (stdout + stderr).trim();
         
-        if (!contentType || !contentType.includes("application/json")) {
-            if (response.ok) {
-                const text = await response.text();
-                console.error("API expected JSON but got HTML/Text:", text.substring(0, 100) + '...');
-                if (text.trim().startsWith('<!DOCTYPE html>')) {
-                     showStatus("API 响应错误：会话可能已过期，请尝试重新登录。", false);
-                     setTimeout(() => window.location.assign('/login.html'), 1000); 
-                     return null;
-                }
-                showStatus("API 响应格式错误，可能返回了非 JSON 页面。", false);
-                return null;
-            }
+        if (stderr && 
+            !stderr.includes('user not found') &&
+            !stderr.includes('userdel: user') &&
+            !stderr.includes('already exists')
+           ) {
+             console.warn(`safeRunCommand (asyncExecFile) Non-fatal Stderr (Command: ${commandToExec}): ${stderr.trim()}`);
+        }
+        return { success: true, output: stdout.trim() };
+        
+    } catch (e) {
+        // systemctl is-active 失败（非活动状态）返回 code 3
+        if (baseCommand === 'systemctl is-active' && e.code === 3) {
+            return { success: false, output: 'inactive' };
         }
         
-        const data = await response.json();
-        
-        if (!response.ok || (typeof data.success === 'boolean' && !data.success)) {
-            showStatus(data.message || 'API Error: ' + url, false);
-            return null;
+        if (e.code !== 'ETIMEDOUT') {
+            console.error(`safeRunCommand (asyncExecFile) Fatal Error (Command: ${commandToExec}): Code=${e.code}, Stderr=${e.stderr || 'N/A'}, Msg=${e.message}`);
         }
-        return data;
-    } catch (error) {
-         showStatus('网络请求失败: ' + error.message, false);
+        
+        return { success: false, output: e.stderr || e.message || `Command ${fullCommand[0]} failed.` };
+    }
+}
+
+async function loadRootHash() {
+    try {
+        const hash = await fs.readFile(ROOT_HASH_FILE, 'utf8');
+        return hash.trim();
+    } catch (e) {
+        console.error(`Root hash file not found: ${e.message}`);
         return null;
     }
 }
 
-async function fetchServiceLogs(serviceId) {
-// ... existing logic (no change needed here)
-    const logContainer = document.getElementById('service-log-content');
-    const serviceName = CORE_SERVICES_MAP[serviceId] || serviceId;
-    logContainer.textContent = '正在加载 ' + serviceName + ' 日志...';
-    const data = await fetchData('/system/logs', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ service: serviceId })
-    });
-    if (data && data.logs) {
-        const prefixedLogs = data.logs.split('\n').map(line => `~$ ${line}`).join('\n');
-        logContainer.textContent = prefixedLogs;
-    } else {
-        logContainer.textContent = `~$ 无法加载 ${serviceName} 日志。`;
+async function getUserByUsername(username) {
+    return db.get('SELECT * FROM users WHERE username = ?', username);
+}
+
+function loadInternalSecret() {
+    return config.internal_api_secret;
+}
+
+async function loadHosts() {
+    try {
+        if (!fsSync.existsSync(HOSTS_DB_PATH)) {
+            await fs.writeFile(HOSTS_DB_PATH, '[]', 'utf8');
+            return [];
+        }
+        const data = await fs.readFile(HOSTS_DB_PATH, 'utf8');
+        const hosts = JSON.parse(data);
+        if (Array.isArray(hosts)) {
+            return hosts.map(h => String(h).toLowerCase()).filter(h => h);
+        }
+        return [];
+    } catch (e) {
+        console.error(`Error loading hosts file: ${e.message}`);
+        return [];
     }
 }
 
-async function fetchHosts() {
-// ... existing logic (no change needed here)
-     const data = await fetchData('/settings/hosts');
-     if (data && data.hosts) {
-        renderHosts(data.hosts);
-     } else {
-        renderHosts([]);
-     }
-}
+// --- 辅助函数 (safeRunCommand, logAction, getSystemLockStatus) ---
 
-async function saveHosts() {
-// ... existing logic (no change needed here)
-    const textarea = document.getElementById('host-list-textarea');
-    const hostsArray = textarea.value.split('\n').map(h => h.trim()).filter(h => h.length > 0);
-    showStatus('正在保存 Host 配置并通知 WSS 代理热重载...', true);
-    const result = await fetchData('/settings/hosts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ hosts: hostsArray })
-    });
-    if (result) {
-        showStatus(result.message, true);
+async function logAction(actionType, username, details = "") {
+    const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
+    const operatorIp = '127.0.0.1 (System)'; 
+    const logEntry = `[${timestamp}] [USER:${username}] [IP:${operatorIp}] ACTION:${actionType} DETAILS: ${details}\n`;
+    try {
+        await fs.appendFile(AUDIT_LOG_PATH, logEntry);
+    } catch (e) {
+        console.error(`Error writing to audit log: ${e.message}`);
     }
 }
 
-/**
- * [V6.0 FIX] 读取全局 QoS 设置
- */
-async function fetchGlobalSettings() {
-     const data = await fetchData('/settings/global');
-     if (data && data.settings) {
-        // 检查元素是否存在，防止 TypeError
-        const fuseEl = document.getElementById('global-fuse-threshold');
-        const bandEl = document.getElementById('global-bandwidth-limit');
-        if (fuseEl) fuseEl.value = data.settings.fuse_threshold_kbps || 0;
-        // [V6.0 NEW] 全局带宽限制
-        if (bandEl) bandEl.value = data.settings.global_bandwidth_limit_mbps || 0;
-     }
-}
-
-/**
- * [V6.0 FIX] 保存全局 QoS 设置
- */
-async function saveGlobalSettings() {
-    const fuseThreshold = document.getElementById('global-fuse-threshold').value;
-    const bandwidthLimit = document.getElementById('global-bandwidth-limit').value; // [V6.0 NEW]
-    
-    showStatus('正在保存全局安全设置并实时通知所有代理...', true);
-    
-    const result = await fetchData('/settings/global', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-            fuse_threshold_kbps: parseInt(fuseThreshold),
-            global_bandwidth_limit_mbps: parseInt(bandwidthLimit) // [V6.0 NEW]
-        })
-    });
-    
-    if (result) {
-        showStatus(result.message, true);
-    }
-}
-
-/**
- * [V6.0 FIX / BUGFIX 2] 读取所有配置项
- */
-async function fetchGlobalConfig() {
-     const data = await fetchData('/settings/config');
-     if (data && data.config) {
-        // [BUGFIX 2] 增强对 DOM 元素的检查，防止 TypeError
-        const setVal = (id, value) => {
-            const el = document.getElementById(id);
-            if (el) el.value = value;
-            else console.warn(`[Config Load] Element not found: ${id}`);
-        };
-        const setChecked = (id, value) => {
-             const el = document.getElementById(id);
-             if (el) el.checked = (value === 1);
-             else console.warn(`[Config Load] Element not found: ${id}`);
-        };
-
-        setVal('config-panel-port', data.config.panel_port);
-        setVal('config-stunnel-port', data.config.stunnel_port);
-        setVal('config-udpgw-port', data.config.udpgw_port);
-        setVal('config-udp-custom-port', data.config.udp_custom_port || 7400);
-        // 此处是导致 TypeError 的位置之一。在 index.html 中确认此 ID 的元素存在。
-        setVal('config-internal-forward-port', data.config.internal_forward_port); 
-
-        // [V6.0 NEW] Nginx/Xray 配置
-        setVal('config-nginx-domain', data.config.nginx_domain || '');
-        setChecked('config-nginx-enable', data.config.nginx_enable);
-        setVal('config-wss-ws-path', data.config.wss_ws_path || '/ssh-ws');
-        setVal('config-xray-ws-path', data.config.xray_ws_path || '/vless-ws');
-        setVal('config-wss-proxy-port-internal', data.config.wss_proxy_port_internal || 10080);
-        setVal('config-xray-port-internal', data.config.xray_port_internal || 10081);
-        setVal('config-xray-api-port', data.config.xray_api_port || 10085);
-     }
-}
-
-/**
- * [V6.0 FIX] 保存所有配置项
- */
-async function saveGlobalConfig() {
-    showStatus('正在保存端口和网关配置...', true);
-    
-    const configData = {
-        panel_port: parseInt(document.getElementById('config-panel-port').value),
-        // wss_http_port/wss_tls_port 不再更新
-        wss_http_port: FLASK_CONFIG.WSS_HTTP_PORT || 80, 
-        wss_tls_port: FLASK_CONFIG.WSS_TLS_PORT || 443,
-        stunnel_port: parseInt(document.getElementById('config-stunnel-port').value),
-        udpgw_port: parseInt(document.getElementById('config-udpgw-port').value),
-        udp_custom_port: parseInt(document.getElementById('config-udp-custom-port').value) || 7400,
-        internal_forward_port: parseInt(document.getElementById('config-internal-forward-port').value),
+async function getSystemLockStatus() {
+    try {
+        // [V6.2 FIX] 修复 getent shadow 需要密码的问题：
+        // 在安装脚本 (install.sh) 中，我们已经为 'admin' 用户设置了 NOPASSWD 权限，
+        // 但为了读取 shadow 文件，需要确保用户 'admin' 对 'getent shadow' 有 NOPASSWD 权限，并且该命令可以通过 sudo 运行。
+        // 如果这里仍然失败，可能是 Sudoers 配置没有生效，或者 Node.js 进程没有正确以 'admin' 用户身份运行。
+        // 由于 wss_panel.service 是以 'admin' 身份运行的，我们应该使用 'sudo' 来调用需要 root 权限的命令。
+        // 确保使用 ['sudo', 'getent', 'shadow']。
         
-        // [V6.0 NEW] Nginx/Xray 配置
-        nginx_domain: document.getElementById('config-nginx-domain').value,
-        nginx_enable: document.getElementById('config-nginx-enable').checked ? 1 : 0,
-        wss_ws_path: document.getElementById('config-wss-ws-path').value,
-        xray_ws_path: document.getElementById('config-xray-ws-path').value,
-        wss_proxy_port_internal: parseInt(document.getElementById('config-wss-proxy-port-internal').value) || 10080,
-        xray_port_internal: parseInt(document.getElementById('config-xray-port-internal').value) || 10081,
-        xray_api_port: parseInt(document.getElementById('config-xray-api-port').value) || 10085
-    };
-    
-    const result = await fetchData('/settings/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(configData)
+        // 注意：safeRunCommand 内部会添加 'sudo' 前缀，所以我们只需要提供 ['getent', 'shadow']。
+        const { success, output } = await safeRunCommand(['getent', 'shadow']);
+        
+        if (!success) {
+            // [V6.2 FIX] 仅在控制台报告错误，但不依赖于此功能来阻止启动
+            console.error("[CRITICAL] getSystemLockStatus: Failed to run 'sudo getent shadow'. Ensure Sudoers file for 'admin' user is correct.");
+            return new Set();
+        }
+        const lockedUsers = new Set();
+        output.split('\n').forEach(line => {
+            const parts = line.split(':');
+            if (parts.length > 1) {
+                const username = parts[0];
+                const passwordHash = parts[1];
+                if (passwordHash.startsWith('!') || passwordHash.startsWith('*')) {
+                    lockedUsers.add(username);
+                }
+            }
+        });
+        return lockedUsers;
+    } catch (e) {
+        console.error(`[CRITICAL] getSystemLockStatus Error: ${e.message}`);
+        return new Set();
+    }
+}
+
+
+// --- 数据库 Setup and User Retrieval (initDb) ---
+
+async function initDb() {
+    db = await open({
+        filename: DB_PATH,
+        driver: sqlite3.Database
     });
+    try {
+        await db.exec('PRAGMA journal_mode = WAL;');
+        console.log("[DB] WAL (Write-Ahead Logging) mode enabled.");
+    } catch (e) {
+        console.error(`[DB] Failed to enable WAL mode: ${e.message}`);
+    }
+    await db.exec(`
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY, password_hash TEXT, created_at TEXT,
+            status TEXT, expiration_date TEXT, quota_gb REAL,
+            usage_gb REAL DEFAULT 0.0, rate_kbps INTEGER DEFAULT 0,
+            max_connections INTEGER DEFAULT 0,
+            require_auth_header INTEGER DEFAULT 1, realtime_speed_up REAL DEFAULT 0.0,
+            realtime_speed_down REAL DEFAULT 0.0, active_connections INTEGER DEFAULT 0,
+            status_text TEXT, allow_shell INTEGER DEFAULT 0,
+            uuid TEXT, 
+            xray_protocol TEXT DEFAULT 'none' 
+        );
+        CREATE TABLE IF NOT EXISTS ip_bans ( ip TEXT PRIMARY KEY, reason TEXT, added_by TEXT, timestamp TEXT );
+        CREATE TABLE IF NOT EXISTS traffic_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL,
+            date TEXT NOT NULL, usage_gb REAL DEFAULT 0.0, UNIQUE(username, date)
+        );
+        CREATE TABLE IF NOT EXISTS global_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+    `);
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_traffic_history_user_date ON traffic_history (username, date);`);
     
-    if (result) {
-        showStatus(result.message, true);
-        if (configData.panel_port !== FLASK_CONFIG.PANEL_PORT) {
-            showStatus('面板端口已更改！页面将在 3 秒后尝试使用新端口重新加载...', true);
-            setTimeout(() => {
-                window.location.port = configData.panel_port;
-                window.location.reload();
-            }, 3000);
+    try { await db.exec('ALTER TABLE users ADD COLUMN password_hash TEXT'); } catch (e) { /* ignore */ }
+    try { await db.exec('ALTER TABLE users ADD COLUMN max_connections INTEGER DEFAULT 0'); } catch (e) { /* ignore */ }
+    try { await db.exec('ALTER TABLE users ADD COLUMN require_auth_header INTEGER DEFAULT 1'); } catch (e) { /* ignore */ }
+    try { await db.exec('ALTER TABLE users ADD COLUMN realtime_speed_up REAL DEFAULT 0.0'); } catch (e) { /* ignore */ }
+    try { await db.exec('ALTER TABLE users ADD COLUMN realtime_speed_down REAL DEFAULT 0.0'); } catch (e) { /* ignore */ }
+    try { await db.exec('ALTER TABLE users ADD COLUMN active_connections INTEGER DEFAULT 0'); } catch (e) { /* ignore */ }
+    try { await db.exec('ALTER TABLE users ADD COLUMN status_text TEXT'); } catch (e) { /* ignore */ }
+    try { await db.exec('ALTER TABLE users ADD COLUMN allow_shell INTEGER DEFAULT 0'); } catch (e) { /* ignore */ }
+    // [V6.0 NEW] 自动添加 UUID 和 Protocol 字段
+    try { await db.exec('ALTER TABLE users ADD COLUMN uuid TEXT'); } catch (e) { /* ignore */ }
+    try { await db.exec('ALTER TABLE users ADD COLUMN xray_protocol TEXT DEFAULT \'none\''); } catch (e) { /* ignore */ }
+
+
+    let oldFuseColumnExists = false;
+    try {
+        await db.exec('ALTER TABLE users ADD COLUMN fuse_threshold_kbps INTEGER DEFAULT 0');
+    } catch (e) {
+        if (e.message.includes("duplicate column name")) {
+            oldFuseColumnExists = true;
         }
     }
-}
-
-
-// --- [AXIOM V3.0] 实时刷新主函数 (重构为 WebSocket) ---
-
-/**
- * [AXIOM V3.0] 新增: WebSocket 状态指示灯 (需求 #5)
- * @param {'red' | 'green' | 'blue' | 'gray'} color 状态颜色
- * @param {string} tip 鼠标悬停提示
- */
-function setWsStatusIcon(color, tip) {
-// ... existing logic (no change needed here)
-    const button = document.getElementById('ws-status-button');
-    const tooltip = document.getElementById('ws-status-tooltip');
-    if (!button || !tooltip) return;
-
-    tooltip.setAttribute('data-tip', tip);
     
-    let iconName = 'wifi';
-    let iconClass = 'w-5 h-5 transition-colors duration-300 ';
+    await db.run("INSERT OR IGNORE INTO global_settings (key, value) VALUES (?, ?)", 'fuse_threshold_kbps', '0');
 
-    switch (color) {
-        case 'red':
-            iconClass += 'status-light-red';
-            iconName = 'wifi-off';
-            break;
-        case 'green':
-            iconClass += 'status-light-green';
-            iconName = 'wifi';
-            break;
-        case 'blue':
-            iconClass += 'status-light-blue animate-spin'; // Add spin class
-            iconName = 'loader-2'; 
-            break;
-        case 'gray':
-        default:
-            iconClass += 'status-light-gray';
-            iconName = 'wifi-off';
-            break;
-    }
-    
-    // 1. 清空按钮的旧图标
-    button.innerHTML = '';
-    
-    // 2. 创建一个新的 <i> 元素
-    const newIcon = document.createElement('i');
-    newIcon.id = 'ws-status-icon'; // 重新分配 ID
-    newIcon.setAttribute('data-lucide', iconName);
-    newIcon.className = iconClass;
-    
-    // 3. 将新的 <i> 元素附加到按钮
-    button.appendChild(newIcon);
-    
-    // 4. 在新创建的 <i> 元素上调用 lucide.createIcons()
-    try {
-        lucide.createIcons({
-            nodes: [newIcon]
-        });
-    } catch (e) {
-        console.error("Lucide icon creation failed:", e);
-        newIcon.textContent = iconName; 
-    }
-}
-
-/**
- * [AXIOM V3.0] 新增: WebSocket 客户端
- */
-function connectWebSocket() {
-// ... existing logic (no change needed here)
-    if (wsReconnectTimer) {
-        clearTimeout(wsReconnectTimer);
-        wsReconnectTimer = null;
-    }
-    if (panelSocket) {
-        panelSocket.close();
-        panelSocket = null;
-    }
-
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${wsProtocol}//${window.location.host}/ws/ui`;
-    
-    console.log(`[AXIOM V5.0] 正在连接到 WebSocket: ${wsUrl}`);
-    setWsStatusIcon('blue', '正在连接实时推送...'); // 蓝色: 连接中
-
-    panelSocket = new WebSocket(wsUrl);
-
-    panelSocket.onopen = (event) => {
-        console.log('[AXIOM V5.0] WebSocket 已连接。等待服务器验证...');
-    };
-
-    panelSocket.onmessage = (event) => {
+    if (oldFuseColumnExists) {
+        console.log("[MIGRATE] Old 'fuse_threshold_kbps' column detected. Migrating to global_settings table...");
         try {
-            const message = JSON.parse(event.data);
-            
-            switch (message.type) {
-                case 'status_connected':
-                    setWsStatusIcon('green', '实时推送已连接 (1秒/3秒刷新)');
-                    console.log('[AXIOM V5.0] WebSocket 身份验证成功。正在加载初始数据...');
-                    // [V5.1.1 FIX] 确保所有静态数据加载成功
-                    fetchAllStaticData(); 
-                    break;
-                
-                case 'live_update':
-                    // [AXIOM V5.0] 1秒推送：用户流量和总连接数
-                    if (message.payload) {
-                        if (message.payload.users) {
-                            handleSilentUpdate(message.payload.users);
-                        }
-                        if (message.payload.system) {
-                            // 只更新活跃连接总数
-                            handleDashboardConnectionSilentUpdate(message.payload.system);
-                            updateRealtimeTrafficChart(message.payload);
-                        }
-                    }
-                    break;
-                
-                case 'system_update':
-                    // [AXIOM V5.0] 3秒推送：系统状态（CPU/内存/服务/端口）
-                    if (message.payload) {
-                        // [V5.1.1 FIX] 调用新的消息处理器
-                        handleSystemUpdateMessage(message.payload);
-                    }
-                    break;
-                
-                case 'users_changed':
-                    console.log('[AXIOM V5.0] 收到 users_changed 推送，正在全量刷新用户列表...');
-                    fetchAllUsersAndRender();
-                    break;
-                
-                case 'hosts_changed':
-                    if (currentView === 'hosts') {
-                        console.log('[AXIOM V5.0] 收到 hosts_changed 推送，正在刷新 Hosts...');
-                        fetchHosts();
-                    }
-                    break;
-                
-                case 'auth_failed':
-                    console.error('[AXIOM V5.0] WebSocket 身份验证失败。');
-                    setWsStatusIcon('red', '实时推送身份验证失败');
-                    showStatus('实时推送身份验证失败，请重新登录。', false);
-                    panelSocket.close();
-                    break;
+            const firstUser = await db.get('SELECT fuse_threshold_kbps FROM users WHERE fuse_threshold_kbps > 0 LIMIT 1');
+            if (firstUser && firstUser.fuse_threshold_kbps > 0) {
+                await db.run(
+                    "UPDATE global_settings SET value = ? WHERE key = ?", 
+                    firstUser.fuse_threshold_kbps.toString(),
+                    'fuse_threshold_kbps'
+                );
+                console.log(`[MIGRATE] Migrated fuse value ${firstUser.fuse_threshold_kbps} to global_settings.`);
             }
         } catch (e) {
-            console.error('[AXIOM V5.0] 解析 WebSocket 消息失败:', e);
+            console.error(`[MIGRATE] Failed to migrate old fuse setting: ${e.message}`);
         }
-    };
-
-    panelSocket.onclose = (event) => {
-        console.warn(`[AXIOM V5.0] WebSocket 已断开。代码: ${event.code}. 3秒后重试...`);
-        setWsStatusIcon('red', '实时推送已断开，正在重连...');
-        if (!wsReconnectTimer) {
-            wsReconnectTimer = setTimeout(connectWebSocket, 3000);
-        }
-    };
-
-    panelSocket.onerror = (error) => {
-        console.error('[AXIOM V5.0] WebSocket 发生错误: ', error);
-        setWsStatusIcon('red', '实时推送连接错误');
-    };
-}
-
-
-/**
- * [AXIOM V3.1] 建议 #2: 初始化实时流量图
- */
-function initRealtimeTrafficChart() {
-// ... existing logic (no change needed here)
-    if (realtimeChartInstance) {
-        realtimeChartInstance.destroy();
-    }
-    const ctx = document.getElementById('realtime-traffic-chart').getContext('2d');
-    
-    const initialLabels = Array(30).fill('');
-    const initialDataUp = Array(30).fill(0);
-    const initialDataDown = Array(30).fill(0);
-
-    realtimeChartInstance = new Chart(ctx, {
-        type: 'line',
-        data: {
-            labels: initialLabels,
-            datasets: [
-                {
-                    label: '上传 (KB/s)',
-                    data: initialDataUp,
-                    borderColor: '#34d399', // green-400
-                    backgroundColor: 'rgba(52, 211, 153, 0.1)',
-                    borderWidth: 2,
-                    pointRadius: 0,
-                    tension: 0.3,
-                    fill: true
-                },
-                {
-                    label: '下载 (KB/s)',
-                    data: initialDataDown,
-                    borderColor: '#3b82f6', // blue-500
-                    backgroundColor: 'rgba(59, 130, 246, 0.1)',
-                    borderWidth: 2,
-                    pointRadius: 0,
-                    tension: 0.3,
-                    fill: true
-                }
-            ]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            animation: false, // 关键: 禁用动画以实现平滑更新
-            scales: {
-                y: {
-                    beginAtZero: true,
-                    ticks: {
-                        callback: function(value, index, values) {
-                            return value + ' KB/s';
-                        }
-                    }
-                },
-                x: {
-                    ticks: { display: false } // 隐藏 X 轴标签
-                }
-            },
-            plugins: {
-                legend: { position: 'bottom', labels: { padding: 10 } },
-                tooltip: {
-                    intersect: false,
-                    mode: 'index',
-                }
-            },
-            interaction: {
-                intersect: false,
-                mode: 'index',
-            }
-        }
-    });
-}
-
-/**
- * [AXIOM V3.1] 建议 #2: 更新实时流量图 (1秒)
- */
-function updateRealtimeTrafficChart(liveUpdatePayload) {
-// ... existing logic (no change needed here)
-    if (!realtimeChartInstance || !liveUpdatePayload || !liveUpdatePayload.users) {
-        return;
     }
     
-    // [AXIOM V3.1] 聚合所有用户的总速度
-    let totalSpeedUp = 0;
-    let totalSpeedDown = 0;
-    for (const username in liveUpdatePayload.users) {
-        const userSpeed = liveUpdatePayload.users[username].speed_kbps;
-        totalSpeedUp += (userSpeed.upload || 0);
-        totalSpeedDown += (userSpeed.download || 0);
-    }
-    
-    const labels = realtimeChartInstance.data.labels;
-    const dataUp = realtimeChartInstance.data.datasets[0].data;
-    const dataDown = realtimeChartInstance.data.datasets[1].data;
-
-    // 1. 移除最旧的数据
-    labels.shift();
-    dataUp.shift();
-    dataDown.shift();
-
-    // 2. 添加最新的数据
-    const now = new Date();
-    labels.push(now.toLocaleTimeString()); 
-    dataUp.push(totalSpeedUp.toFixed(1));
-    dataDown.push(totalSpeedDown.toFixed(1));
-
-    // 3. 更新图表
-    realtimeChartInstance.update('none'); // 使用 'none' 避免动画和过渡
-}
-
-
-/**
- * [AXIOM V5.5 FIX 僵尸清理] 优雅的静默更新处理器 (1秒)
- * @param {object} userStats - 仅包含有变化的用户数据
- */
-function handleSilentUpdate(userStats) {
-// ... existing logic (no change needed here)
-    if (currentView !== 'users') return; 
-
-    for (const username in userStats) {
-        if (!userStats.hasOwnProperty(username)) continue;
-        
-        const stats = userStats[username];
-        const speedUpText = formatSpeedUnits(stats.speed_kbps.upload || 0);
-        const speedDownText = formatSpeedUnits(stats.speed_kbps.download || 0);
-        const connectionsText = stats.connections || 0;
-        
-        // 找到用户在缓存中的索引
-        const userIndex = allUsersCache.findIndex(u => u.username === username);
-        if (userIndex === -1) continue; 
-
-        // 1. 更新 allUsersCache 中的实时数据 (确保列表排序和移动端卡片使用最新值)
-        allUsersCache[userIndex].realtime_speed_up = stats.speed_kbps.upload;
-        allUsersCache[userIndex].realtime_speed_down = stats.speed_kbps.download;
-        allUsersCache[userIndex].active_connections = connectionsText;
-        
-        // 2. 更新 PC 列表 (只修改 textContent)
-        const speedCell = document.getElementById(`speed-cell-${username}`);
-        const connCell = document.getElementById(`conn-cell-${username}`); 
-
-        if (speedCell) {
-            speedCell.innerHTML = 
-                `<span class="speed-up">↑ ${speedUpText}</span> / ` +
-                `<span class="speed-down">↓ ${speedDownText}</span>`;
-        }
-        if (connCell) {
-            connCell.textContent = connectionsText;
-        }
-
-        // 3. 更新移动端卡片 (只修改 textContent)
-        const speedUpMobile = document.getElementById(`speed-up-mobile-${username}`);
-        const speedDownMobile = document.getElementById(`speed-down-mobile-${username}`);
-        const connMobile = document.getElementById(`conn-mobile-${username}`);
-
-        if (speedUpMobile) speedUpMobile.textContent = `↑ ${speedUpText}`;
-        if (speedDownMobile) speedDownMobile.textContent = `↓ ${speedDownText}`;
-        if (connMobile) connMobile.textContent = connectionsText;
-    }
-}
-
-/**
- * [AXIOM V5.0] 仪表盘连接数静默更新 (1秒)
- * @param {object} systemStats - 例如: { "active_connections_total": 3 }
- */
-function handleDashboardConnectionSilentUpdate(systemStats) {
-// ... existing logic (no change needed here)
-    if (currentView !== 'dashboard') return; 
-
-    // 只更新“活跃连接数”
-    const activeConnsWidget = document.getElementById('stat-active-conns');
-    if (activeConnsWidget) {
-        activeConnsWidget.textContent = systemStats.active_connections_total;
-    }
-}
-
-
-/**
- * [AXIOM V3.1] 重构: `fetchAllStaticData`
- */
-async function fetchAllStaticData() {
-// ... existing logic (no change needed here)
-    console.log("[AXIOM V6.0] 正在加载一次性静态数据...");
     try {
-        // 1. 异步获取配置 (确保 CORE_SERVICES_MAP 是最新的)
-        const data = await fetchData('/settings/config');
-        if (data && data.config) {
-            FLASK_CONFIG = {
-                // Existing Config
-                WSS_HTTP_PORT: data.config.wss_http_port,
-                WSS_TLS_PORT: data.config.wss_tls_port,
-                STUNNEL_PORT: data.config.stunnel_port,
-                UDPGW_PORT: data.config.udpgw_port,
-                UDP_CUSTOM_PORT: data.config.udp_custom_port, 
-                INTERNAL_FORWARD_PORT: data.config.internal_forward_port,
-                PANEL_PORT: data.config.panel_port,
-                // [V6.0 NEW] Nginx/Xray Config
-                NGINX_DOMAIN: data.config.nginx_domain,
-                NGINX_ENABLE: data.config.nginx_enable,
-                WSS_WS_PATH: data.config.wss_ws_path,
-                XRAY_WS_PATH: data.config.xray_ws_path,
-                WSS_PROXY_PORT_INTERNAL: data.config.wss_proxy_port_internal,
-                XRAY_PORT_INTERNAL: data.config.xray_port_internal,
-                XRAY_API_PORT: data.config.xray_api_port
-            };
+        const fuseSetting = await db.get("SELECT value FROM global_settings WHERE key = 'fuse_threshold_kbps'");
+        if (fuseSetting) {
+            globalFuseLimitKbps = parseInt(fuseSetting.value) || 0;
+            console.log(`[DB] Global fuse threshold loaded into memory: ${globalFuseLimitKbps} KB/s`);
         }
-        
-        if (typeof lucide === 'undefined' || typeof lucide.createIcons !== 'function') {
-            showStatus('图标库(Lucide)加载失败，请刷新。', false);
-            console.error("Lucide library is not loaded.");
-            return;
-        }
+    } catch(e) {
+        console.error(`[DB] Failed to load global fuse threshold: ${e.message}`);
+    }
+    
+    console.log(`SQLite database initialized at ${DB_PATH}`);
+}
 
-        // 2. 加载仪表盘数据 (将触发全量渲染)
-        const statusData = await fetchData('/system/status');
-        if (statusData) {
-            renderSystemStatus(statusData);
-            renderUserQuickStats(statusData.user_stats); 
-            initRealtimeTrafficChart();
-        }
+// --- Authentication Middleware ---
 
-        // 3. 加载用户列表
-        await fetchAllUsersAndRender();
-        
-        // 4. (可选) 预加载其他视图的数据
-        if (currentView === 'live-ips') { fetchActiveIPs(); }
-        
-        // 4.1. 确保日志按钮与 CORE_SERVICES_MAP 同步
-        const btnGroup = document.querySelector('#view-settings .btn-group');
-        if (btnGroup) {
-             // 清空旧按钮
-            btnGroup.innerHTML = '';
-            
-            Object.keys(CORE_SERVICES_MAP).forEach(key => {
-                const newButton = document.createElement('button');
-                newButton.setAttribute('onclick', `fetchServiceLogs('${key}')`);
-                newButton.className = 'btn btn-ghost btn-sm';
-                newButton.textContent = CORE_SERVICES_MAP[key];
-                btnGroup.appendChild(newButton);
+function loadSecretKey() {
+    try {
+        return fsSync.readFileSync(SECRET_KEY_PATH, 'utf8').trim();
+    } catch (e) {
+        const key = require('crypto').randomBytes(32).toString('hex');
+        fsSync.writeFileSync(SECRET_KEY_PATH, key, 'utf8');
+        return key;
+    }
+}
+
+const sessionMiddleware = session({
+    secret: loadSecretKey(),
+    resave: false,
+    saveUninitialized: true,
+    cookie: { 
+        secure: false, httpOnly: true,
+        maxAge: 3600000 * 24, sameSite: 'lax'
+    }
+});
+app.use(sessionMiddleware);
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+
+function loginRequired(req, res, next) {
+    if (req.session.loggedIn) {
+        next();
+    } else {
+        if (req.path.startsWith('/api/')) {
+            return res.status(401).json({ success: false, message: "Authentication failed or session expired" });
+        }
+        return res.redirect('/login.html');
+    }
+}
+
+// --- Business Logic / System Sync ---
+
+function broadcastToFrontends(message) {
+    if (!wssUiPool || wssUiPool.size === 0) {
+        return; 
+    }
+    const payload = JSON.stringify(message);
+    wssUiPool.forEach((client) => {
+        if (client.readyState === 1) { 
+            client.send(payload, (err) => {
+                if (err) {
+                    console.error(`[IPC_UI] 发送消息到前端失败: ${err.message}`);
+                }
             });
         }
-        
-        if (currentView === 'settings') { 
-            fetchAuditLogs(); 
-        }
-        if (currentView === 'security') { fetchGlobalBans(); }
-        
-        // 5. 隐藏骨架屏, 显示真实卡片
-        const skeleton = document.getElementById('dashboard-skeleton-loader');
-        const card1 = document.getElementById('system-status-card');
-        const card2 = document.getElementById('user-stats-card');
-        const card3 = document.getElementById('realtime-traffic-card');
-
-        if (skeleton) skeleton.style.display = 'none';
-        if (card1) card1.style.display = 'block';
-        if (card2) card2.style.display = 'block';
-        if (card3) card3.style.display = 'block';
-        
-    } catch (error) {
-        console.error("Error during fetchAllStaticData:", error);
-    }
+    });
 }
 
-async function fetchAllUsersAndRender() {
-// ... existing logic (no change needed here)
-    const usersData = await fetchData('/users/list');
-    if (usersData) {
-        allUsersCache = usersData.users; 
-        if (currentView === 'users') {
-            renderFilteredUserList(); 
-        }
-        if (currentView === 'payload-gen') { 
-            populatePayloadUserSelect();
-        }
-    }
-}
-
-async function fetchActiveIPs() {
-// ... existing logic (no change needed here)
-     const ipData = await fetchData('/system/active_ips');
-     if (ipData) {
-        renderActiveGlobalIPs(ipData.active_ips);
-     }
-}
-async function fetchAuditLogs() {
-// ... existing logic (no change needed here)
-    const auditData = await fetchData('/system/audit_logs');
-    if (auditData) {
-        renderAuditLogs(auditData.logs);
-    }
-}
-async function fetchGlobalBans() {
-// ... existing logic (no change needed here)
-    const globalData = await fetchData('/ips/global_list');
-    if (globalData) {
-        renderGlobalBans(globalData.global_bans);
-    }
-}
-
-// --- 用户操作实现 (保持不变) ---
-
-function generateBase64Token(username, password) {
-// ... existing logic (no change needed here)
-    if (!username || !password) return null; 
-    try {
-        const token = btoa(`${username}:${password}`); 
-        return token;
-    } catch (e) {
-        console.error("btoa failed:", e);
-        return "编码失败";
-    }
-}
-
-/**
- * [V6.0 NEW / BUGFIX 1] Xray 链接生成器
- * @param {string} protocol - vmess/vless/trojan
- * @param {string} uuid - 用户UUID
- * @param {string} wsPath - 路径
- * @param {string} domain - 域名
- * @returns {string} - Base64 编码的链接
- */
-function generateXrayLink(protocol, uuid, wsPath, domain) {
-    if (!uuid || !domain || protocol === 'none') {
-        return "请检查 UUID、域名和协议配置";
-    }
-    
-    const port = 443;
-    let link = "";
-
-    try {
-        // [BUGFIX 1] 确保 UUID 是有效的字符串，否则 Xray 链接会失败
-        if (uuid === 'N/A' || uuid.length < 16) {
-             return "UUID 无效或未生成。";
-        }
-        
-        if (protocol === 'vless') {
-            const VLESS_CONFIG = {
-                v: "0",
-                ps: uuid.substring(0, 8),
-                add: domain,
-                port: port,
-                id: uuid,
-                aid: 0,
-                net: "ws",
-                type: "none",
-                host: domain,
-                path: wsPath,
-                tls: "tls",
-                sni: domain
-            };
-            const params = `security=tls&type=ws&host=${domain}&path=${encodeURIComponent(wsPath)}&sni=${domain}`;
-            link = `vless://${uuid}@${domain}:${port}?${params}#${VLESS_CONFIG.ps}`;
-            
-        } else if (protocol === 'vmess') {
-            const VMESS_CONFIG = {
-                v: "2",
-                ps: uuid.substring(0, 8),
-                add: domain,
-                port: port,
-                id: uuid,
-                aid: 0,
-                net: "ws",
-                type: "none",
-                host: domain,
-                path: wsPath,
-                tls: "tls",
-                sni: domain
-            };
-            const jsonString = JSON.stringify(VMESS_CONFIG);
-            link = `vmess://${btoa(jsonString)}`;
-        } else {
-             return `不支持的协议: ${protocol}`;
-        }
-        
-        return link;
-
-    } catch (e) {
-        console.error("Xray Link generation failed:", e);
-        return "生成链接失败，请检查域名和路径是否正确。";
-    }
-}
-
-document.getElementById('add-user-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const username = document.getElementById('new-username').value;
-    const password = document.getElementById('new-password').value;
-    const expirationDays = document.getElementById('expiration-days').value;
-    // [BUGFIX 1] 修复 ReferenceError: quota_gb is not defined
-    const quotaGb = document.getElementById('quota-gb').value; 
-    const rateKbps = document.getElementById('rate-kbps').value;
-    const maxConnections = document.getElementById('new-max-connections').value;
-    const requireAuth = document.getElementById('new-require-auth').checked; 
-    const allowShell = document.getElementById('new-allow-shell').checked; 
-    // [V6.0 NEW]
-    const xrayProtocol = document.getElementById('new-xray-protocol').value;
-
-    if (!/^[a-z0-9_]{3,16}$/.test(username)) {
-        showStatus('用户名格式不正确 (3-16位小写字母/数字/下划线)', false);
+function broadcastToProxies(message) {
+    if (!wssIpc || wssIpc.clients.size === 0) {
+        console.warn("[IPC_WSS] 无法广播: 没有连接的数据平面 (Proxy) 实例。");
         return;
     }
-    showStatus('正在创建用户 ' + username + '...', true);
-
-    const result = await fetchData('/users/add', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-            username: username, 
-            password: password, 
-            expiration_days: parseInt(expirationDays),
-            quota_gb: parseFloat(quotaGb), // 使用正确定义的 quotaGb
-            rate_kbps: parseInt(rateKbps),
-            max_connections: parseInt(maxConnections),
-            require_auth_header: requireAuth ? 1 : 0,
-            allow_shell: allowShell ? 1 : 0,
-            xray_protocol: xrayProtocol // [V6.0 NEW]
-        })
-    });
-
-    if (result) {
-        showStatus(result.message, true);
-        document.getElementById('add-user-form').reset();
-        closeModal('add-user-modal');
-        const tokenOutput = document.getElementById('new-connect-token');
-        if (tokenOutput) {
-            tokenOutput.value = "[在此输入用户名和密码]";
-        }
-    }
-});
-
-/**
- * [V6.0 FIX / BUGFIX 3] 增加 UUID 和 Protocol 字段
- */
-async function openSettingsModal(username, expiry_date, quota_gb, rate_kbps, max_connections, fuse_threshold_kbps, require_auth_header, allow_shell, uuid, xray_protocol) {
-    document.getElementById('modal-username-title-settings').textContent = username;
-    document.getElementById('modal-username-setting').value = username;
-    document.getElementById('modal-expiry-date').value = expiry_date; 
-    document.getElementById('modal-quota-gb').value = quota_gb;
-    document.getElementById('modal-rate-kbps').value = rate_kbps;
-    document.getElementById('modal-max-connections').value = (max_connections !== undefined) ? max_connections : 0;
-    document.getElementById('modal-require-auth').checked = (require_auth_header === 1); 
-    document.getElementById('modal-allow-shell').checked = (allow_shell === 1); 
-    
-    document.getElementById('modal-new-password').value = ''; 
-    document.getElementById('modal-connect-token').value = TOKEN_PLACEHOLDER;
-    
-    // [V6.0 NEW] Xray Fields
-    document.getElementById('modal-uuid').value = uuid || 'N/A';
-    document.getElementById('modal-xray-protocol').value = xray_protocol || 'none';
-    document.getElementById('modal-xray-link-output').value = '点击 [生成连接链接]...';
-    
-    // [BUGFIX 3] 初始化连接信息显示，确保 FLASK_CONFIG 已加载
-    if (FLASK_CONFIG.NGINX_DOMAIN && FLASK_CONFIG.NGINX_DOMAIN !== '...') {
-        generateXrayLinkForModal(uuid, xray_protocol);
-    } else {
-        // 如果 FLASK_CONFIG 尚未加载，则延迟执行，直到 fetchAllStaticData 完成
-        // 由于 fetchAllStaticData 是在 connectWebSocket 成功后立即异步执行的，
-        // 且 openSettingsModal 可以在任何时候被调用，此处需要做延迟处理或依赖用户点击生成按钮。
-        // 为确保用户体验，我们依赖用户点击“生成链接”按钮，或等待下次实时推送加载配置。
-        document.getElementById('modal-xray-link-output').value = '配置加载中，请稍后点击 [生成链接]...';
-    }
-
-
-    openModal('settings-modal');
-}
-
-document.getElementById('modal-new-password').addEventListener('input', function() {
-    const username = document.getElementById('modal-username-setting').value;
-    const password = this.value;
-    const tokenInput = document.getElementById('modal-connect-token');
-    
-    if (password) {
-         const token = generateBase64Token(username, password);
-         tokenInput.value = token;
-    } else {
-         tokenInput.value = TOKEN_PLACEHOLDER;
-    }
-});
-
-document.getElementById('modal-xray-protocol').addEventListener('change', function() {
-    const uuid = document.getElementById('modal-uuid').value;
-    generateXrayLinkForModal(uuid, this.value);
-});
-
-function generateXrayLinkForModal(uuid, protocol) {
-    const linkOutput = document.getElementById('modal-xray-link-output');
-    // 确保 FLASK_CONFIG 已经加载完毕
-    const domain = FLASK_CONFIG.NGINX_DOMAIN;
-    const wsPath = FLASK_CONFIG.XRAY_WS_PATH;
-    
-    if (protocol === 'none' || uuid === 'N/A' || !domain || !wsPath || domain === '...') {
-        linkOutput.value = "请在配置中检查域名/路径，并选择协议。";
-        return;
-    }
-
-    linkOutput.value = generateXrayLink(protocol, uuid, wsPath, domain);
-}
-
-
-async function saveUserSettings() {
-    const username = document.getElementById('modal-username-setting').value;
-    const expiry_date = document.getElementById('modal-expiry-date').value;
-    const quota_gb = document.getElementById('modal-quota-gb').value;
-    const rate_kbps = document.getElementById('modal-rate-kbps').value;
-    const max_connections = document.getElementById('modal-max-connections').value;
-    const new_password = document.getElementById('modal-new-password').value;
-    const requireAuth = document.getElementById('modal-require-auth').checked; 
-    const allowShell = document.getElementById('modal-allow-shell').checked; 
-    // [V6.0 NEW]
-    const xrayProtocol = document.getElementById('modal-xray-protocol').value;
-    
-    closeModal('settings-modal');
-    showStatus('正在保存用户 ' + username + ' 的设置并实时通知代理...', true);
-
-    const result = await fetchData('/users/set_settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-            username: username, 
-            expiry_date: expiry_date, 
-            quota_gb: parseFloat(quota_gb), 
-            rate_kbps: parseInt(rate_kbps),
-            max_connections: parseInt(max_connections),
-            new_password: new_password,
-            require_auth_header: requireAuth ? 1 : 0,
-            allow_shell: allowShell ? 1 : 0,
-            xray_protocol: xrayProtocol // [V6.0 NEW]
-        })
-    });
-
-    if (result) {
-        showStatus(result.message, true);
-    }
-}
-
-async function openTrafficChartModal(username) {
-// ... existing logic (no change needed here)
-    document.getElementById('traffic-chart-username-title').textContent = username;
-    document.getElementById('traffic-chart-loading').style.display = 'block';
-    if (trafficChartInstance) {
-        trafficChartInstance.destroy();
-    }
-    openModal('traffic-chart-modal');
-    const data = await fetchData(`/users/traffic-history?username=${username}`);
-    document.getElementById('traffic-chart-loading').style.display = 'none';
-
-    if (data && data.history) {
-        const history = data.history;
-        const dates = history.map(item => item.date.substring(5)); 
-        const usage = history.map(item => item.usage_gb);
-        const ctx = document.getElementById('trafficChartCanvas').getContext('2d');
-        trafficChartInstance = new Chart(ctx, {
-            type: 'line',
-            data: {
-                labels: dates,
-                datasets: [{
-                    label: '每日用量 (GB)',
-                    data: usage,
-                    borderColor: '#3b82f6', // blue-500
-                    backgroundColor: 'rgba(59, 130, 246, 0.1)',
-                    fill: true,
-                    tension: 0.2,
-                    pointRadius: 3,
-                    pointHoverRadius: 5,
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                plugins: { legend: { display: false }, title: { display: false } },
-                scales: {
-                    y: { beginAtZero: true, title: { display: true, text: '流量 (GB)' } },
-                    x: { title: { display: true, text: '日期' } }
+    const payload = JSON.stringify(message);
+    console.log(`[IPC_WSS] 正在广播 (-> ${wssIpc.clients.size} 个代理): ${payload}`);
+    wssIpc.clients.forEach((client) => {
+        if (client.readyState === 1) { 
+            client.send(payload, (err) => {
+                if (err) {
+                    console.error(`[IPC_WSS] 发送消息到代理失败: ${err.message}`);
                 }
+            });
+        }
+    });
+}
+
+
+async function kickUserFromProxy(username) {
+    broadcastToProxies({
+        action: 'kick',
+        username: username
+    });
+    return true; 
+}
+
+/**
+ * [AXIOM V6.1 FIX] 核心修复: 批量写入 WSS 流量增量到 DB
+ * @param {object} workerStatsMap - Key: WorkerId, Value: {stats: {username: {traffic_delta_up, traffic_delta_down}}}
+ */
+async function persistTrafficDelta(workerStatsMap) {
+    const today = new Date().toISOString().split('T')[0];
+    let userDeltaMap = new Map();
+    
+    // 1. 聚合所有 Worker 的 WSS 流量增量
+    for (const [workerId, workerData] of workerStatsMap.entries()) {
+        const stats = workerData.stats || {};
+        // 仅处理 WSS Proxy 的流量 (traffic_delta_up/down)
+        if (workerId.startsWith('xray')) continue; 
+
+        for (const username in stats) {
+            // 确保增量字段存在且为数字
+            const deltaUp = stats[username].traffic_delta_up || 0;
+            const deltaDown = stats[username].traffic_delta_down || 0;
+            
+            const deltaBytes = deltaUp + deltaDown;
+            
+            if (deltaBytes > 0) {
+                const deltaGb = (deltaBytes / GIGA_BYTE);
+                userDeltaMap.set(username, (userDeltaMap.get(username) || 0) + deltaGb);
+            }
+        }
+    }
+
+    if (userDeltaMap.size === 0) return;
+    
+    console.log(`[TRAFFIC_ASYNC] 准备持久化 ${userDeltaMap.size} 个用户的流量增量...`);
+
+    // 2. 批量写入 DB
+    try {
+        await db.run('BEGIN TRANSACTION');
+        
+        // --- A. 准备 SQL 语句 ---
+        const userUpdates = [];
+        const historyUpdates = [];
+        
+        for (const [username, deltaGb] of userDeltaMap.entries()) {
+            if (deltaGb <= 0) continue; 
+            
+            // 1. 更新主表总流量
+            userUpdates.push(db.run('UPDATE users SET usage_gb = usage_gb + ? WHERE username = ?',
+                [deltaGb, username]));
+            
+            // 2. 确保历史记录存在 (INSERT OR IGNORE)
+            historyUpdates.push(db.run('INSERT OR IGNORE INTO traffic_history (username, date, usage_gb) VALUES (?, ?, 0.0)', [username, today]));
+            // 3. 更新历史表流量
+            historyUpdates.push(db.run('UPDATE traffic_history SET usage_gb = usage_gb + ? WHERE username = ? AND date = ?', [deltaGb, username, today]));
+        }
+        
+        await Promise.all(userUpdates);
+        await Promise.all(historyUpdates);
+        
+        await db.run('COMMIT');
+        console.log(`[TRAFFIC_ASYNC] 流量增量 DB 批量写入成功。`);
+        
+    } catch (e) {
+        await db.run('ROLLBACK').catch(()=>{});
+        console.error(`[TRAFFIC_ASYNC] 流量增量 DB 批量写入失败 (事务回滚): ${e.message}`);
+    }
+}
+
+
+/**
+ * [AXIOM V5.5 FIX A2/B2] 聚合所有 Worker 的统计数据
+ */
+function aggregateAllWorkerStats() {
+    const aggregatedStats = {};
+    const aggregatedLiveIps = {};
+    let totalActiveConnections = 0;
+
+    for (const [workerId, workerData] of workerStatsCache.entries()) {
+        for (const username in workerData.stats) {
+            const current = workerData.stats[username];
+            
+            if (!aggregatedStats[username]) {
+                aggregatedStats[username] = {
+                    speed_kbps: { upload: 0, download: 0 },
+                    connections: 0
+                };
+            }
+            
+            const existing = aggregatedStats[username];
+            
+            // WSS 和 UDPGW Worker 都推送 speed_kbps 和 connections
+            existing.connections += current.connections;
+            existing.speed_kbps.upload += current.speed_kbps.upload;
+            existing.speed_kbps.download += current.speed_kbps.download;
+            
+            totalActiveConnections += current.connections;
+        }
+        Object.assign(aggregatedLiveIps, workerData.live_ips);
+    }
+    
+    return {
+        users: aggregatedStats,
+        live_ips: aggregatedLiveIps,
+        system: {
+            active_connections_total: totalActiveConnections
+        }
+    };
+}
+
+/**
+ * [AXIOM V5.0] 核心功能: 1秒实时流量/连接推送
+ */
+function pushLiveUpdates() {
+    if (!isRealtimePushing) return;
+    
+    // [V6.0 NEW] ---------------------------------------
+    // 异步拉取 Xray 统计 (此处应连接 gRPC，暂时跳过)
+    // const xrayStats = await fetchXrayStats();
+    // workerStatsCache.set('xray', xrayStats);
+    // ----------------------------------------------------
+    
+    const aggregatedData = aggregateAllWorkerStats();
+    
+    // 1. 检查用户流量/连接数据是否有变化
+    const usersToPush = {};
+    let usersChanged = false;
+    let currentTotalSpeedKbps = 0;
+
+    for (const username in aggregatedData.users) {
+        const current = aggregatedData.users[username];
+        const last = lastAggregatedStats.users[username];
+        
+        currentTotalSpeedKbps += current.speed_kbps.upload + current.speed_kbps.download;
+
+        // 检查连接数、上传速度或下载速度是否有显著变化
+        const hasChange = !last ||
+            current.connections !== last.connections ||
+            Math.abs(current.speed_kbps.upload - (last.speed_kbps.upload || 0)) > 0.1 ||
+            Math.abs(current.speed_kbps.download - (last.speed_kbps.download || 0)) > 0.1;
+
+        if (hasChange) {
+            usersToPush[username] = current;
+            usersChanged = true;
+        }
+        // [AXIOM V5.5 FIX] 如果用户没有连接，且速度为0，从推送中移除，让前端使用DB数据
+        if (current.connections === 0 && current.speed_kbps.upload < 0.1 && current.speed_kbps.download < 0.1) {
+             delete usersToPush[username];
+        }
+    }
+    
+    // [V6.0 NEW] 动态 QoS/流量整形逻辑 ------------------------------
+    let throttleRatio = 1.0;
+    const globalLimitKbps = (config.global_bandwidth_limit_mbps || 0) * 1024;
+    
+    if (globalLimitKbps > 0) {
+        const softLimitKbps = globalLimitKbps * 0.9;
+        
+        if (currentTotalSpeedKbps > softLimitKbps) {
+            throttleRatio = softLimitKbps / currentTotalSpeedKbps;
+            // 确保节流比率不低于 10%
+            throttleRatio = Math.max(0.1, throttleRatio); 
+            console.warn(`[QoS] 全局总速度 ${currentTotalSpeedKbps.toFixed(0)} KB/s 超过软限制 ${softLimitKbps.toFixed(0)} KB/s。执行动态节流: ${throttleRatio.toFixed(2)}.`);
+            
+            // 向所有 Proxy Worker 发送动态节流指令
+            broadcastToProxies({
+                action: 'throttle',
+                ratio: throttleRatio
+            });
+        } else if (currentTotalSpeedKbps < softLimitKbps && totalRealtimeSpeedKbps > softLimitKbps) {
+             // 拥塞解除，如果上次处于节流状态，发送恢复指令
+             console.log("[QoS] 全局拥塞解除。恢复节流比率 (ratio: 1.0)。");
+             broadcastToProxies({
+                 action: 'throttle',
+                 ratio: 1.0
+             });
+        }
+    }
+    totalRealtimeSpeedKbps = currentTotalSpeedKbps; // 更新全局缓存
+    // -------------------------------------------------------------
+    
+    // 2. 检查全局活跃 IP 数量是否有变化
+    const currentLiveIpCount = Object.keys(aggregatedData.live_ips).length;
+    const lastLiveIpCount = Object.keys(lastAggregatedStats.live_ips).length;
+    
+    let systemChanged = false;
+    if (currentLiveIpCount !== lastLiveIpCount) {
+        systemChanged = true;
+    }
+    
+    // 3. 推送有变化的数据
+    if (usersChanged || systemChanged || Object.keys(usersToPush).length > 0) {
+         broadcastToFrontends({
+            type: 'live_update',
+            payload: { 
+                users: usersToPush,
+                system: { 
+                    active_connections_total: aggregatedData.system.active_connections_total 
+                } 
             }
         });
-    } else {
-         document.getElementById('traffic-chart-loading').textContent = '未能加载流量历史数据。';
-         document.getElementById('traffic-chart-loading').style.display = 'block';
+        
+        // 4. 更新上次推送缓存 (仅更新被推送的数据)
+        for (const username in usersToPush) {
+            lastAggregatedStats.users[username] = aggregatedData.users[username];
+        }
+        // 更新全局连接数缓存
+        lastAggregatedStats.system = aggregatedData.system; 
     }
 }
-
-// --- [AXIOM V1.5] 载荷生成器逻辑 ---
-function generatePayload() {
-// ... existing logic (no change needed here)
-    const CRLF = '[crlf]';
-    const SPLIT = '[split]';
-    const PROTOCOL = '[protocol]'; 
-    const HOST_PORT = '[host_port]';
-    const UA = '[ua]';
-    
-    const C = {
-        splitEnable: document.getElementById('payload-split-enable').checked,
-        r1Method: document.getElementById('payload-r1-method').value,
-        r1Host: document.getElementById('payload-r1-host').value.trim() || HOST_PORT,
-        r2Host: document.getElementById('payload-host').value.trim() || '[host]',
-        r2Method: document.getElementById('payload-method').value,
-        headerHost: document.getElementById('payload-header-host').checked,
-        headerKeepAlive: document.getElementById('payload-header-keep-alive').checked,
-        headerUserAgent: document.getElementById('payload-header-user-agent').checked,
-        headerWebsocket: document.getElementById('payload-header-websocket').checked,
-        headerOnlineHost: document.getElementById('payload-header-online-host').checked, 
-        authMode: document.getElementById('payload-auth-mode').value,
-        username: document.getElementById('payload-username').value.trim(),
-        password: document.getElementById('payload-password').value,
-        token: document.getElementById('payload-auth-token').value
-    };
-    
-    let finalPayload = "";
-    
-    if (C.splitEnable) {
-        let request1 = `${C.r1Method} ${C.r1Host} ${PROTOCOL}${CRLF}`;
-        request1 += `Connection: close${CRLF}`; 
-        request1 += CRLF; 
-        finalPayload += request1;
-        finalPayload += SPLIT + CRLF; 
-    }
-    
-    let r2RequestLine = `${C.r2Method} http://${C.r2Host}/ ${PROTOCOL}${CRLF}`;
-    if (C.authMode === 'uri') {
-        if (!C.username) {
-            showStatus('使用 URI 注入时必须填写用户名', false);
-            return;
-        }
-        r2RequestLine = `${C.r2Method} http://${C.r2Host}/?user=${C.username} ${PROTOCOL}${CRLF}`;
-    }
-
-    let r2Headers = "";
-    if (C.headerHost) {
-        r2Headers += `Host: ${C.r2Host}${CRLF}`;
-    }
-    if (C.headerOnlineHost) {
-        r2Headers += `X-Online-Host: ${C.r2Host}${CRLF}`;
-    }
-    if (C.headerUserAgent) {
-        r2Headers += `User-Agent: ${UA}${CRLF}`;
-    }
-    
-    if (C.authMode === 'proxy') {
-        if (!C.token || C.token.startsWith('[')) {
-            showStatus('使用认证头时必须填写用户名和密码', false);
-            return;
-        }
-        r2Headers += `Proxy-Authorization: Basic ${C.token}${CRLF}`;
-    }
-    
-    if (C.headerKeepAlive) {
-        r2Headers += `Connection: Keep-Alive${CRLF}`;
-    }
-    if (C.headerWebsocket) {
-        if (C.headerKeepAlive) {
-            r2Headers = r2Headers.replace(`Connection: Keep-Alive${CRLF}`, `Connection: Upgrade${CRLF}`);
-        } else {
-            r2Headers += `Connection: Upgrade${CRLF}`;
-        }
-        r2Headers += `Upgrade: websocket${CRLF}`;
-    }
-    
-    let request2 = r2RequestLine + r2Headers + CRLF; 
-    finalPayload += request2;
-    
-    document.getElementById('payload-output').value = finalPayload;
-    showStatus('载荷生成成功！', true);
-}
-
-function setupPayloadAuthListeners() {
-// ... existing logic (no change needed here)
-    const usernameInput = document.getElementById('payload-username');
-    const passwordInput = document.getElementById('payload-password');
-    const tokenOutput = document.getElementById('payload-auth-token');
-    
-    if (!usernameInput || !passwordInput || !tokenOutput) {
-        console.warn("[Axiom] 载荷生成器 (Auth) 的 DOM 元素未找到，跳过监听器。");
-        return;
-    }
-    
-    const updateToken = () => {
-        const username = usernameInput.value;
-        const password = passwordInput.value;
-        const token = generateBase64Token(username, password);
-        if (token) {
-            tokenOutput.value = token;
-        } else {
-            tokenOutput.value = "[在此输入用户名和密码]";
-        }
-    };
-    
-    usernameInput.addEventListener('input', updateToken);
-    passwordInput.addEventListener('input', updateToken);
-}
-
-function populatePayloadUserSelect() {
-// ... existing logic (no change needed here)
-    const select = document.getElementById('payload-user-select');
-    if (!select) return; 
-    
-    const currentValue = select.value;
-    while (select.options.length > 1) {
-        select.remove(1);
-    }
-    if (allUsersCache.length === 0) {
-        return;
-    }
-    const fragment = document.createDocumentFragment();
-    allUsersCache.forEach(user => {
-        const option = document.createElement('option');
-        option.value = user.username;
-        option.textContent = user.username;
-        fragment.appendChild(option);
-    });
-    select.appendChild(fragment);
-    
-    if (Array.from(select.options).some(opt => opt.value === currentValue)) {
-        select.value = currentValue;
-    }
-}
-
-function setupCreateUserTokenListeners() {
-// ... existing logic (no change needed here)
-    const usernameInput = document.getElementById('new-username');
-    const passwordInput = document.getElementById('new-password');
-    const tokenOutput = document.getElementById('new-connect-token');
-
-    if (!usernameInput || !passwordInput || !tokenOutput) {
-        console.warn("[Axiom] “创建用户”表单的令牌 DOM 元素未找到，跳过监听器。");
-        return;
-    }
-
-    const updateToken = () => {
-        const username = usernameInput.value;
-        const password = passwordInput.value;
-        const token = generateBase64Token(username, password); 
-        if (token) {
-            tokenOutput.value = token;
-        } else {
-            tokenOutput.value = "[在此输入用户名和密码]";
-        }
-    };
-
-    usernameInput.addEventListener('input', updateToken);
-    passwordInput.addEventListener('input', updateToken);
-}
-
-// --- 启动脚本 ---
 
 /**
- * [AXIOM V3.1.2] 重构: 异步初始化
+ * [AXIOM V5.0] 核心功能: 3秒系统状态推送
  */
-async function initializeApp() {
-    try {
-        // 1. 异步获取配置
-        const data = await fetchData('/settings/config');
-        if (data && data.config) {
-            FLASK_CONFIG = {
-                // Existing Config
-                WSS_HTTP_PORT: data.config.wss_http_port,
-                WSS_TLS_PORT: data.config.wss_tls_port,
-                STUNNEL_PORT: data.config.stunnel_port,
-                UDPGW_PORT: data.config.udpgw_port,
-                UDP_CUSTOM_PORT: data.config.udp_custom_port,
-                INTERNAL_FORWARD_PORT: data.config.internal_forward_port,
-                PANEL_PORT: data.config.panel_port,
-                 // [V6.0 NEW] Nginx/Xray Config
-                NGINX_DOMAIN: data.config.nginx_domain,
-                NGINX_ENABLE: data.config.nginx_enable,
-                WSS_WS_PATH: data.config.wss_ws_path,
-                XRAY_WS_PATH: data.config.xray_ws_path,
-                WSS_PROXY_PORT_INTERNAL: data.config.wss_proxy_port_internal,
-                XRAY_PORT_INTERNAL: data.config.xray_port_internal,
-                XRAY_API_PORT: data.config.xray_api_port
-            };
-        } else {
-             showStatus("无法加载核心配置，请刷新。", false);
-             return;
-        }
-        
-        if (typeof lucide === 'undefined' || typeof lucide.createIcons !== 'function') {
-            showStatus('图标库(Lucide)加载失败，请刷新。', false);
-            console.error("Lucide library is not loaded.");
-            return;
-        }
-        
-        lastUserStats = {}; 
-        
-        // 2. 切换到仪表盘 (将显示骨架屏)
-        switchView('dashboard');
-        
-        // 3. 启动 WebSocket (这将触发 'status_connected' 和 fetchAllStaticData)
-        connectWebSocket();
-        
-        // 4. 绑定所有静态事件监听器
-        setupPayloadAuthListeners(); 
-        setupCreateUserTokenListeners();
-        
-        document.getElementById('user-search-input').addEventListener('input', () => {
-            renderFilteredUserList();
-        });
-        
-        document.querySelectorAll('th.sortable').forEach(th => {
-            th.addEventListener('click', () => {
-                const sortKey = th.dataset.sortkey;
-                if (currentSortKey === sortKey) {
-                    currentSortDir = currentSortDir === 'asc' ? 'desc' : 'asc';
-                } else {
-                    currentSortKey = sortKey;
-                    currentSortDir = 'asc';
-                }
-                renderFilteredUserList();
-            });
-        });
+async function pushSystemUpdates() {
+    if (!isRealtimePushing) return;
+    
+    const systemStatusData = await getSystemStatusData();
+    let isChanged = false;
 
-        const payloadUserSelect = document.getElementById('payload-user-select');
-        if (payloadUserSelect) {
-            payloadUserSelect.addEventListener('change', (e) => {
-                const username = e.target.value;
-                const usernameInput = document.getElementById('payload-username');
-                const passwordInput = document.getElementById('payload-password');
-                const tokenOutput = document.getElementById('payload-auth-token');
+    // 检查 CPU/内存/磁盘是否有变化 (使用 JSON.stringify 快速比较，但忽略 user_stats)
+    const currentStatus = { ...systemStatusData };
+    delete currentStatus.user_stats;
+    
+    const lastJSON = JSON.stringify(lastSystemStatus);
+    const currentJSON = JSON.stringify(currentStatus);
+
+    if (lastJSON !== currentJSON) {
+        isChanged = true;
+    }
+
+    if (isChanged) {
+        broadcastToFrontends({
+            type: 'system_update',
+            payload: systemStatusData
+        });
+        
+        // 更新上次推送缓存
+        lastSystemStatus = currentStatus;
+    }
+}
+
+
+/**
+ * [AXIOM V5.0] 启动/停止实时推送机制 (由 UI 连接/断开触发)
+ */
+function toggleRealtimePush(shouldStart) {
+    if (shouldStart && !isRealtimePushing) {
+        // 启动实时推送
+        console.log("[PUSH] 启动 1秒/3秒 实时推送定时器...");
+        isRealtimePushing = true;
+        
+        // 1. 启动 1 秒流量/连接推送
+        if (liveUpdateInterval) clearInterval(liveUpdateInterval);
+        liveUpdateInterval = setInterval(pushLiveUpdates, 1000);
+        
+        // 2. 启动 3 秒系统状态推送
+        if (systemUpdateInterval) clearInterval(systemUpdateInterval);
+        systemUpdateInterval = setInterval(pushSystemUpdates, 3000);
+        
+    } else if (!shouldStart && isRealtimePushing) {
+        // 停止实时推送
+        console.log("[PUSH] 停止 1秒/3秒 实时推送定时器 (管理员已离线)。");
+        isRealtimePushing = false;
+        if (liveUpdateInterval) clearInterval(liveUpdateInterval);
+        if (systemUpdateInterval) clearInterval(systemUpdateInterval);
+        liveUpdateInterval = null;
+        systemUpdateInterval = null;
+        
+        // 重置缓存以备下次连接时进行全量推送
+        lastAggregatedStats = { users: {}, live_ips: {} };
+        lastSystemStatus = {};
+        totalRealtimeSpeedKbps = 0; // [V6.0 NEW] 重置速度缓存
+    }
+}
+
+
+/**
+ * [AXIOM V5.5 FIX A3] 异步熔断检查和执行
+ */
+async function checkAndApplyFuse(username, userSpeedKbps) {
+    if (globalFuseLimitKbps <= 0) return; 
+
+    const totalSpeed = (userSpeedKbps.upload || 0) + (userSpeedKbps.download || 0);
+
+    if (totalSpeed >= globalFuseLimitKbps) {
+        const user = await getUserByUsername(username);
+        
+        // 仅对当前处于 'active' 状态的用户执行熔断
+        if (user && user.status === 'active') {
+            console.warn(`[FUSE] 用户 ${username} 已触发全局熔断器! 速率: ${totalSpeed.toFixed(0)} KB/s. 正在暂停...`);
+            
+            // 数据库更新
+            await db.run(`UPDATE users SET status = 'fused', status_text = '熔断 (Fused)' WHERE username = ?`, username);
+            
+            // 系统账户锁定和踢出
+            await safeRunCommand(['usermod', '-L', username]);
+            await kickUserFromProxy(username); 
+            await safeRunCommand(['pkill', '-9', '-u', username]); 
+            
+            // [V6.0 NEW] 通知 Xray Core 踢出用户 (Mocked)
+            // await kickUserFromXray(user.uuid);
+            
+            await logAction("USER_FUSED", "SYSTEM", `User ${username} exceeded speed limit (${totalSpeed.toFixed(0)} KB/s). Fused and Kicked.`);
+            
+            broadcastToFrontends({ type: 'users_changed' });
+        }
+    }
+}
+
+
+/**
+ * [AXIOM V3.0] 60秒维护任务
+ */
+async function syncUserStatus() {
+// ... existing logic (no change needed here)
+    const systemLockedUsers = await getSystemLockStatus();
+    let allUsers = [];
+    try {
+        // [V6.0 NEW] 异步拉取 Xray 统计和流量持久化
+        // Note: Xray traffic persistence should happen here, mocking the fetch for now.
+        // await fetchAndPersistXrayTraffic(); 
+        
+        allUsers = await db.all('SELECT * FROM users');
+    } catch (e) {
+        console.error(`[SYNC] 无法从 DB 获取用户: ${e.message}`);
+        return;
+    }
+    
+    const usersToUpdate = []; 
+    
+    for (const user of allUsers) {
+        const username = user.username;
+        
+        let isExpired = false, isOverQuota = false;
+        
+        if (user.expiration_date) {
+            // [AXIOM V5.5 FIX A4] 增强日期解析的健壮性
+            try { 
+                const expiry = new Date(user.expiration_date);
+                // 确保日期有效，并且小于当前时间
+                if (!isNaN(expiry.getTime()) && expiry.getTime() < Date.now()) { 
+                    isExpired = true; 
+                }
+            } catch (e) { 
+                console.warn(`[SYNC] 日期解析失败 for ${username}: ${user.expiration_date}`);
+            }
+        }
+        
+        if (user.quota_gb > 0 && user.usage_gb >= user.quota_gb) { isOverQuota = true; }
+        
+        const currentDbStatus = user.status; 
+        let newDbStatus = currentDbStatus;
+        let statusChanged = false;
+        
+        if (isExpired) {
+            if (currentDbStatus !== 'expired') { newDbStatus = 'expired'; statusChanged = true; }
+        } else if (isOverQuota) {
+            if (currentDbStatus !== 'exceeded') { newDbStatus = 'exceeded'; statusChanged = true; }
+        } else if (currentDbStatus === 'paused' || currentDbStatus === 'fused') {
+            newDbStatus = currentDbStatus; 
+        } else {
+            if (currentDbStatus !== 'active') { newDbStatus = 'active'; statusChanged = true; }
+        }
+        
+        user.status = newDbStatus;
+
+        const systemLocked = systemLockedUsers.has(username);
+        const shouldBeLocked_SYS = (user.status !== 'active');
+        
+        if (shouldBeLocked_SYS && !systemLocked) {
+            await safeRunCommand(['usermod', '-L', username]);
+            statusChanged = true; 
+        } else if (!shouldBeLocked_SYS && systemLocked) {
+            await safeRunCommand(['usermod', '-U', username]);
+            statusChanged = true; 
+        }
+        
+        let newStatusText = user.status_text;
+        if (user.status === 'active') { newStatusText = '启用 (Active)'; } 
+        else if (user.status === 'paused') { newStatusText = '暂停 (Manual)'; } 
+        else if (user.status === 'expired') { newStatusText = '已到期 (Expired)'; } 
+        else if (user.status === 'exceeded') { newStatusText = '超额 (Quota)'; } 
+        else if (user.status === 'fused') { newStatusText = '熔断 (Fused)'; } 
+        else { newStatusText = '未知'; }
+
+        if (statusChanged || user.status_text !== newStatusText) {
+             user.status_text = newStatusText;
+             usersToUpdate.push(user);
+        }
+    }
+    
+    if (usersToUpdate.length > 0) {
+        try {
+            await db.run('BEGIN TRANSACTION');
+            for (const u of usersToUpdate) {
+                await db.run(`UPDATE users SET 
+                                status = ?, status_text = ?
+                              WHERE username = ?`,
+                    u.status, u.status_text, u.username);
+            }
+            await db.run('COMMIT');
+            console.log(`[SYNC] 60秒维护任务完成。更新了 ${usersToUpdate.length} 个用户的状态。`);
+            
+            if (wssUiPool.size > 0) {
+                broadcastToFrontends({ type: 'users_changed' });
+            }
+            
+        } catch (e) {
+            await db.run('ROLLBACK').catch(()=>{});
+            console.error(`[SYNC] CRITICAL: 60秒维护DB更新失败: ${e.message}`);
+        }
+    }
+}
+
+
+async function manageIpIptables(ip, action, chainName = BLOCK_CHAIN) {
+// ... existing logic (no change needed here)
+    if (action === 'check') {
+        const result = await asyncExecFile('sudo', ['iptables', '-C', chainName, '-s', ip, '-j', 'DROP'], { timeout: 2000 }).catch(e => e);
+        return { success: result.code === 0 };
+    }
+    let command;
+    if (action === 'block') {
+        await safeRunCommand(['iptables', '-D', chainName, '-s', ip, '-j', 'DROP']);
+        command = ['iptables', '-I', chainName, '1', '-s', ip, '-j', 'DROP'];
+    } else if (action === 'unblock') {
+        command = ['iptables', '-D', chainName, '-s', ip, '-j', 'DROP'];
+    } else {
+        return { success: false, output: "Invalid action" };
+    }
+    const result = await safeRunCommand(command);
+    if (result.success) {
+        safeRunCommand(['iptables-save'], null, true)
+            .then(({ output }) => fs.writeFile('/etc/iptables/rules.v4', output))
+            .catch(e => console.error(`Warning: Failed to save iptables rules: ${e.message}`));
+    }
+    return result;
+}
+
+// --- API Routes (Admin Panel) ---
+
+app.use(express.static(PANEL_DIR));
+
+const loginLimiter = rateLimit({
+	windowMs: 15 * 60 * 1000, 
+	max: 5, 
+	message: '登录尝试次数过多，IP已被限制，请 15 分钟后再试',
+    handler: (req, res, next, options) => {
+        res.redirect(`/login.html?error=${encodeURIComponent(options.message)}`);
+    },
+	standardHeaders: true, 
+	legacyHeaders: false, 
+});
+
+app.post('/login', loginLimiter, async (req, res) => {
+// ... existing login logic (no change needed here)
+    const { username, password } = req.body;
+    const rootHash = await loadRootHash(); 
+    if (username === ROOT_USERNAME && password && rootHash) {
+        try {
+            const match = await bcrypt.compare(password, rootHash);
+            if (match) {
+                req.session.loggedIn = true;
+                req.session.username = ROOT_USERNAME;
+                await logAction("LOGIN_SUCCESS", ROOT_USERNAME, "Web UI Login");
+                return res.redirect('/index.html');
+            }
+        } catch (e) { console.error(`Bcrypt comparison failed: ${e.message}`); }
+    }
+    await logAction("LOGIN_FAILED", username, "Wrong credentials or invalid username attempt");
+    res.redirect('/login.html?error=' + encodeURIComponent('用户名或密码错误。'));
+});
+
+app.get('/logout', (req, res) => {
+    logAction("LOGOUT_SUCCESS", req.session.username || ROOT_USERNAME, "Web UI Logout");
+    req.session.destroy();
+    res.redirect('/login.html');
+});
+
+// --- Internal API (For Proxy) ---
+const internalApi = express.Router();
+internalApi.use((req, res, next) => {
+    const clientIp = req.ip;
+    if (clientIp === '127.0.0.1' || clientIp === '::1' || clientIp === '::ffff:127.0.0.1') {
+        next();
+    } else {
+        console.warn(`[AUTH] Denied external access attempt to /internal API from ${clientIp}`);
+        res.status(403).json({ success: false, message: 'Forbidden' });
+    }
+});
+
+/**
+ * [V6.1 FIX] 允许 'lite_auth_placeholder' 密码进行认证，用于 URI 免认证。
+ */
+internalApi.post('/auth', async (req, res) => {
+    const { username, password } = req.body;
+    if (!username || !password) {
+        return res.status(400).json({ success: false, message: 'Missing credentials' });
+    }
+    
+    // [V6.1 NEW] 检查是否为 Lite Auth 占位符
+    const isLiteAuth = (password === 'lite_auth_placeholder');
+    
+    try {
+        const user = await getUserByUsername(username);
+        if (!user || !user.password_hash) {
+            await logAction("PROXY_AUTH_FAIL", username, "User not found or no password hash in DB.");
+            return res.status(401).json({ success: false, message: 'Invalid credentials' });
+        }
+        
+        let match = false;
+        if (isLiteAuth) {
+            // Lite Auth 仅要求用户存在且允许免认证头
+            match = (user.require_auth_header === 0);
+        } else {
+            // 正常密码认证
+            match = await bcrypt.compare(password, user.password_hash);
+        }
+
+        if (match) {
+            if (user.status !== 'active') {
+                 await logAction("PROXY_AUTH_LOCKED", username, `User locked in DB (Status: ${user.status}).`);
+                 return res.status(403).json({ success: false, message: 'User locked, paused, or disabled' });
+            }
+            
+            // [V6.0 CRITICAL FIX] 统一并发检查 (避免双重往返)
+            const maxConnections = user.max_connections || 0;
+            let allowed = true;
+            if (maxConnections > 0) {
+                const aggregatedData = aggregateAllWorkerStats();
+                // 注意: Xray 连接也会在 aggregatedData.users 中，因此这是集群总连接数
+                const globalConnections = aggregatedData.users[username]?.connections || 0;
                 
-                if (username) {
-                    usernameInput.value = username;
-                    passwordInput.value = ''; 
-                    tokenOutput.value = "[请输入密码]"; 
-                    passwordInput.focus(); 
-                } else {
-                    usernameInput.value = '';
-                    passwordInput.value = '';
-                    tokenOutput.value = "[在此输入用户名和密码]";
-                    usernameInput.focus();
+                if (globalConnections >= maxConnections) {
+                    allowed = false;
+                    await logAction("PROXY_AUTH_CONCURRENCY", username, `Denied: Global connections (${globalConnections}) reached limit (${maxConnections}).`);
+                    // 返回 429 告知客户端连接数超限
+                    return res.status(429).json({ success: false, message: 'Too many active connections (Concurrency Limit Reached)' });
                 }
+            }
+            
+            await logAction("PROXY_AUTH_SUCCESS", username, `Proxy auth success. (LiteAuth: ${isLiteAuth})`);
+            res.json({
+                success: true,
+                allowed: allowed, // [V6.0 NEW] 明确返回是否允许连接
+                limits: {
+                    rate_kbps: user.rate_kbps || 0,
+                    max_connections: maxConnections, // 使用已检查的值
+                },
+                require_auth_header: user.require_auth_header === 0 ? 0 : 1
             });
+        } else {
+            if (isLiteAuth) {
+                 await logAction("PROXY_AUTH_FAIL", username, "Lite Auth Failed (User exists but requires header).");
+            } else {
+                 await logAction("PROXY_AUTH_FAIL", username, "Invalid password (bcrypt mismatch).");
+            }
+            res.status(401).json({ success: false, message: 'Invalid credentials' });
+        }
+    } catch (e) {
+        await logAction("PROXY_AUTH_ERROR", username, `Internal auth error: ${e.message}`);
+        res.status(500).json({ success: false, message: 'Internal server error' });
+    }
+});
+
+internalApi.get('/auth/user-settings', async (req, res) => {
+    const { username } = req.query;
+    if (!username) {
+        return res.status(400).json({ success: false, message: 'Missing username' });
+    }
+    try {
+        const user = await getUserByUsername(username);
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'User not found' });
+        }
+        res.json({
+            success: true,
+            require_auth_header: user.require_auth_header === 0 ? 0 : 1
+        });
+    } catch (e) {
+        console.error(`[PROXY_SETTINGS] Internal API error: ${e.message}`);
+        res.status(500).json({ success: false, message: 'Internal server error' });
+    }
+});
+
+internalApi.get('/auth/check-conn', async (req, res) => {
+    console.warn("[V6.0 DEPRECATED] /auth/check-conn API 已废弃，请使用 /internal/auth 接口。");
+    return res.status(410).json({ success: false, message: 'API Deprecated: Use /internal/auth' });
+});
+
+
+app.use('/internal', internalApi);
+
+// --- Public API (For Admin Panel UI) ---
+const api = express.Router();
+
+/**
+ * [AXIOM V5.2] 新增：跨 Worker 获取用户实时连接元数据
+ */
+async function getLiveConnectionMetadata(username) {
+// ... existing logic (no change needed here)
+    if (!wssIpc || wssIpc.clients.size === 0) {
+        return { success: false, connections: [], message: 'Proxy workers are disconnected.' };
+    }
+
+    const requestId = crypto.randomUUID();
+    const workersToWait = wssIpc.clients.size;
+    workerMetadataResponses.clear();
+    
+    // 1. 广播请求到所有 Worker
+    const requestMessage = JSON.stringify({
+        action: 'GET_METADATA',
+        username: username,
+        requestId: requestId
+    });
+    
+    wssIpc.clients.forEach(client => {
+        if (client.readyState === 1) {
+            client.send(requestMessage);
+        }
+    });
+
+    // 2. 等待 Worker 响应 (设置超时 3000ms)
+    return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+            console.warn(`[METADATA] Timeout waiting for worker responses. Received ${workerMetadataResponses.size}/${workersToWait} responses.`);
+            resolve(aggregateResponses());
+        }, 3000);
+
+        function checkResponses() {
+            if (workerMetadataResponses.size >= workersToWait) {
+                clearTimeout(timer);
+                resolve(aggregateResponses());
+            }
         }
 
-        const payloadSplitEnable = document.getElementById('payload-split-enable');
-        if (payloadSplitEnable) {
-            payloadSplitEnable.addEventListener('change', (e) => {
-                const optionsDiv = document.getElementById('payload-split-options');
-                if (e.target.checked) {
-                    optionsDiv.style.display = 'block';
-                } else {
-                    optionsDiv.style.display = 'none';
+        function aggregateResponses() {
+            const allConnections = [];
+            let successfulWorkers = 0;
+            
+            workerMetadataResponses.forEach(response => {
+                if (response.connections && Array.isArray(response.connections)) {
+                    allConnections.push(...response.connections);
+                    successfulWorkers++;
                 }
             });
+            
+            return {
+                success: true,
+                connections: allConnections,
+                message: `Aggregated metadata from ${successfulWorkers}/${workersToWait} workers.`
+            };
         }
         
-    } catch (e) {
-        console.error("Failed to initialize app:", e);
-        showStatus("应用初始化失败: " + e.message, false);
-    }
+        // 临时存储响应的函数 (被 IPC 消息处理器调用)
+        getLiveConnectionMetadata.onResponse = (response) => {
+            if (response.requestId === requestId) {
+                workerMetadataResponses.set(response.workerId, response);
+                checkResponses();
+            }
+        };
+
+        // 清理函数 (确保在 Promise 结束后移除临时回调)
+        const originalResolve = resolve;
+        resolve = (value) => {
+            delete getLiveConnectionMetadata.onResponse;
+            originalResolve(value);
+        };
+    });
 }
 
 
 /**
- * [AXIOM V3.0] 启动
+ * [AXIOM V5.2] 新增 API：获取用户的实时连接元数据
  */
-window.onload = function() {
-    initializeApp();
-};
-
-
-// --- 通用确认及执行逻辑 (保留) ---
-
-function confirmAction(param1, param2, param3, type, titleText) {
+api.get('/users/connections', async (req, res) => {
 // ... existing logic (no change needed here)
-    let message = '';
-    document.getElementById('confirm-param1').value = param1 || ''; 
-    document.getElementById('confirm-param2').value = param2 || ''; 
-    document.getElementById('confirm-param3').value = param3 || ''; 
-    document.getElementById('confirm-type').value = type;
-    const username = param1;
-    const action = param2;
-    if (type === 'deleteUser') {
-        message = '您确定要永久删除用户 <strong>' + username + '</strong> 吗？此操作不可逆，将删除系统账户和所有配置。';
-    } else if (type === 'toggleStatus') {
-        message = '您确定要 ' + (action === 'pause' ? '暂停' : '启用') + ' 用户 <strong>' + username + '</strong> 吗？';
-    } else if (type === 'serviceControl') {
-        message = '警告：您确定要对核心服务 <strong>' + CORE_SERVICES_MAP[username] + '</strong> 执行 ' + action + ' 操作吗？这可能会导致短暂的服务中断。';
-    } else if (type === 'unbanGlobal') {
-        message = '您确定要解除全局封禁 IP 地址 <strong>' + action + '</strong> 吗？';
-    } else if (type === 'banGlobal') {
-        message = '您确定要对 IP 地址 <strong>' + action + '</strong> 执行全局封禁操作吗？';
-    } else if (type === 'resetTraffic') {
-        message = '警告：您确定要将用户 <strong>' + username + '</strong> 的流量使用量和历史记录重置为 0 吗？';
-    } else if (type === 'killAll') {
-        message = '警告：您确定要强制断开用户 <strong>' + username + '</strong> 的所有活跃连接吗？这会强制用户重新连接。';
-    } else if (type === 'batchAction') {
-         return;
+    const { username } = req.query;
+    if (!username) {
+        return res.status(400).json({ success: false, message: 'Missing username.' });
     }
-    document.getElementById('confirm-title').textContent = titleText;
-    document.getElementById('confirm-message').innerHTML = message;
-    const confirmBtn = document.getElementById('confirm-action-btn');
-    if (type.includes('ban') || type === 'deleteUser' || type === 'serviceControl' || type === 'killAll') {
-         confirmBtn.className = 'btn btn-error';
-    } else if (type.includes('enable') || type === 'unbanGlobal' || type === 'resetTraffic') {
-         confirmBtn.className = 'btn btn-success';
-    } else {
-         confirmBtn.className = 'btn btn-primary';
-    }
-    confirmBtn.onclick = executeAction;
-    openModal('confirm-modal');
-}
-
-async function executeAction() {
-// ... existing logic (no change needed here)
-    closeModal('confirm-modal');
-    const param1 = document.getElementById('confirm-param1').value;
-    const param2 = document.getElementById('confirm-param2').value;
-    const param3 = document.getElementById('confirm-param3').value;
-    const type = document.getElementById('confirm-type').value;
-    showStatus('正在执行 ' + type + ' 操作...', true);
-    let url;
-    let body = {};
-    if (type === 'deleteUser') {
-        url = '/users/delete';
-        body = { username: param1 };
-    } else if (type === 'toggleStatus') {
-        url = '/users/status';
-        body = { username: param1, action: param2 }; 
-    } else if (type === 'resetTraffic') {
-        url = '/users/reset_traffic';
-        body = { username: param1 };
-    } else if (type === 'serviceControl') {
-        url = '/system/control';
-        body = { service: param1, action: param2 }; 
-    } else if (type === 'unbanGlobal') {
-        url = '/ips/unban_global';
-        body = { ip: param2 }; 
-    } else if (type === 'banGlobal') {
-        url = '/ips/ban_global';
-        body = { ip: param2, reason: 'Manual Global Ban' };
-    } else if (type === 'killAll') {
-        url = '/users/kill_all';
-        body = { username: param1 };
-    } else if (type === 'batchAction') {
-        url = '/users/batch-action';
-        body = {
-            action: param1,
-            usernames: JSON.parse(param2),
-            days: parseInt(param3) || 0
-        };
-    }
-    const result = await fetchData(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-    });
-    if (result) {
-        showStatus(result.message, true);
-        if (type === 'batchAction') {
-            clearSelections();
-        }
-    }
-}
-
-document.getElementById('add-global-ban-form').addEventListener('submit', async (e) => {
-// ... existing logic (no change needed here)
-    e.preventDefault();
-    const ip = document.getElementById('global-ban-ip').value;
-    if (!ip) return showStatus('IP 地址不能为空', false);
-    confirmAction(null, ip, null, 'banGlobal', '全局封禁 IP');
-});
-
-document.getElementById('change-password-form').addEventListener('submit', async (e) => {
-// ... existing logic (no change needed here)
-    e.preventDefault();
-    const old_password = document.getElementById('old-password').value;
-    const new_password = document.getElementById('admin-new-password').value;
-    const confirm_new_password = document.getElementById('admin-confirm-new-password').value;
     
-    if (new_password !== confirm_new_password) {
-        showStatus('新密码和确认密码不一致。', false);
-        return;
-    }
-    if (new_password.length < 6) {
-        showStatus('新密码长度必须至少为 6 位。', false);
-        return;
-    }
-    showStatus('正在修改管理员密码...', true);
-    const result = await fetchData('/settings/change-password', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ old_password, new_password })
-    });
-    if (result) {
-        showStatus(result.message, true);
-        document.getElementById('change-password-form').reset();
+    try {
+        const result = await getLiveConnectionMetadata(username);
+        if (result.success) {
+            return res.json({ success: true, connections: result.connections, message: result.message });
+        } else {
+            return res.status(503).json({ success: false, message: result.message });
+        }
+    } catch (e) {
+        console.error(`[API] Failed to get connection metadata for ${username}: ${e.message}`);
+        return res.status(500).json({ success: false, message: 'Internal server error during metadata aggregation.' });
     }
 });
 
-// --- 批量操作 JS ---
-function clearSelections() {
-// ... existing logic (no change needed here)
-    selectedUsers = [];
-    document.querySelectorAll('.user-checkbox').forEach(cb => cb.checked = false);
-    const selectAll = document.getElementById('select-all-users');
-    if (selectAll) selectAll.checked = false;
-    updateBatchActionBar();
-}
 
-function updateBatchActionBar() {
-// ... existing logic (no change needed here)
-    const bar = document.getElementById('batch-action-bar');
-    const countSpan = document.getElementById('selected-user-count');
-    countSpan.textContent = selectedUsers.length;
-    if (selectedUsers.length > 0) {
-        bar.classList.add('visible');
-    } else {
-        bar.classList.remove('visible');
+/**
+ * [AXIOM V5.0] 提取: 获取系统状态的核心逻辑
+ * [AXIOM V6.0] 更新端口和服务列表
+ */
+async function getSystemStatusData() {
+    let diskUsedPercent = 55.0; 
+    try {
+         const { stdout } = await promisify(exec)('df -P / | tail -1'); 
+         const parts = stdout.trim().split(/\s+/);
+         if (parts.length >= 5) { diskUsedPercent = parseFloat(parts[4].replace('%', '')); }
+    } catch (e) { /* ignore */ }
+    const mem = os.totalmem();
+    const memFree = os.freemem();
+    
+    const serviceStatuses = {};
+    for (const [id, name] of Object.entries(CORE_SERVICES)) {
+        // [AXIOM V5.5 FIX A7] 使用 systemctl is-active 命令作为完整参数传递
+        const { success } = await safeRunCommand(['systemctl', 'is-active', id]);
+        const status = success ? 'running' : 'failed';
+        serviceStatuses[id] = { name, status, label: status === 'running' ? "运行中" : "失败" };
     }
+    const ports = [
+        // [V6.0 FIX] Nginx 接管 80/443
+        { name: 'NGINX_HTTP', port: 80, protocol: 'TCP', status: 'LISTEN' },
+        { name: 'NGINX_TLS', port: 443, protocol: 'TCP', status: 'LISTEN' },
+        
+        { name: 'STUNNEL', port: config.stunnel_port, protocol: 'TCP', status: 'LISTEN' },
+        { name: 'NATIVE_UDPGW', port: config.udpgw_port, protocol: 'TCP', status: 'LISTEN' },
+        { name: 'UDP_CUSTOM', port: config.udp_custom_port, protocol: 'UDP', status: 'LISTEN' },
+        { name: 'PANEL', port: config.panel_port, protocol: 'TCP', status: 'LISTEN' },
+        
+        // 内部端口 (用于监控 Nginx 是否能连接后端)
+        { name: 'SSH_INTERNAL', port: config.internal_forward_port, protocol: 'TCP', status: 'LISTEN' },
+        { name: 'WSS_PROXY_INT', port: config.wss_proxy_port_internal, protocol: 'TCP', status: 'LISTEN' }, 
+        { name: 'XRAY_INT', port: config.xray_port_internal, protocol: 'TCP', status: 'LISTEN' },
+        { name: 'XRAY_API', port: config.xray_api_port, protocol: 'TCP', status: 'LISTEN' }
+    ];
+    
+    let liveIpCount = 0;
+    try {
+        const aggregatedData = aggregateAllWorkerStats();
+        liveIpCount = Object.keys(aggregatedData.live_ips || {}).length;
+    } catch (e) {
+        console.warn(`[SYSTEM_STATUS] 无法从 workerStatsCache 聚合 IP: ${e.message}`);
+    }
+
+    const users = await db.all('SELECT * FROM users');
+    let totalTraffic = 0, pausedCount = 0, expiredCount = 0, exceededCount = 0, fusedCount = 0;
+    for (const user of users) {
+        totalTraffic += user.usage_gb || 0;
+        if (user.status === 'paused') pausedCount++;
+        else if (user.status === 'expired') expiredCount++;
+        else if (user.status === 'exceeded') exceededCount++;
+        else if (user.status === 'fused') fusedCount++;
+    }
+    
+    return {
+        cpu_usage: (os.loadavg()[0] / os.cpus().length) * 100,
+        memory_used_gb: (mem - memFree) / GIGA_BYTE,
+        memory_total_gb: mem / GIGA_BYTE,
+        disk_used_percent: diskUsedPercent,
+        services: serviceStatuses,
+        ports: ports,
+        user_stats: {
+            total: users.length, active: liveIpCount, paused: pausedCount,
+            expired: expiredCount, exceeded: exceededCount,
+            fused: fusedCount, total_traffic_gb: totalTraffic
+        }
+    };
 }
 
-function bindCheckboxEvents() {
+
+api.get('/system/status', async (req, res) => {
 // ... existing logic (no change needed here)
-    const selectAll = document.getElementById('select-all-users');
-    if (selectAll) {
-        selectAll.addEventListener('change', (e) => {
-            const isChecked = e.target.checked;
-            selectedUsers = [];
-            const visibleUsernames = Array.from(document.querySelectorAll('#user-list-tbody .user-checkbox')).map(cb => cb.dataset.username);
-            document.querySelectorAll('.user-checkbox').forEach(cb => {
-                if (visibleUsernames.includes(cb.dataset.username)) {
-                    cb.checked = isChecked;
-                    if (isChecked) {
-                        selectedUsers.push(cb.dataset.username);
-                    }
+    try {
+        const data = await getSystemStatusData();
+        res.json({ success: true, ...data });
+    } catch (e) {
+        await logAction("SYSTEM_STATUS_ERROR", req.session.username, `Status check failed: ${e.message}`);
+        res.status(500).json({ success: false, message: `System status check failed: ${e.message}` });
+    }
+});
+
+
+api.post('/system/control', async (req, res) => {
+    const { service, action } = req.body;
+    if (!CORE_SERVICES[service] || action !== 'restart' && action !== 'stop' && action !== 'start') {
+        return res.status(400).json({ success: false, message: "无效的服务或操作" });
+    }
+    // [V6.0 FIX] 支持 start/stop
+    const { success, output } = await safeRunCommand(['systemctl', action, service]);
+    if (success) {
+        await logAction("SERVICE_CONTROL_SUCCESS", req.session.username, `Successfully executed ${action} on ${service}`);
+        res.json({ success: true, message: `服务 ${CORE_SERVICES[service]} 已成功执行 ${action} 操作。` });
+    } else {
+        await logAction("SERVICE_CONTROL_FAIL", req.session.username, `Failed to ${action} ${service}: ${output}`);
+        res.status(500).json({ success: false, message: `服务 ${CORE_SERVICES[service]} 操作失败: ${output}` });
+    }
+});
+
+api.post('/system/logs', async (req, res) => {
+// ... existing logic (no change needed here)
+    const serviceName = req.body.service;
+    if (!CORE_SERVICES[serviceName]) { return res.status(400).json({ success: false, message: "无效的服务名称。" }); }
+    try {
+        const { success, output } = await safeRunCommand(['journalctl', '-u', serviceName, '-n', '50', '--no-pager', '--utc']);
+        res.json({ success: true, logs: success ? output : `错误: 无法获取 ${serviceName} 日志. ${output}` });
+    } catch (e) {
+        res.status(500).json({ success: false, message: `日志获取异常: ${e.message}` });
+    }
+});
+
+api.get('/system/audit_logs', async (req, res) => {
+// ... existing logic (no change needed here)
+    try {
+        const logContent = await fs.readFile(AUDIT_LOG_PATH, 'utf8');
+        const logs = logContent.trim().split('\n').filter(line => line.trim().length > 0).slice(-20);
+        res.json({ success: true, logs });
+    } catch (e) {
+        res.json({ success: true, logs: ["读取日志失败或日志文件为空。"] });
+    }
+});
+
+/**
+ * [V6.0 NEW] GeoIP 集成和数据添加
+ */
+api.get('/system/active_ips', async (req, res) => {
+    try {
+        const aggregatedData = aggregateAllWorkerStats();
+        const liveIps = aggregatedData.live_ips || {};
+        
+        const ipList = await Promise.all(
+            Object.keys(liveIps).map(async ip => {
+                const isBanned = (await manageIpIptables(ip, 'check')).success;
+                
+                // [V6.0 NEW] GeoIP Lookup
+                const geo = geoip.lookup(ip); 
+                const country = geo ? geo.country : 'N/A';
+                const city = geo ? geo.city : 'N/A';
+                const isp = geo ? geo.isp : 'N/A';
+                
+                return { 
+                    ip: ip, 
+                    is_banned: isBanned, 
+                    username: liveIps[ip],
+                    country: country, 
+                    city: city,       
+                    isp: isp          
+                };
+            })
+        );
+        res.json({ success: true, active_ips: ipList });
+    } catch (e) {
+        res.status(500).json({ success: false, message: e.message });
+    }
+});
+
+api.get('/users/list', async (req, res) => {
+    try {
+        // [V6.0 FIX] 查询新增的字段
+        let users = await db.all('SELECT *, realtime_speed_up, realtime_speed_down, active_connections, status_text, allow_shell, uuid, xray_protocol FROM users');
+        users.forEach(u => {
+            u.status_text = u.status_text || (u.status === 'active' ? '启用 (Active)' : 
+                               (u.status === 'paused' ? '暂停 (Manual)' : 
+                               (u.status === 'expired' ? '已到期 (Expired)' : 
+                               (u.status === 'exceeded' ? '超额 (Quota)' :
+                               (u.status === 'fused' ? '熔断 (Fused)' : '未知')))));
+            u.allow_shell = u.allow_shell || 0;
+            // [V6.0 NEW]
+            u.uuid = u.uuid || 'N/A';
+            u.xray_protocol = u.xray_protocol || 'none';
+        });
+        res.json({ success: true, users: users });
+    } catch (e) {
+        res.status(500).json({ success: false, message: `Failed to fetch users: ${e.message}` });
+    }
+});
+
+
+api.post('/users/add', async (req, res) => {
+    // [V6.0 FIX] 接收 Xray 协议类型
+    const { username, password, expiration_days, quota_gb, rate_kbps, max_connections, require_auth_header, allow_shell, xray_protocol } = req.body;
+    if (!username || !password) return res.status(400).json({ success: false, message: "缺少用户名或密码" });
+    if (!/^[a-z0-9_]{3,16}$/.test(username)) return res.status(400).json({ success: false, message: "用户名格式不正确" });
+    const existingUser = await getUserByUsername(username);
+    if (existingUser) return res.status(409).json({ success: false, message: `用户组 ${username} 已存在于面板` });
+    try {
+        const shell = SHELL_DEFAULT; 
+        const { success: userAddSuccess, output: userAddOutput } = await safeRunCommand(['useradd', '-m', '-s', shell, username]);
+        if (!userAddSuccess && !userAddOutput.includes("already exists")) {
+            throw new Error(`创建系统用户失败: ${userAddOutput}`);
+        }
+        
+        const chpasswdInput = `${username}:${password}`;
+        const { success: chpassSuccess, output: chpassOutput } = await safeRunCommand(['chpasswd'], chpasswdInput);
+        if (!chpassSuccess) { throw new Error(`设置系统密码失败: ${chpassOutput}`); }
+        
+        const lockCmd = ['usermod', '-U', username];
+        const { success: lockSuccess, output: lockOutput } = await safeRunCommand(lockCmd);
+        if (!lockSuccess) { throw new Error(`解锁账户失败: ${lockOutput}`); }
+
+        if (allow_shell) {
+            const { success: groupSuccess, output: groupOutput } = await safeRunCommand(['usermod', '-a', '-G', 'shell_users', username]);
+            if (!groupSuccess) {
+                console.warn(`[V1.6.0] Failed to add ${username} to shell_users group: ${groupOutput}. Maybe group doesn't exist?`);
+            }
+        }
+        
+        // [V6.0 NEW] UUID Generation
+        const userUuid = crypto.randomUUID(); 
+
+        const passwordHash = await bcrypt.hash(password, 12);
+        const expiryDate = new Date(Date.now() + expiration_days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+        
+        const newStatus = "active";
+        const newStatusText = "启用 (Active)";
+        
+        const newUser = {
+            username: username, password_hash: passwordHash,
+            created_at: new Date().toISOString().replace('T', ' ').substring(0, 19),
+            status: newStatus,
+            expiration_date: expiryDate, 
+            quota_gb: parseFloat(quota_gb), usage_gb: 0.0, 
+            rate_kbps: parseInt(rate_kbps), 
+            max_connections: parseInt(max_connections) || 0,
+            require_auth_header: require_auth_header ? 1 : 0,
+            realtime_speed_up: 0.0, realtime_speed_down: 0.0,
+            active_connections: 0, 
+            status_text: newStatusText,
+            allow_shell: allow_shell ? 1 : 0,
+            uuid: userUuid, // [V6.0 NEW]
+            xray_protocol: xray_protocol || 'none' // [V6.0 NEW]
+        };
+        await db.run(`INSERT INTO users (
+                        username, password_hash, created_at, status, expiration_date, 
+                        quota_gb, usage_gb, rate_kbps, max_connections, 
+                        require_auth_header, realtime_speed_up, realtime_speed_down, active_connections, status_text,
+                        allow_shell, uuid, xray_protocol
+                      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                      Object.values(newUser));
+        await logAction("USER_ADD_SUCCESS", req.session.username, `User ${username} created (Shell: ${shell}, Lock: UNLOCKED, Shell Group: ${allow_shell}, Xray: ${xray_protocol})`);
+        
+        // [V6.0 FIX] 通知 Proxy 更新限制
+        broadcastToProxies({
+            action: 'update_limits',
+            username: username,
+            limits: {
+                rate_kbps: newUser.rate_kbps,
+                max_connections: newUser.max_connections,
+                require_auth_header: newUser.require_auth_header
+            }
+        });
+        
+        // [V6.0 NEW] 通知 Xray Core 添加用户 (Mocked)
+        // await addXrayUser(userUuid, username, newUser.xray_protocol);
+        
+        broadcastToFrontends({ type: 'users_changed' });
+        
+        res.json({ success: true, message: `用户 ${username} 创建成功，有效期至 ${expiryDate}。UUID: ${userUuid}` });
+    } catch (e) {
+        await safeRunCommand(['userdel', '-r', username]);
+        await logAction("USER_ADD_FAIL", req.session.username, `Failed to create user ${username}: ${e.message}`);
+        res.status(500).json({ success: false, message: `操作失败: ${e.message}` });
+    }
+});
+
+
+api.post('/users/delete', async (req, res) => {
+    const { username } = req.body;
+    const userToDelete = await getUserByUsername(username);
+    if (!userToDelete) return res.status(404).json({ success: false, message: `用户组 ${username} 不存在` });
+    try {
+        await kickUserFromProxy(username); 
+        await safeRunCommand(['pkill', '-9', '-u', username]); 
+        await safeRunCommand(['userdel', '-r', username]); 
+        await db.run('DELETE FROM users WHERE username = ?', username);
+        await db.run('DELETE FROM traffic_history WHERE username = ?', username);
+        
+        broadcastToProxies({
+            action: 'delete',
+            username: username
+        });
+        
+        // [V6.0 NEW] 通知 Xray Core 删除用户 (Mocked)
+        // await deleteXrayUser(userToDelete.uuid);
+        
+        broadcastToFrontends({ type: 'users_changed' });
+        
+        await logAction("USER_DELETE_SUCCESS", req.session.username, `Deleted user ${username}`);
+        res.json({ success: true, message: `用户组 ${username} 已删除，会话已终止` });
+    } catch (e) {
+        await logAction("USER_DELETE_FAIL", req.session.username, `Failed to delete user ${username}: ${e.message}`);
+        res.status(500).json({ success: false, message: `删除操作失败: ${e.message}` });
+    }
+});
+
+api.post('/users/set_settings', async (req, res) => {
+    // [V6.0 FIX] 接收 Xray 协议类型
+    const { username, expiry_date, quota_gb, rate_kbps, max_connections, new_password, require_auth_header, allow_shell, xray_protocol } = req.body;
+    
+    const user = await getUserByUsername(username);
+    if (!user) return res.status(404).json({ success: false, message: `用户 ${username} 不存在` });
+    
+    try {
+        const new_allow_shell = allow_shell ? 1 : 0;
+        
+        let updateFields = {
+            expiration_date: expiry_date || "", 
+            quota_gb: parseFloat(quota_gb), 
+            rate_kbps: parseInt(rate_kbps), 
+            max_connections: parseInt(max_connections) || 0,
+            require_auth_header: require_auth_header ? 1 : 0,
+            allow_shell: new_allow_shell,
+            xray_protocol: xray_protocol || 'none' // [V6.0 NEW]
+        };
+        
+        let updateSql = 'UPDATE users SET ';
+        const updateValues = [];
+        const fieldNames = Object.keys(updateFields);
+
+        if (new_password) {
+            const chpasswdInput = `${username}:${new_password}`;
+            const { success, output } = await safeRunCommand(['chpasswd'], chpasswdInput);
+            if (!success) throw new Error(`Failed to update system password: ${output}`);
+            const passwordHash = await bcrypt.hash(new_password, 12);
+            updateSql += 'password_hash = ?, ';
+            updateValues.push(passwordHash);
+            await kickUserFromProxy(username); 
+            await safeRunCommand(['pkill', '-9', '-u', username]); 
+            // [V6.0 NEW] 通知 Xray Core 踢出用户 (Mocked)
+            // await kickUserFromXray(user.uuid);
+            await logAction("USER_PASS_CHANGE", req.session.username, `Password changed (DB + System) for ${username}. Kicking sessions.`);
+        }
+        
+        if (user.allow_shell != new_allow_shell) {
+            let groupCmd, groupActionLog;
+            if (new_allow_shell === 1) {
+                groupCmd = ['usermod', '-a', '-G', 'shell_users', username];
+                groupActionLog = "Added to shell_users group";
+            } else {
+                groupCmd = ['gpasswd', '-d', username, 'shell_users'];
+                groupActionLog = "Removed from shell_users group";
+                await safeRunCommand(['pkill', '-9', '-u', username]);
+            }
+            const { success: groupSuccess, output: groupOutput } = await safeRunCommand(groupCmd);
+            if (!groupSuccess) {
+                if (!groupOutput.includes("is not a member")) {
+                    throw new Error(`Failed to update group membership: ${groupOutput}`);
+                }
+            }
+            await logAction("USER_SHELL_CHANGE", req.session.username, `Stunnel (444) access for ${username} ${new_allow_shell ? 'ENABLED' : 'DISABLED'}. ${groupActionLog}.`);
+        }
+
+        fieldNames.forEach(field => {
+            updateSql += `${field} = ?, `;
+            updateValues.push(updateFields[field]);
+        });
+        
+        updateSql = updateSql.slice(0, -2); 
+        updateSql += ' WHERE username = ?';
+        updateValues.push(username);
+        await db.run(updateSql, updateValues);
+        
+        // [V6.0 NEW] 通知 Xray Core 更新用户策略 (Mocked)
+        // await updateXrayUser(user.uuid, updateFields.xray_protocol);
+
+        broadcastToProxies({
+            action: 'update_limits',
+            username: username,
+            limits: {
+                rate_kbps: updateFields.rate_kbps,
+                max_connections: updateFields.max_connections,
+                require_auth_header: updateFields.require_auth_header
+            }
+        });
+        
+        broadcastToFrontends({ type: 'users_changed' });
+        
+        setTimeout(syncUserStatus, 1000); 
+
+        await logAction("USER_SETTINGS_UPDATE", req.session.username, `Settings updated for ${username}.`);
+        res.json({ success: true, message: `用户 ${username} 的设置已保存。` });
+
+    } catch (e) {
+        await logAction("USER_SETTINGS_FAIL", req.session.username, `Failed to update settings for ${username}: ${e.message}`);
+        res.status(500).json({ success: false, message: `操作失败: ${e.message}` });
+    }
+});
+
+api.post('/users/status', async (req, res) => {
+// ... existing logic (no change needed here)
+    const { username, action } = req.body;
+    const user = await getUserByUsername(username);
+    if (!user) return res.status(404).json({ success: false, message: `用户 ${username} 不存在` });
+    try {
+        let newStatus = 'active';
+        let newStatusText = '启用 (Active)';
+        
+        if (action === 'pause') {
+            newStatus = 'paused';
+            newStatusText = '暂停 (Manual)';
+            await safeRunCommand(['usermod', '-L', username]); 
+            await kickUserFromProxy(username);
+            await safeRunCommand(['pkill', '-9', '-u', username]);
+            // [V6.0 NEW] 通知 Xray Core 踢出用户 (Mocked)
+            // await kickUserFromXray(user.uuid);
+            await logAction("USER_PAUSE", req.session.username, `User ${username} manually paused (System Locked).`);
+        
+        } else if (action === 'enable') {
+            newStatus = 'active';
+            newStatusText = '启用 (Active)';
+            await safeRunCommand(['usermod', '-U', username]); 
+            await logAction("USER_ENABLE", req.session.username, `User ${username} manually enabled (System Unlocked).`);
+        }
+        
+        await db.run(`UPDATE users SET status = ?, status_text = ? WHERE username = ?`, newStatus, newStatusText, username);
+        
+        broadcastToFrontends({ type: 'users_changed' });
+        
+        res.json({ success: true, message: `用户 ${username} 状态已更新。` });
+    } catch (e) {
+        await logAction("USER_STATUS_FAIL", req.session.username, `Failed to change status for ${username}: ${e.message}`);
+        res.status(500).json({ success: false, message: `操作失败: ${e.message}` });
+    }
+});
+
+api.post('/users/reset_traffic', async (req, res) => {
+// ... existing logic (no change needed here)
+    const { username } = req.body;
+    const user = await getUserByUsername(username);
+    if (!user) return res.status(404).json({ success: false, message: `用户 ${username} 不存在` });
+    try {
+        await db.run('BEGIN TRANSACTION');
+        await db.run(`UPDATE users SET usage_gb = 0.0 WHERE username = ?`, username);
+        await db.run(`DELETE FROM traffic_history WHERE username = ?`, username);
+        
+        broadcastToProxies({
+            action: 'reset_traffic',
+            username: username
+        });
+        
+        // [V6.0 NEW] 通知 Xray Core 重置流量 (Mocked)
+        // await resetXrayTraffic(user.uuid);
+        
+        await db.run('COMMIT');
+        
+        if (user.status === 'exceeded') {
+             await db.run(`UPDATE users SET status = 'active', status_text = '启用 (Active)' WHERE username = ?`, username);
+        }
+        
+        broadcastToFrontends({ type: 'users_changed' });
+        
+        setTimeout(syncUserStatus, 1000);
+
+        await logAction("USER_TRAFFIC_RESET", req.session.username, `Traffic usage reset for ${username}.`);
+        res.json({ success: true, message: `用户 ${username} 的流量使用量和历史记录已重置。` });
+    } catch (e) {
+        await db.run('ROLLBACK').catch(() => {});
+        await logAction("USER_TRAFFIC_FAIL", req.session.username, `Failed to reset traffic for ${username}: ${e.message}`);
+        res.status(500).json({ success: false, message: `操作失败: ${e.message}` });
+    }
+});
+
+api.post('/users/kill_all', async (req, res) => {
+// ... existing logic (no change needed here)
+    const { username } = req.body;
+    const user = await getUserByUsername(username);
+    if (!user) return res.status(404).json({ success: false, message: `用户 ${username} 不存在` });
+    try {
+        const wss_success = await kickUserFromProxy(username);
+        const ssh_success = (await safeRunCommand(['pkill', '-9', '-u', username])).success;
+        
+        // [V6.0 NEW] 通知 Xray Core 踢出用户 (Mocked)
+        // await kickUserFromXray(user.uuid);
+
+        if (wss_success || ssh_success) {
+            await logAction("USER_KILL_SESSIONS", req.session.username, `All active sessions (WSS + SSHD + Xray) killed for ${username}.`);
+            res.json({ success: true, message: `用户 ${username} 的所有活跃连接已强制断开。` });
+        } else {
+            throw new Error("Proxy /kick and pkill API failed.");
+        }
+    } catch (e) {
+        await logAction("USER_KILL_FAIL", req.session.username, `Failed to kill sessions for ${username}: ${e.message}`);
+        res.status(500).json({ success: false, message: `操作失败: ${e.message}` });
+    }
+});
+
+api.post('/users/batch-action', async (req, res) => {
+// ... existing logic (no change needed here)
+    const { action, usernames, days } = req.body;
+    if (!action || !Array.isArray(usernames) || usernames.length === 0) {
+        return res.status(400).json({ success: false, message: "无效的请求参数。" });
+    }
+    let successCount = 0, failedCount = 0; const errors = [];
+    try {
+        if (action === 'delete') {
+            await db.run('BEGIN TRANSACTION');
+            for (const username of usernames) {
+                try {
+                    const user = await getUserByUsername(username); // [V6.0 FIX] 获取 UUID
+                    await kickUserFromProxy(username); 
+                    await safeRunCommand(['pkill', '-9', '-u', username]);
+                    await safeRunCommand(['userdel', '-r', username]); 
+                    await db.run('DELETE FROM users WHERE username = ?', username);
+                    await db.run('DELETE FROM traffic_history WHERE username = ?', username);
+                    broadcastToProxies({ action: 'delete', username: username });
+                    // [V6.0 NEW] 通知 Xray Core 删除用户 (Mocked)
+                    // if (user) await deleteXrayUser(user.uuid);
+                    successCount++;
+                } catch(e) { failedCount++; errors.push(`${username}: ${e.message}`); }
+            }
+            await db.run('COMMIT');
+        } else if (action === 'pause') {
+            await db.run('BEGIN TRANSACTION');
+            for (const username of usernames) {
+                try {
+                    const user = await getUserByUsername(username); // [V6.0 FIX] 获取 UUID
+                    await db.run(`UPDATE users SET status = 'paused', status_text = '暂停 (Manual)' WHERE username = ?`, username);
+                    await safeRunCommand(['usermod', '-L', username]); 
+                    await kickUserFromProxy(username); 
+                    await safeRunCommand(['pkill', '-9', '-u', username]);
+                    // [V6.0 NEW] 通知 Xray Core 踢出用户 (Mocked)
+                    // if (user) await kickUserFromXray(user.uuid);
+                    successCount++;
+                } catch(e) { failedCount++; errors.push(`${username}: ${e.message}`); }
+            }
+            await db.run('COMMIT');
+        } else if (action === 'enable') {
+            await db.run('BEGIN TRANSACTION');
+            for (const username of usernames) {
+                try {
+                    const user = await getUserByUsername(username);
+                    if (!user) { throw new Error("User not found"); }
+                    
+                    await db.run(`UPDATE users SET status = 'active', status_text = '启用 (Active)' WHERE username = ?`, username);
+                    await safeRunCommand(['usermod', '-U', username]); 
+                    successCount++;
+                } catch(e) { failedCount++; errors.push(`${username}: ${e.message}`); }
+            }
+            await db.run('COMMIT');
+        } else if (action === 'renew') {
+            const renewDays = parseInt(days) || 30; const today = new Date();
+            await db.run('BEGIN TRANSACTION');
+            for (const username of usernames) {
+                try {
+                    const user = await getUserByUsername(username);
+                    if (!user) { failedCount++; errors.push(`${username}: not found`); continue; }
+                    let currentExpiry = null;
+                    
+                    // [AXIOM V5.5 FIX A4] 增强日期解析的健壮性
+                    try { 
+                        if (user.expiration_date) { 
+                            currentExpiry = new Date(user.expiration_date); 
+                        } 
+                    } catch(e) { /* ignore parse error */ }
+                    
+                    let baseDate = today;
+                    if (currentExpiry && !isNaN(currentExpiry.getTime()) && currentExpiry.getTime() > today.getTime()) { baseDate = currentExpiry; }
+                    const newExpiryDate = new Date(baseDate.getTime() + renewDays * 24 * 60 * 60 * 1000);
+                    const newExpiryString = newExpiryDate.toISOString().split('T')[0];
+                    
+                    await db.run(`UPDATE users SET expiration_date = ?, status = 'active', status_text = '启用 (Active)' WHERE username = ?`, newExpiryString, username);
+                    await safeRunCommand(['usermod', '-U', username]); 
+                    successCount++;
+                } catch(e) { failedCount++; errors.push(`${username}: ${e.message}`); }
+            }
+            await db.run('COMMIT');
+        } else {
+            return res.status(400).json({ success: false, message: "无效的动作。" });
+        }
+        
+        broadcastToFrontends({ type: 'users_changed' });
+        
+        await logAction("USER_BATCH_ACTION", req.session.username, `Action: ${action}, Days: ${days || 'N/A'}, Success: ${successCount}, Failed: ${failedCount}.`);
+        res.json({ success: true, message: `批量操作 "${action}" 完成。成功 ${successCount} 个, 失败 ${failedCount} 个。`, errors: errors });
+    } catch (e) {
+        await db.run('ROLLBACK').catch(() => {});
+        await logAction("USER_BATCH_FAIL", req.session.username, `Action: ${action} failed: ${e.message}`);
+        res.status(500).json({ success: false, message: `批量操作失败: ${e.message}` });
+    }
+});
+
+
+api.get('/users/traffic-history', async (req, res) => {
+// ... existing logic (no change needed here)
+    const { username } = req.query;
+    if (!username) { return res.status(400).json({ success: false, message: "缺少用户名。" }); }
+    try {
+        const history = await db.all(`SELECT date, usage_gb FROM traffic_history WHERE username = ? ORDER BY date DESC LIMIT 30`, [username]);
+        res.json({ success: true, history: history.reverse() }); 
+    } catch (e) {
+        res.status(500).json({ success: false, message: `获取流量历史失败: ${e.message}` });
+    }
+});
+
+
+api.get('/settings/hosts', async (req, res) => {
+// ... existing logic (no change needed here)
+    const hosts = await loadHosts();
+    res.json({ success: true, hosts });
+});
+
+api.post('/settings/hosts', async (req, res) => {
+// ... existing logic (no change needed here)
+    const { hosts: newHostsRaw } = req.body;
+    if (!Array.isArray(newHostsRaw)) return res.status(400).json({ success: false, message: "Hosts 必须是列表格式" });
+    try {
+        const newHosts = newHostsRaw.map(h => String(h).trim().toLowerCase()).filter(h => h);
+        await fs.writeFile(HOSTS_DB_PATH, JSON.stringify(newHosts, null, 4), 'utf8');
+        
+        broadcastToProxies({
+            action: 'reload_hosts'
+        });
+        
+        broadcastToFrontends({ type: 'hosts_changed' });
+        
+        // [V6.0 NEW] 通知 Nginx 重新加载 Host 白名单 (Mocked)
+        // await reloadNginxHostList(newHosts);
+
+        await logAction("HOSTS_UPDATE", req.session.username, `Updated host whitelist. Count: ${newHosts.length}`);
+        res.json({ success: true, message: `Host 白名单已更新，WSS 代理将自动热重载。` });
+    } catch (e) {
+        res.status(500).json({ success: false, message: `保存 Hosts 配置失败: ${e.message}` });
+    }
+});
+
+api.get('/settings/global', async (req, res) => {
+    try {
+        const fuseSetting = await db.get("SELECT value FROM global_settings WHERE key = 'fuse_threshold_kbps'");
+        res.json({
+            success: true,
+            settings: {
+                fuse_threshold_kbps: fuseSetting ? parseInt(fuseSetting.value) : 0,
+                // [V6.0 NEW] 全局带宽限制
+                global_bandwidth_limit_mbps: config.global_bandwidth_limit_mbps || 0 
+            }
+        });
+    } catch (e) {
+        res.status(500).json({ success: false, message: `获取全局设置失败: ${e.message}` });
+    }
+});
+
+api.post('/settings/global', async (req, res) => {
+    // [V6.0 FIX] 接收新的全局设置
+    const { fuse_threshold_kbps, global_bandwidth_limit_mbps } = req.body;
+    
+    if (fuse_threshold_kbps === undefined || global_bandwidth_limit_mbps === undefined) { 
+        return res.status(400).json({ success: false, message: "缺少熔断阈值或全局带宽限制" }); 
+    }
+    
+    try {
+        const fuseThreshold = parseInt(fuse_threshold_kbps) || 0;
+        const bandwidthLimit = parseInt(global_bandwidth_limit_mbps) || 0;
+        
+        // 1. 更新数据库 (熔断阈值)
+        await db.run(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES (?, ?)", 
+            'fuse_threshold_kbps', 
+            fuseThreshold.toString()
+        );
+        
+        globalFuseLimitKbps = fuseThreshold;
+
+        // 2. 更新内存配置 (全局带宽限制)
+        config.global_bandwidth_limit_mbps = bandwidthLimit;
+        await fs.writeFile(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8'); 
+        
+        // Note: 动态 QoS 逻辑依赖于 config.global_bandwidth_limit_mbps
+        
+        await logAction("GLOBAL_SETTINGS_UPDATE", req.session.username, `Global fuse threshold set to ${fuseThreshold} KB/s. Bandwidth limit set to ${bandwidthLimit} MB/s.`);
+        res.json({ success: true, message: `全局安全与带宽设置已保存。` });
+
+    } catch (e) {
+        await logAction("GLOBAL_SETTINGS_FAIL", req.session.username, `Failed to save global settings: ${e.message}`);
+        res.status(500).json({ success: false, message: `保存设置失败: ${e.message}` });
+    }
+});
+
+api.get('/settings/config', (req, res) => {
+    const { internal_api_secret, ...safeConfig } = config;
+    res.json({ success: true, config: safeConfig });
+});
+
+
+/**
+ * [AXIOM V6.1 FIX] 增加 Nginx 和 Xray 配置文件的动态生成与重载。
+ */
+api.post('/settings/config', async (req, res) => {
+    const newConfigData = req.body;
+    if (!newConfigData) {
+        return res.status(400).json({ success: false, message: "无效的配置数据。" });
+    }
+    
+    try {
+        let currentConfig = { ...config };
+        
+        const oldStunnelPort = currentConfig.stunnel_port;
+        const oldUdpCustomPort = currentConfig.udp_custom_port;
+        
+        const fieldsToUpdate = [
+            'panel_port', 'wss_http_port', 'wss_tls_port', 
+            'stunnel_port', 'udpgw_port', 'udp_custom_port', 
+            'internal_forward_port', 'wss_proxy_port_internal', 
+            'xray_port_internal', 'xray_api_port' 
+        ];
+        const stringFieldsToUpdate = [
+            'nginx_domain', 'wss_ws_path', 'xray_ws_path'
+        ];
+        const booleanFieldsToUpdate = ['nginx_enable'];
+        
+        let requiresWssRestart = false;
+        let requiresPanelRestart = false;
+        let requiresStunnelRestart = false;
+        let requiresUdpGwRestart = false;
+        let requiresUdpCustomRestart = false;
+        let requiresNginxReload = false;
+        let requiresXrayRestart = false;
+        
+        // 1. 处理数值字段
+        fieldsToUpdate.forEach(key => {
+            const newValue = parseInt(newConfigData[key]);
+            if (newValue && newValue !== currentConfig[key]) {
+                console.log(`[CONFIG] 端口变更: ${key} 从 ${currentConfig[key]} -> ${newValue}`);
+                currentConfig[key] = newValue;
+                if (key === 'panel_port') requiresPanelRestart = true;
+                if (key.includes('wss_')) requiresWssRestart = true;
+                if (key === 'stunnel_port') requiresStunnelRestart = true;
+                if (key === 'udpgw_port') requiresUdpGwRestart = true;
+                if (key === 'udp_custom_port') requiresUdpCustomRestart = true;
+                if (key.includes('xray_')) requiresXrayRestart = true;
+                if (key === 'wss_proxy_port_internal' || key === 'xray_port_internal') requiresNginxReload = true;
+            }
+        });
+        
+        // 2. 处理字符串/布尔值字段
+        stringFieldsToUpdate.forEach(key => {
+            const newValue = String(newConfigData[key]).trim();
+            if (newValue && newValue !== currentConfig[key]) {
+                currentConfig[key] = newValue;
+                if (key.includes('domain') || key.includes('_path')) requiresNginxReload = true;
+                if (key.includes('xray_ws_path')) requiresXrayRestart = true;
+            }
+        });
+
+        booleanFieldsToUpdate.forEach(key => {
+            const newValue = newConfigData[key] ? 1 : 0;
+            if (newValue !== currentConfig[key]) {
+                 currentConfig[key] = newValue;
+                 requiresNginxReload = true;
+                 if (key === 'nginx_enable') {
+                     // Nginx 启停也需要 Nginx reload/restart
+                 }
+            }
+        });
+        
+        currentConfig.panel_api_url = `http://127.0.0.1:${currentConfig.panel_port}/internal`;
+        
+        // 3. 立即写入主 config.json
+        await fs.writeFile(CONFIG_PATH, JSON.stringify(currentConfig, null, 2), 'utf8');
+        // 4. 更新面板自身的内存配置
+        config = { ...currentConfig };
+        
+        // --- 核心服务文件修补 (Stunnel/UDP Custom) ---
+        try {
+            // 1. 处理 Stunnel 端口变更
+            if (requiresStunnelRestart) {
+                const newPort = currentConfig.stunnel_port;
+                const sedResult = await safeRunCommand(['sed', '-i', `s/accept = 0.0.0.0:${oldStunnelPort}/accept = 0.0.0.0:${newPort}/g`, STUNNEL_CONF]);
+                if (!sedResult.success) throw new Error(`Failed to update ${STUNNEL_CONF}: ${sedResult.output}`);
+            }
+
+            // 2. 处理 UDP Custom 端口变更
+            if (requiresUdpCustomRestart) {
+                const newPort = currentConfig.udp_custom_port;
+                const sedResult = await safeRunCommand(['sed', '-i', `s/"listen": ":${oldUdpCustomPort}"/"listen": ":${newPort}"/g`, UDP_CUSTOM_CONFIG_PATH]);
+                if (!sedResult.success) {
+                    // 如果 sed 失败，尝试重新生成整个文件
+                    console.error(`[CONFIG_FIX] UDP Custom config update failed: ${sedResult.output}. Attempting regenerate.`);
+                    const newContent = JSON.stringify({
+                        listen: `:${newPort}`, stream_buffer: 33554432, receive_buffer: 83886080, auth: { mode: "passwords" }
+                    }, null, 2);
+                    await fs.writeFile(UDP_CUSTOM_CONFIG_PATH, newContent, 'utf8');
+                }
+            }
+            
+            // 3. [V6.1 NEW] 动态生成 Nginx 配置
+            if (requiresNginxReload) {
+                await generateAndApplyNginxConfig(currentConfig);
+            }
+            
+            // 4. [V6.1 NEW] 动态生成 Xray 配置
+            if (requiresXrayRestart) {
+                 await generateAndApplyXrayConfig(currentConfig);
+            }
+            
+        } catch (e) {
+            await logAction("CONFIG_FIX_FAIL", req.session.username, `Failed to patch service files: ${e.message}`);
+            res.status(500).json({ success: false, message: `保存 config.json 成功，但应用到服务文件失败: ${e.message}` });
+            return; 
+        }
+
+        await logAction("CONFIG_SAVE_SUCCESS", req.session.username, `配置已保存到 ${CONFIG_PATH} 并且服务文件已修补。`);
+        
+        // 5. 异步重启所有受影响的服务
+        const restartServices = async () => {
+            if (requiresWssRestart) await safeRunCommand(['systemctl', 'restart', 'wss']);
+            if (requiresStunnelRestart) await safeRunCommand(['systemctl', 'restart', 'stunnel4']);
+            if (requiresUdpGwRestart) await safeRunCommand(['systemctl', 'restart', 'udpgw']);
+            if (requiresUdpCustomRestart) await safeRunCommand(['systemctl', 'restart', 'wss-udp-custom']);
+            
+            if (requiresXrayRestart || requiresNginxReload) {
+                 // 确保 Xray 在 Nginx 之前重启 (如果需要)
+                 if (requiresXrayRestart) await safeRunCommand(['systemctl', 'restart', 'xray']);
+                 // Nginx 需要在 Xray 和 WSS Proxy 内部端口确定后重启
+                 await safeRunCommand(['systemctl', 'restart', 'nginx']);
+            }
+            
+            if (requiresPanelRestart) {
+                setTimeout(async () => {
+                    await safeRunCommand(['systemctl', 'restart', 'wss_panel']);
+                }, 1000);
+            }
+        };
+        restartServices(); 
+
+        res.json({ success: true, message: `配置已保存并成功应用！相关服务正在后台重启... (面板可能会在 ${requiresPanelRestart ? '1秒' : '0秒'} 后刷新)` });
+
+    } catch (e) {
+        await logAction("CONFIG_SAVE_FAIL", req.session.username, `Failed to save config: ${e.message}`);
+        res.status(500).json({ success: false, message: `保存配置失败: ${e.message}` });
+    }
+});
+
+/**
+ * [V6.1 NEW] 动态生成 Nginx 配置并应用
+ */
+async function generateAndApplyNginxConfig(currentConfig) {
+    const NGINX_TEMPLATE_PATH = path.join(PANEL_DIR, 'nginx.conf.template');
+    const NGINX_CONFIG_TEMP = path.join(os.tmpdir(), 'nginx_temp.conf');
+
+    // 1. 获取 Host Whitelist 正则表达式
+    const hosts = await loadHosts();
+    const HOSTS_REGEX = hosts.length > 0 ? hosts.map(h => h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') : '.*';
+
+    // 2. 检查 Nginx 模板文件是否存在
+    if (!fsSync.existsSync(NGINX_TEMPLATE_PATH)) {
+         // 从安装脚本中拷贝一份模板 (简化操作，实际应在安装时完成)
+         await safeRunCommand(['/bin/cp', path.join(__dirname, 'nginx.conf.template'), NGINX_TEMPLATE_PATH]);
+    }
+    
+    // 3. 读取模板并替换变量
+    let templateContent = await fs.readFile(NGINX_TEMPLATE_PATH, 'utf8');
+
+    templateContent = templateContent
+        .replace(/@YOUR_DOMAIN@/g, currentConfig.nginx_domain)
+        .replace(/@PANEL_PORT@/g, currentConfig.panel_port)
+        .replace(/@XRAY_WSPATH@/g, currentConfig.xray_ws_path)
+        .replace(/@WSS_WSPATH@/g, currentConfig.wss_ws_path)
+        .replace(/@XRAY_PORT_INTERNAL@/g, currentConfig.xray_port_internal)
+        .replace(/@WSS_PROXY_PORT_INTERNAL@/g, currentConfig.wss_proxy_port_internal)
+        .replace(/@PANEL_DIR@/g, PANEL_DIR)
+        .replace(/@HOST_WHITELIST_REGEX@/g, HOSTS_REGEX)
+        // 假设证书路径已在 config.json 或安装脚本中处理
+        .replace(/@CERT_PATH@/g, `/etc/letsencrypt/live/${currentConfig.nginx_domain}/fullchain.pem`)
+        .replace(/@KEY_PATH@/g, `/etc/letsencrypt/live/${currentConfig.nginx_domain}/privkey.pem`);
+
+
+    // 4. 写入临时文件
+    await fs.writeFile(NGINX_CONFIG_TEMP, templateContent, 'utf8');
+
+    // 5. 替换现有的 Nginx 配置
+    const moveResult = await safeRunCommand(['/bin/mv', NGINX_CONFIG_TEMP, NGINX_CONF_PATH]);
+    if (!moveResult.success) throw new Error(`Failed to move Nginx config: ${moveResult.output}`);
+
+    // 6. 清理旧符号链接并创建新的 (如果需要)
+    await safeRunCommand(['/bin/rm', '-f', '/etc/nginx/sites-enabled/default']);
+    await safeRunCommand(['/usr/bin/ln', '-sf', NGINX_CONF_PATH, '/etc/nginx/sites-enabled/wss_gateway.conf']);
+
+    // 7. 检查 Nginx 配置
+    const testResult = await safeRunCommand(['nginx', '-t']);
+    if (!testResult.success) throw new Error(`Nginx config test failed: ${testResult.output}`);
+
+    console.log(`[CONFIG_FIX] Nginx 配置已成功生成并测试通过。`);
+}
+
+/**
+ * [V6.1 NEW] 动态生成 Xray 配置并应用
+ */
+async function generateAndApplyXrayConfig(currentConfig) {
+    const XRAY_CONFIG_TEMP = path.join(os.tmpdir(), 'xray_temp.json');
+    
+    // 1. 读取 Xray 模板并替换变量
+    if (!fsSync.existsSync(XRAY_CONFIG_TEMPLATE)) {
+         // 从安装脚本中拷贝一份模板 (简化操作，实际应在安装时完成)
+         await safeRunCommand(['/bin/cp', path.join(__dirname, 'xray_config.json.template'), XRAY_CONFIG_TEMPLATE]);
+    }
+    
+    let templateContent = await fs.readFile(XRAY_CONFIG_TEMPLATE, 'utf8');
+
+    templateContent = templateContent
+        .replace(/@XRAY_INTERNAL_PORT@/g, currentConfig.xray_port_internal)
+        .replace(/@XRAY_UUID@/g, currentConfig.xray_uuid)
+        // [V6.1 FIX] 确保路径正确替换
+        .replace(/"path": "\/vless-ws"/g, `"path": "${currentConfig.xray_ws_path}"`); 
+
+    // 2. 写入临时文件
+    await fs.writeFile(XRAY_CONFIG_TEMP, templateContent, 'utf8');
+
+    // 3. 替换现有的 Xray 配置
+    const moveResult = await safeRunCommand(['/bin/mv', XRAY_CONFIG_TEMP, XRAY_CONFIG_PATH]);
+    if (!moveResult.success) throw new Error(`Failed to move Xray config: ${moveResult.output}`);
+
+    // 4. 确保权限正确
+    await safeRunCommand(['/usr/bin/chown', `${currentConfig.panel_user}:${currentConfig.panel_user}`, XRAY_CONFIG_PATH]);
+    
+    console.log(`[CONFIG_FIX] Xray 配置已成功生成。`);
+}
+
+
+api.post('/settings/change-password', async (req, res) => {
+// ... existing logic (no change needed here)
+    const { old_password, new_password } = req.body;
+    if (!old_password || !new_password) { return res.status(400).json({ success: false, message: "新旧密码均不能为空。" }); }
+    if (new_password.length < 6) { return res.status(400).json({ success: false, message: "新密码长度必须至少为 6 位。" }); }
+    try {
+        const rootHash = await loadRootHash();
+        if (!rootHash) { throw new Error("无法加载 root hash 文件。"); }
+        const match = await bcrypt.compare(old_password, rootHash);
+        if (!match) {
+            await logAction("CHANGE_PASS_FAIL", req.session.username, "Failed to change panel password: Incorrect old password");
+            return res.status(403).json({ success: false, message: "当前密码不正确。" });
+        }
+        const newHash = await bcrypt.hash(new_password, 12);
+        await fs.writeFile(ROOT_HASH_FILE, newHash, 'utf8');
+        await logAction("CHANGE_PASS_SUCCESS", req.session.username, "Panel admin password changed successfully.");
+        res.json({ success: true, message: "管理员密码修改成功。" });
+    } catch (e) {
+        await logAction("CHANGE_PASS_FAIL", req.session.username, `Failed to change panel password: ${e.message}`);
+        res.status(500).json({ success: false, message: `密码修改失败: ${e.message}` });
+    }
+});
+
+api.post('/ips/ban_global', async (req, res) => {
+// ... existing logic (no change needed here)
+    const { ip, reason } = req.body;
+    if (!ip) return res.status(400).json({ success: false, message: "IP 地址不能为空" });
+    try {
+        const iptablesResult = await manageIpIptables(ip, 'block');
+        if (!iptablesResult.success) throw new Error(iptablesResult.output);
+        const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
+        await db.run(`INSERT OR REPLACE INTO ip_bans (ip, reason, added_by, timestamp) VALUES (?, ?, ?, ?)`,
+            ip, reason || 'Manual Panel Ban', req.session.username, timestamp
+        );
+        await logAction("IP_BAN_GLOBAL", req.session.username, `Globally banned IP ${ip}. Reason: ${reason}`);
+        res.json({ success: true, message: `IP 地址 ${ip} 已全局封禁。` });
+    } catch (e) {
+        await logAction("IP_BAN_FAIL", req.session.username, `Failed to ban IP ${ip}: ${e.message}`);
+        res.status(500).json({ success: false, message: `封禁操作失败: ${e.message}` });
+    }
+});
+
+api.post('/ips/unban_global', async (req, res) => {
+// ... existing logic (no change needed here)
+    const { ip } = req.body;
+    if (!ip) return res.status(400).json({ success: false, message: "IP 地址不能为空" });
+    try {
+        const iptablesResult = await manageIpIptables(ip, 'unblock');
+        if (!iptablesResult.success && !iptablesResult.output.includes('No chain/target/match')) {
+            throw new Error(iptablesResult.output);
+        }
+        await db.run(`DELETE FROM ip_bans WHERE ip = ?`, ip);
+        await logAction("IP_UNBAN_GLOBAL", req.session.username, `Globally unbanned IP ${ip}.`);
+        res.json({ success: true, message: `IP 地址 ${ip} 已解除全局封禁。` });
+    } catch (e) {
+        await logAction("IP_UNBAN_FAIL", req.session.username, `Failed to unban IP ${ip}: ${e.message}`);
+        res.status(500).json({ success: false, message: `解除封禁失败: ${e.message}` });
+    }
+});
+
+api.get('/ips/global_list', async (req, res) => {
+// ... existing logic (no change needed here)
+    try {
+        const bans = await db.all('SELECT * FROM ip_bans ORDER BY timestamp DESC');
+        const bansMap = bans.reduce((acc, item) => {
+            acc[item.ip] = { reason: item.reason, timestamp: item.timestamp };
+            return acc;
+        }, {});
+        res.json({ success: true, global_bans: bansMap });
+    } catch (e) {
+        res.status(500).json({ success: false, message: `Failed to fetch ban list: ${e.message}` });
+    }
+});
+
+api.post('/utils/find_sni', async (req, res) => {
+// ... existing logic (no change needed here)
+    const { hostname } = req.body;
+    if (!hostname) {
+        return res.status(400).json({ success: false, message: "Hostname 不能为空。" });
+    }
+    try {
+        const { address: ip_address } = await dns.promises.lookup(hostname);
+        const promise = new Promise((resolve, reject) => {
+            const options = {
+                port: 443,
+                host: ip_address, 
+                servername: hostname, 
+                timeout: 8000, 
+                rejectUnauthorized: true 
+            };
+            const socket = tls.connect(options, () => {
+                const cert = socket.getPeerCertificate();
+                socket.end();
+                if (!cert || !cert.subjectaltname) {
+                    return resolve([]); 
+                }
+                const altNames = cert.subjectaltname
+                    .split(',')
+                    .map(s => s.trim())
+                    .filter(s => s.startsWith('DNS:'))
+                    .map(s => s.substring(4)); 
+                resolve(altNames);
+            });
+            socket.on('timeout', () => {
+                socket.destroy();
+                reject(new Error(`连接到 ${hostname} (port 443) 超时。`));
+            });
+            socket.on('error', (err) => {
+                if (err.code === 'CERT_HAS_EXPIRED' || err.code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') {
+                     reject(new Error(`SSL 证书验证失败: ${err.message}`));
+                } else {
+                     reject(new Error(`TLS 错误: ${err.message}`));
                 }
             });
-            updateBatchActionBar();
         });
-    }
-    document.querySelectorAll('.user-checkbox').forEach(cb => {
-        cb.addEventListener('change', (e) => {
-            const username = e.target.dataset.username;
-            if (e.target.checked) {
-                if (!selectedUsers.includes(username)) {
-                    selectedUsers.push(username);
-                }
-            } else {
-                selectedUsers = selectedUsers.filter(u => u !== username);
-            }
-            document.querySelectorAll(`.user-checkbox[data-username="${username}"]`).forEach(box => box.checked = e.target.checked);
-            const visibleCheckboxes = Array.from(document.querySelectorAll('#user-list-tbody .user-checkbox'));
-            const allVisibleChecked = visibleCheckboxes.length > 0 && visibleCheckboxes.every(box => box.checked);
-            if (selectAll) selectAll.checked = allVisibleChecked;
-            updateBatchActionBar();
-        });
-    });
-}
-
-async function handleBatchAction(action) {
-// ... existing logic (no change needed here)
-    if (selectedUsers.length === 0) {
-        showStatus('请至少选择一个用户。', false);
-        return;
-    }
-    let days = 0;
-    let confirmTitle = '批量操作确认';
-    let confirmMessage = `您确定要对选中的 ${selectedUsers.length} 个用户执行 "${action}" 操作吗？`;
-    if (action === 'renew') {
-        days = parseInt(document.getElementById('batch-renew-days').value) || 30;
-        confirmTitle = '批量续期确认';
-        confirmMessage = `您确定要为 ${selectedUsers.length} 个用户续期 ${days} 天吗？`;
-    } else if (action === 'delete') {
-        confirmTitle = '批量删除确认';
-        confirmMessage = `警告：您确定要永久删除选中的 ${selectedUsers.length} 个用户吗？此操作不可逆！`;
-    }
-    document.getElementById('confirm-param1').value = action;
-    document.getElementById('confirm-param2').value = JSON.stringify(selectedUsers);
-    document.getElementById('confirm-param3').value = days;
-    document.getElementById('confirm-type').value = 'batchAction';
-    document.getElementById('confirm-title').textContent = confirmTitle;
-    document.getElementById('confirm-message').innerHTML = confirmMessage;
-    const confirmBtn = document.getElementById('confirm-action-btn');
-    confirmBtn.className = 'btn btn-error'; 
-    if (action === 'enable' || action === 'renew') {
-         confirmBtn.className = 'btn btn-success';
-    }
-    confirmBtn.onclick = executeAction;
-    openModal('confirm-modal');
-}
-
-async function runSniFinder() {
-// ... existing logic (no change needed here)
-    const hostname = document.getElementById('sni-finder-host').value;
-    const resultsEl = document.getElementById('sni-finder-results');
-    const buttonEl = document.getElementById('sni-finder-btn');
-
-    if (!hostname) {
-        resultsEl.textContent = '错误: 域名不能为空。';
-        return;
-    }
-
-    resultsEl.textContent = '正在查询，请稍候...';
-    buttonEl.classList.add('loading', 'btn-disabled');
-
-    const result = await fetchData('/utils/find_sni', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ hostname: hostname })
-    });
-
-    buttonEl.classList.remove('loading', 'btn-disabled');
-
-    if (result && result.success) {
-        let output = `查询 ${hostname} (IP: ${result.ip}) 成功。\n\n`;
-        if (result.hosts && result.hosts.length > 0) {
-            output += '发现 ' + result.hosts.length + ' 个 DNS 备用名称:\n';
-            output += '----------------------------\n';
-            output += result.hosts.join('\n');
-        } else {
-            output += '没有找到额外的 DNS 备用名称 (subjectAltName)。';
+        const sniHosts = await promise;
+        res.json({ success: true, hosts: sniHosts, ip: ip_address });
+    } catch (e) {
+        let errorMessage = e.message;
+        if (e.code === 'ENOTFOUND' || e.message.includes('getaddrinfo')) {
+            errorMessage = `无法解析域名 '${hostname}'。`;
         }
-        resultsEl.textContent = output;
-    } else {
-        resultsEl.textContent = `查询失败: ${result ? result.message : '未知错误'}`;
+        res.status(500).json({ success: false, message: errorMessage });
+    }
+});
+
+
+app.use('/api', loginRequired, api);
+
+
+// --- IPC (WebSocket) 服务器 ---
+
+
+function startWebSocketServers(httpServer) {
+    console.log(`[AXIOM V6.0] 正在启动实时 WebSocket 服务...`);
+    
+    // --- 1. IPC (Proxy) 服务器 (/ipc) ---
+    wssIpc = new WebSocketServer({
+        noServer: true, 
+        path: '/ipc'
+    });
+    
+    wssIpc.on('connection', (ws, req) => {
+        const workerId = req.headers['x-worker-id'] || req.socket.remoteAddress;
+        ws.workerId = workerId;
+        console.log(`[IPC_WSS] 一个数据平面 (Proxy Worker: ${workerId}) 已连接。`);
+        
+        ws.on('message', async (data) => {
+            try {
+                const message = JSON.parse(data.toString());
+                
+                if (message.type === 'stats_update' && message.payload) {
+                    
+                    // [AXIOM V6.0 FIX] 缓存 Worker 的原始统计数据
+                    workerStatsCache.set(message.workerId || ws.workerId, message.payload);
+                    
+                    // [AXIOM V6.0 FIX] 异步处理阻塞 I/O 和熔断检查
+                    process.nextTick(async () => {
+                        try {
+                            // 1. 批量持久化流量数据 (FIXED)
+                            await persistTrafficDelta(workerStatsCache); 
+                            
+                            if (wssUiPool.size > 0) {
+                                // 2. 聚合数据并检查熔断
+                                const aggregatedStats = aggregateAllWorkerStats();
+                                
+                                if (globalFuseLimitKbps > 0) {
+                                    for (const username in aggregatedStats.users) {
+                                        const userSpeed = aggregatedStats.users[username].speed_kbps;
+                                        // 异步执行熔断，防止阻塞
+                                        await checkAndApplyFuse(username, userSpeed);
+                                    }
+                                }
+                            }
+                        } catch(e) {
+                            console.error(`[IPC_ASYNC_TASK] 异步处理失败: ${e.message}`);
+                        }
+                    });
+
+                } 
+                // [AXIOM V5.2] 处理 Worker 的元数据响应
+                else if (message.type === 'METADATA_RESPONSE') {
+                     if (typeof getLiveConnectionMetadata.onResponse === 'function') {
+                         getLiveConnectionMetadata.onResponse(message);
+                     }
+                }
+                
+                // [V6.0 NEW] 处理 Proxy 的节流反馈 (如果 Proxy 收到节流指令，Panel 也要知道)
+                else if (message.type === 'THROTTLE_FEEDBACK') {
+                    // Panel 接收到反馈，确认 Worker 已调整 TokenBucket
+                }
+            } catch (e) {
+                console.error(`[IPC_WSS] 解析 Proxy 消息失败: ${e.message}`);
+            }
+        });
+
+        ws.on('close', () => {
+            // [AXIOM V6.0 FIX 僵尸清理] Worker 断开连接时，立即从缓存中移除其数据
+            workerStatsCache.delete(ws.workerId);
+            console.log(`[IPC_WSS] 一个数据平面 (Proxy Worker: ${ws.workerId}) 已断开连接。`);
+        });
+        
+        ws.on('error', (err) => {
+            console.error(`[IPC_WSS] 客户端 WebSocket 错误: ${err.message}`);
+        });
+    });
+    
+    wssIpc.on('error', (err) => {
+         console.error(`[IPC_WSS] 实时 IPC 服务器错误: ${err.message}`);
+    });
+    
+    // --- 2. UI (Frontend) 服务器 (/ws/ui) ---
+    const wssUi = new WebSocketServer({
+        noServer: true,
+        path: '/ws/ui'
+    });
+
+    wssUi.on('connection', (ws, req) => {
+        if (!req.session || !req.session.loggedIn) {
+            console.warn("[IPC_UI] 拒绝连接: 未经身份验证的前端尝试连接 WebSocket。");
+            ws.send(JSON.stringify({ type: 'auth_failed', message: 'Authentication required.' }));
+            ws.terminate();
+            return;
+        }
+
+        console.log(`[IPC_UI] 一个已验证的管理员前端 (User: ${req.session.username}) 已连接。`);
+        wssUiPool.add(ws);
+        
+        if (wssUiPool.size === 1) {
+            toggleRealtimePush(true);
+        }
+        
+        ws.send(JSON.stringify({ type: 'status_connected', message: 'WebSocket 连接成功' }));
+
+        ws.on('close', () => {
+            console.log(`[IPC_UI] 一个管理员前端已断开连接。`);
+            wssUiPool.delete(ws);
+            
+            if (wssUiPool.size === 0) {
+                toggleRealtimePush(false);
+            }
+        });
+
+        ws.on('error', (err) => {
+            console.error(`[IPC_UI] 前端 WebSocket 错误: ${err.message}`);
+            wssUiPool.delete(ws);
+        });
+    });
+    
+    wssUi.on('error', (err) => {
+         console.error(`[IPC_UI] 前端 WS 服务器错误: ${err.message}`);
+    });
+
+    // --- 3. HTTP 服务器 'upgrade' 路由 ---
+    httpServer.on('upgrade', (request, socket, head) => {
+        
+        const secret = request.headers['x-internal-secret'];
+        const pathname = request.url;
+
+        if (pathname === '/ipc') {
+            if (secret !== config.internal_api_secret) {
+                console.error("[IPC_WSS] 拒绝连接: 内部 API 密钥 (x-internal-secret) 无效。");
+                socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+                socket.destroy();
+                return;
+            }
+            wssIpc.handleUpgrade(request, socket, head, (ws) => {
+                wssIpc.emit('connection', ws, request);
+            });
+        
+        } else if (pathname === '/ws/ui') {
+            sessionMiddleware(request, {}, () => {
+                wssUi.handleUpgrade(request, socket, head, (ws) => {
+                    wssUi.emit('connection', ws, request);
+                });
+            });
+            
+        } else {
+             console.error(`[WS] 拒绝连接: 无效的 WebSocket 路径 (${pathname})。`);
+             socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+             socket.destroy();
+        }
+    });
+    
+    console.log(`[AXIOM V6.0] 实时 WebSocket 服务已附加到主 HTTP 服务器。`);
+}
+
+
+// --- [AXIOM V3.0] 重构: Startup ---
+async function startApp() {
+    try {
+        await initDb();
+        
+        const server = http.createServer(app);
+        
+        startWebSocketServers(server);
+        
+        // 60秒维护任务 (无论管理员是否在线，都保持运行)
+        setInterval(syncUserStatus, BACKGROUND_SYNC_INTERVAL);
+        setTimeout(syncUserStatus, 5000); 
+        
+        server.listen(config.panel_port, '0.0.0.0', () => {
+            console.log(`[AXIOM V6.2] WSS Panel (HTTP) 运行在 port ${config.panel_port}`);
+            console.log(`[AXIOM V6.2] 实时 IPC (WSS) 运行在 port ${config.panel_port} (路径: /ipc)`);
+            console.log(`[AXIOM V6.2] 实时 UI (WSS) 运行在 port ${config.panel_port} (路径: /ws/ui)`);
+            console.log(`[AXIOM V6.2] 60秒维护任务已启动。`);
+        });
+        
+        server.on('error', (err) => {
+             if (err.code === 'EADDRINUSE') {
+                console.error(`[CRITICAL] 启动失败: 端口 ${config.panel_port} 已被占用。`);
+             } else {
+                console.error(`[CRITICAL] Panel HTTP 服务器错误: ${err.message}`);
+             }
+             process.exit(1);
+        });
+
+    } catch (e) {
+        console.error(`[CRITICAL] Panel App 启动失败: ${e.message}`);
+        process.exit(1);
     }
 }
+
+startApp();
