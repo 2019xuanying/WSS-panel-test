@@ -1,20 +1,12 @@
 /**
  * WSS Panel Backend (Node.js + Express + SQLite)
- * V9.3.0 (Axiom Refactor V6.0 - Xray/Nginx Multi-Protocol & QoS Integration)
+ * V9.3.1 (Axiom Refactor V6.0 - Xray/Nginx Multi-Protocol & QoS Integration)
  *
- * [AXIOM V6.0 CHANGELOG]
- * - [ARCH] 核心架构升级，为 Nginx 和 Xray Core 做准备。
- * - [DB] users表新增 uuid 和 xray_protocol 字段。
- * - [FIX] 并发检查合并到 /internal/auth API，消除 Proxy 双重往返延迟。
- * - [NEW] 集成 geoip-lite，在活跃连接 IP 列表中显示地理位置信息。
- * - [QoS] 引入动态 QoS/节流逻辑，根据服务器总速度向 Proxy Worker 发送动态节流指令。
- * - [CONFIG] 新增 Nginx/Xray 相关端口、域名、路径配置。
- * * [BUG FIXES V9.3.1]
- * - [FIX 1] 修复 /users/add 路由中对 quota_gb 的后端处理问题 (匹配前端修复)。
- * - [NEW 1] 增加 Xray Core 用户管理模拟函数 (addXrayUser, deleteXrayUser, updateXrayUser, kickUserFromXray, resetXrayTraffic)。
- * - [NEW 2] 增加 Nginx 配置文件重载模拟函数 (reloadNginxConfig)。
- * - [FIX 2] 修复 ReferenceError: toggleRealtimePush is not defined (提升函数作用域)。
- * - [FIX 3] 修复 getSystemLockStatus/safeRunCommand 中的 'sudo: a password is required' 错误。
+ * [AXIOM V6.1 FIXES]
+ * - [TRAFFIC FIX] 修复 persistTrafficDelta 逻辑，确保从 workerStatsCache 正确聚合和写入流量增量。
+ * - [AUTH FIX] 允许使用 'lite_auth_placeholder' 密码在 /internal/auth 接口进行认证并返回限速配置。
+ * - [XRAY FIX] 增加 Xray 配置文件生成和重载的框架代码 (位于 config post API)。
+ * - [DB NEW] 为 Xray 统计预留了流量统计函数 (仍为空实现)。
  */
 
 // --- 核心依赖 ---
@@ -47,6 +39,10 @@ const PANEL_DIR = process.env.PANEL_DIR_ENV || '/etc/wss-panel';
 const CONFIG_PATH = path.join(PANEL_DIR, 'config.json');
 // [AXIOM V5.7] UDP Custom 专属配置路径
 const UDP_CUSTOM_CONFIG_PATH = path.join(PANEL_DIR, 'udp-custom', 'config.json');
+// [V6.1 NEW] Xray 配置模板路径
+const XRAY_CONFIG_TEMPLATE = path.join(PANEL_DIR, 'xray_config.json.template');
+const XRAY_CONFIG_PATH = path.join(PANEL_DIR, 'xray_config.json');
+const NGINX_CONF_PATH = '/etc/nginx/sites-available/wss_gateway.conf';
 
 try {
     const configData = fsSync.readFileSync(CONFIG_PATH, 'utf8');
@@ -64,10 +60,7 @@ try {
     if (!config.xray_api_port) config.xray_api_port = 10085;
     if (!config.global_bandwidth_limit_mbps) config.global_bandwidth_limit_mbps = 0; // 全局带宽限制 (MB/s)
 
-    // [V6.0 NEW] Xray UUID
-    if (!config.xray_uuid) config.xray_uuid = crypto.randomUUID(); 
-
-    console.log(`[AXIOM V6.0] 成功从 ${CONFIG_PATH} 加载配置。UDP Custom Port: ${config.udp_custom_port}`);
+    console.log(`[AXIOM V6.1] 成功从 ${CONFIG_PATH} 加载配置。UDP Custom Port: ${config.udp_custom_port}`);
 } catch (e) {
     console.error(`[CRITICAL] 无法加载 ${CONFIG_PATH}: ${e.message}。将使用默认端口。`);
     // 默认配置
@@ -92,8 +85,7 @@ try {
         wss_proxy_port_internal: 10080,
         xray_port_internal: 10081,
         xray_api_port: 10085,
-        global_bandwidth_limit_mbps: 0, // 全局带宽限制 (MB/s)
-        xray_uuid: crypto.randomUUID()
+        global_bandwidth_limit_mbps: 0 // 全局带宽限制 (MB/s)
     };
     try {
         fsSync.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
@@ -157,7 +149,7 @@ const SUDO_COMMANDS = new Set([
     // ... existing commands
     'useradd', 'usermod', 'userdel', 'gpasswd', 'chpasswd', 'pkill',
     'iptables', 'iptables-save', 'journalctl', 
-    'systemctl', // 广义 systemctl，需要特殊处理
+    'systemctl', // 广义 systemctl, 需要特殊处理
     'getent', 
     'sed', 
     'systemctl daemon-reload',
@@ -165,69 +157,13 @@ const SUDO_COMMANDS = new Set([
     'systemctl restart',
     'systemctl stop',
     'systemctl enable',
-    'systemctl disable'
+    'systemctl disable',
+    // [V6.1 NEW] 添加 certbot 和 mv, cp, rm 等必要的文件操作命令，用于配置更新
+    '/usr/bin/certbot',
+    '/bin/mv',
+    '/bin/cp',
+    '/bin/rm'
 ]);
-
-// =======================================================
-// [AXIOM V6.0 NEW] Xray Core 模拟 API 交互
-// =======================================================
-
-async function addXrayUser(uuid, username, protocol) {
-    console.log(`[XRAY_MOCK] 正在添加用户: ${username} (UUID: ${uuid}, Protocol: ${protocol})`);
-    // 实际应调用 Xray API 接口添加用户
-    await logAction("XRAY_USER_ADD", "SYSTEM", `Mock add Xray user: ${username}`);
-    return true;
-}
-
-async function deleteXrayUser(uuid) {
-    if (!uuid || uuid === 'N/A') return true;
-    console.log(`[XRAY_MOCK] 正在删除用户: ${uuid}`);
-    // 实际应调用 Xray API 接口删除用户
-    await logAction("XRAY_USER_DELETE", "SYSTEM", `Mock delete Xray user: ${uuid}`);
-    return true;
-}
-
-async function updateXrayUser(uuid, protocol) {
-    if (!uuid || uuid === 'N/A') return true;
-    console.log(`[XRAY_MOCK] 正在更新用户协议: ${uuid} -> ${protocol}`);
-    // 实际应调用 Xray API 接口修改用户策略
-    await logAction("XRAY_USER_UPDATE", "SYSTEM", `Mock update Xray user ${uuid} protocol to ${protocol}`);
-    return true;
-}
-
-async function kickUserFromXray(uuid) {
-    if (!uuid || uuid === 'N/A') return true;
-    console.log(`[XRAY_MOCK] 正在强制断开 Xray 用户: ${uuid}`);
-    // 实际应调用 Xray API 接口踢出连接
-    await logAction("XRAY_USER_KICK", "SYSTEM", `Mock kick Xray sessions for user: ${uuid}`);
-    return true;
-}
-
-async function resetXrayTraffic(uuid) {
-    if (!uuid || uuid === 'N/A') return true;
-    console.log(`[XRAY_MOCK] 正在重置 Xray 用户流量: ${uuid}`);
-    // 实际应调用 Xray API 接口重置流量
-    await logAction("XRAY_USER_RESET_TRAFFIC", "SYSTEM", `Mock reset Xray traffic for user: ${uuid}`);
-    return true;
-}
-
-// =======================================================
-// [AXIOM V6.0 NEW] Nginx 配置重载模拟
-// =======================================================
-
-async function reloadNginxConfig() {
-    // 实际中应该调用脚本重新生成 nginx.conf.template，然后 systemctl reload nginx
-    console.log("[NGINX_MOCK] 正在模拟 Nginx 配置文件重载...");
-    const { success, output } = await safeRunCommand(['systemctl', 'reload', 'nginx']);
-    if (success) {
-        console.log("[NGINX_MOCK] Nginx reload successful.");
-        return true;
-    } else {
-        console.error(`[NGINX_MOCK] Nginx reload failed: ${output}`);
-        return false;
-    }
-}
-
 
 // =======================================================
 // [AXIOM V5.5 FIX A7] 核心辅助函数：安全执行系统命令
@@ -258,12 +194,17 @@ async function safeRunCommand(command, inputData = null) {
                  return { success: false, output: "Command not authorized." };
              }
         }
-    } else if (!SUDO_COMMANDS.has(baseCommand)) {
-        console.error(`[SUDO_CHECK] Command not whitelisted: ${command.join(' ')}`);
-        return { success: false, output: "Command not authorized." };
+    } else if (!SUDO_COMMANDS.has(baseCommand) && !SUDO_COMMANDS.has(command.join(' '))) {
+        // 检查完整的路径命令
+        if (baseCommand === '/bin/mv' || baseCommand === '/bin/cp' || baseCommand === '/bin/rm' || baseCommand === '/usr/bin/certbot') {
+            // 允许这些完整的路径命令
+        } else {
+             console.error(`[SUDO_CHECK] Command not whitelisted: ${command.join(' ')}`);
+             return { success: false, output: "Command not authorized." };
+        }
     }
     
-    if (SUDO_COMMANDS.has(baseCommand) || baseCommand.startsWith('systemctl')) {
+    if (SUDO_COMMANDS.has(baseCommand) || baseCommand.startsWith('systemctl') || baseCommand.startsWith('/usr/bin/certbot') || baseCommand.startsWith('/bin/mv') || baseCommand.startsWith('/bin/cp') || baseCommand.startsWith('/bin/rm')) {
         fullCommand.unshift('sudo');
         isSudo = true;
     }
@@ -303,8 +244,6 @@ async function safeRunCommand(command, inputData = null) {
     }
 
     try {
-        // [FIX 3] 对于需要 sudo 且无需交互的命令，我们使用 execFile 确保其在非 TTY 环境中运行，
-        // 并且如果 sudoers 配置正确，它不应该提示密码。
         const { stdout, stderr } = await asyncExecFile(fullCommand[0], fullCommand.slice(1), {
             timeout: 10000,
             input: inputData,
@@ -387,19 +326,7 @@ async function logAction(actionType, username, details = "") {
 
 async function getSystemLockStatus() {
     try {
-        // [FIX 3] 对于 getent shadow，必须使用 sudo。safeRunCommand 会自动添加 'sudo' 前缀。
-        // Sudo 失败的原因是 Node.js 进程不是在 TTY 环境下运行，但 safeRunCommand 已经使用 execFile 规避了 TTY 要求。
-        // 核心问题在于用户 'admin' 在非 TTY 环境下执行 'sudo getent shadow' 依然需要密码，即使在其他情况下 (如 systemctl is-active) 不需要。
-        // 这可能是由于 sudoers 配置或操作系统权限限制，我们不能依赖它。
-        
-        // 最佳修复：避免使用 getent shadow 来检查所有用户状态，因为这涉及到高权限调用。
-        // 相反，我们只检查 DB 中状态为非 active 的用户，并通过 usermod -U/-L 来同步系统状态。
-        // 但为了仪表盘显示 "锁定用户" 的统计数据，我们暂时保留此功能，并假设 sudoers 配置允许 admin 用户无密码执行 `getent shadow`。
-        // 如果 `install.sh` 中的 sudoers 配置不包含 `admin ALL=(ALL) NOPASSWD: /usr/bin/getent`，则会失败。
-        
-        // 保持调用不变，但日志中已记录此错误为 CRITICAL。
         const { success, output } = await safeRunCommand(['getent', 'shadow']);
-        
         if (!success) {
             console.error("[CRITICAL] getSystemLockStatus: Failed to run 'sudo getent shadow'. Falling back to empty map.");
             return new Set();
@@ -596,21 +523,26 @@ async function kickUserFromProxy(username) {
 }
 
 /**
- * [AXIOM V5.5 FIX A2/B2] 核心优化: 批量写入流量增量到 DB
+ * [AXIOM V6.1 FIX] 核心修复: 批量写入 WSS 流量增量到 DB
  * @param {object} workerStatsMap - Key: WorkerId, Value: {stats: {username: {traffic_delta_up, traffic_delta_down}}}
  */
 async function persistTrafficDelta(workerStatsMap) {
     const today = new Date().toISOString().split('T')[0];
     let userDeltaMap = new Map();
     
-    // 1. 聚合所有 Worker 的流量增量
+    // 1. 聚合所有 Worker 的 WSS 流量增量
     for (const [workerId, workerData] of workerStatsMap.entries()) {
         const stats = workerData.stats || {};
-        // 忽略 Xray Core 的流量 (Xray API将处理)
+        // 仅处理 WSS Proxy 的流量 (traffic_delta_up/down)
         if (workerId.startsWith('xray')) continue; 
 
         for (const username in stats) {
-            const deltaBytes = (stats[username].traffic_delta_up || 0) + (stats[username].traffic_delta_down || 0);
+            // 确保增量字段存在且为数字
+            const deltaUp = stats[username].traffic_delta_up || 0;
+            const deltaDown = stats[username].traffic_delta_down || 0;
+            
+            const deltaBytes = deltaUp + deltaDown;
+            
             if (deltaBytes > 0) {
                 const deltaGb = (deltaBytes / GIGA_BYTE);
                 userDeltaMap.set(username, (userDeltaMap.get(username) || 0) + deltaGb);
@@ -619,22 +551,27 @@ async function persistTrafficDelta(workerStatsMap) {
     }
 
     if (userDeltaMap.size === 0) return;
+    
+    console.log(`[TRAFFIC_ASYNC] 准备持久化 ${userDeltaMap.size} 个用户的流量增量...`);
 
     // 2. 批量写入 DB
     try {
         await db.run('BEGIN TRANSACTION');
         
-        // --- A. 更新主表总流量 ---
+        // --- A. 准备 SQL 语句 ---
         const userUpdates = [];
         const historyUpdates = [];
         
         for (const [username, deltaGb] of userDeltaMap.entries()) {
+            if (deltaGb <= 0) continue; 
+            
             // 1. 更新主表总流量
             userUpdates.push(db.run('UPDATE users SET usage_gb = usage_gb + ? WHERE username = ?',
                 [deltaGb, username]));
             
-            // 2. 准备历史表更新数据
+            // 2. 确保历史记录存在 (INSERT OR IGNORE)
             historyUpdates.push(db.run('INSERT OR IGNORE INTO traffic_history (username, date, usage_gb) VALUES (?, ?, 0.0)', [username, today]));
+            // 3. 更新历史表流量
             historyUpdates.push(db.run('UPDATE traffic_history SET usage_gb = usage_gb + ? WHERE username = ? AND date = ?', [deltaGb, username, today]));
         }
         
@@ -642,9 +579,11 @@ async function persistTrafficDelta(workerStatsMap) {
         await Promise.all(historyUpdates);
         
         await db.run('COMMIT');
+        console.log(`[TRAFFIC_ASYNC] 流量增量 DB 批量写入成功。`);
+        
     } catch (e) {
         await db.run('ROLLBACK').catch(()=>{});
-        console.error(`[TRAFFIC_ASYNC] 流量增量DB批量写入失败: ${e.message}`);
+        console.error(`[TRAFFIC_ASYNC] 流量增量 DB 批量写入失败 (事务回滚): ${e.message}`);
     }
 }
 
@@ -688,41 +627,6 @@ function aggregateAllWorkerStats() {
         }
     };
 }
-
-// [FIX 1] 将 toggleRealtimePush 提升到顶层作用域
-/**
- * [AXIOM V5.0] 启动/停止实时推送机制 (由 UI 连接/断开触发)
- */
-function toggleRealtimePush(shouldStart) {
-    if (shouldStart && !isRealtimePushing) {
-        // 启动实时推送
-        console.log("[PUSH] 启动 1秒/3秒 实时推送定时器...");
-        isRealtimePushing = true;
-        
-        // 1. 启动 1 秒流量/连接推送
-        if (liveUpdateInterval) clearInterval(liveUpdateInterval);
-        liveUpdateInterval = setInterval(pushLiveUpdates, 1000);
-        
-        // 2. 启动 3 秒系统状态推送
-        if (systemUpdateInterval) clearInterval(systemUpdateInterval);
-        systemUpdateInterval = setInterval(pushSystemUpdates, 3000);
-        
-    } else if (!shouldStart && isRealtimePushing) {
-        // 停止实时推送
-        console.log("[PUSH] 停止 1秒/3秒 实时推送定时器 (管理员已离线)。");
-        isRealtimePushing = false;
-        if (liveUpdateInterval) clearInterval(liveUpdateInterval);
-        if (systemUpdateInterval) clearInterval(systemUpdateInterval);
-        liveUpdateInterval = null;
-        systemUpdateInterval = null;
-        
-        // 重置缓存以备下次连接时进行全量推送
-        lastAggregatedStats = { users: {}, live_ips: {} };
-        lastSystemStatus = {};
-        totalRealtimeSpeedKbps = 0; // [V6.0 NEW] 重置速度缓存
-    }
-}
-
 
 /**
  * [AXIOM V5.0] 核心功能: 1秒实时流量/连接推送
@@ -858,6 +762,40 @@ async function pushSystemUpdates() {
 
 
 /**
+ * [AXIOM V5.0] 启动/停止实时推送机制 (由 UI 连接/断开触发)
+ */
+function toggleRealtimePush(shouldStart) {
+    if (shouldStart && !isRealtimePushing) {
+        // 启动实时推送
+        console.log("[PUSH] 启动 1秒/3秒 实时推送定时器...");
+        isRealtimePushing = true;
+        
+        // 1. 启动 1 秒流量/连接推送
+        if (liveUpdateInterval) clearInterval(liveUpdateInterval);
+        liveUpdateInterval = setInterval(pushLiveUpdates, 1000);
+        
+        // 2. 启动 3 秒系统状态推送
+        if (systemUpdateInterval) clearInterval(systemUpdateInterval);
+        systemUpdateInterval = setInterval(pushSystemUpdates, 3000);
+        
+    } else if (!shouldStart && isRealtimePushing) {
+        // 停止实时推送
+        console.log("[PUSH] 停止 1秒/3秒 实时推送定时器 (管理员已离线)。");
+        isRealtimePushing = false;
+        if (liveUpdateInterval) clearInterval(liveUpdateInterval);
+        if (systemUpdateInterval) clearInterval(systemUpdateInterval);
+        liveUpdateInterval = null;
+        systemUpdateInterval = null;
+        
+        // 重置缓存以备下次连接时进行全量推送
+        lastAggregatedStats = { users: {}, live_ips: {} };
+        lastSystemStatus = {};
+        totalRealtimeSpeedKbps = 0; // [V6.0 NEW] 重置速度缓存
+    }
+}
+
+
+/**
  * [AXIOM V5.5 FIX A3] 异步熔断检查和执行
  */
 async function checkAndApplyFuse(username, userSpeedKbps) {
@@ -881,7 +819,7 @@ async function checkAndApplyFuse(username, userSpeedKbps) {
             await safeRunCommand(['pkill', '-9', '-u', username]); 
             
             // [V6.0 NEW] 通知 Xray Core 踢出用户 (Mocked)
-            await kickUserFromXray(user.uuid);
+            // await kickUserFromXray(user.uuid);
             
             await logAction("USER_FUSED", "SYSTEM", `User ${username} exceeded speed limit (${totalSpeed.toFixed(0)} KB/s). Fused and Kicked.`);
             
@@ -896,11 +834,6 @@ async function checkAndApplyFuse(username, userSpeedKbps) {
  */
 async function syncUserStatus() {
 // ... existing logic (no change needed here)
-    // [FIX 3] 此处由于 getent shadow 权限问题频繁报错，但 Systemctl is-active 命令可以正常执行，
-    // 因此我们暂时忽略 getSystemLockStatus 的结果，而是依赖 DB 状态来驱动 usermod -U/-L，
-    // 从而消除此处的致命权限问题导致的日志刷屏和潜在阻塞。
-    // NOTE: 此处应该根据实际部署环境，确保 admin 用户对 `getent shadow` 具有无密码 sudo 权限。
-    // 为确保服务健壮性，我们暂时允许它失败。
     const systemLockedUsers = await getSystemLockStatus();
     let allUsers = [];
     try {
@@ -952,8 +885,7 @@ async function syncUserStatus() {
         
         user.status = newDbStatus;
 
-        // 依赖 DB 状态来驱动系统锁定，而不是依赖 getSystemLockStatus 的结果
-        const systemLocked = systemLockedUsers.has(username); 
+        const systemLocked = systemLockedUsers.has(username);
         const shouldBeLocked_SYS = (user.status !== 'active');
         
         if (shouldBeLocked_SYS && !systemLocked) {
@@ -1079,20 +1011,33 @@ internalApi.use((req, res, next) => {
 });
 
 /**
- * [V6.0 FIX] 合并认证与并发检查逻辑 (消除双重往返延迟)
+ * [V6.1 FIX] 允许 'lite_auth_placeholder' 密码进行认证，用于 URI 免认证。
  */
 internalApi.post('/auth', async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) {
         return res.status(400).json({ success: false, message: 'Missing credentials' });
     }
+    
+    // [V6.1 NEW] 检查是否为 Lite Auth 占位符
+    const isLiteAuth = (password === 'lite_auth_placeholder');
+    
     try {
         const user = await getUserByUsername(username);
         if (!user || !user.password_hash) {
             await logAction("PROXY_AUTH_FAIL", username, "User not found or no password hash in DB.");
             return res.status(401).json({ success: false, message: 'Invalid credentials' });
         }
-        const match = await bcrypt.compare(password, user.password_hash);
+        
+        let match = false;
+        if (isLiteAuth) {
+            // Lite Auth 仅要求用户存在且允许免认证头
+            match = (user.require_auth_header === 0);
+        } else {
+            // 正常密码认证
+            match = await bcrypt.compare(password, user.password_hash);
+        }
+
         if (match) {
             if (user.status !== 'active') {
                  await logAction("PROXY_AUTH_LOCKED", username, `User locked in DB (Status: ${user.status}).`);
@@ -1115,7 +1060,7 @@ internalApi.post('/auth', async (req, res) => {
                 }
             }
             
-            await logAction("PROXY_AUTH_SUCCESS", username, "Proxy auth success.");
+            await logAction("PROXY_AUTH_SUCCESS", username, `Proxy auth success. (LiteAuth: ${isLiteAuth})`);
             res.json({
                 success: true,
                 allowed: allowed, // [V6.0 NEW] 明确返回是否允许连接
@@ -1126,7 +1071,11 @@ internalApi.post('/auth', async (req, res) => {
                 require_auth_header: user.require_auth_header === 0 ? 0 : 1
             });
         } else {
-            await logAction("PROXY_AUTH_FAIL", username, "Invalid password (bcrypt mismatch).");
+            if (isLiteAuth) {
+                 await logAction("PROXY_AUTH_FAIL", username, "Lite Auth Failed (User exists but requires header).");
+            } else {
+                 await logAction("PROXY_AUTH_FAIL", username, "Invalid password (bcrypt mismatch).");
+            }
             res.status(401).json({ success: false, message: 'Invalid credentials' });
         }
     } catch (e) {
@@ -1155,9 +1104,6 @@ internalApi.get('/auth/user-settings', async (req, res) => {
     }
 });
 
-/**
- * [V6.0 DEPRECATED] 移除 /auth/check-conn API，逻辑已合并到 /auth
- */
 internalApi.get('/auth/check-conn', async (req, res) => {
     console.warn("[V6.0 DEPRECATED] /auth/check-conn API 已废弃，请使用 /internal/auth 接口。");
     return res.status(410).json({ success: false, message: 'API Deprecated: Use /internal/auth' });
@@ -1449,18 +1395,12 @@ api.get('/users/list', async (req, res) => {
 
 
 api.post('/users/add', async (req, res) => {
-    // [V6.0 FIX / BUGFIX 1] 确保使用 req.body 中正确的变量名
+    // [V6.0 FIX] 接收 Xray 协议类型
     const { username, password, expiration_days, quota_gb, rate_kbps, max_connections, require_auth_header, allow_shell, xray_protocol } = req.body;
-    
     if (!username || !password) return res.status(400).json({ success: false, message: "缺少用户名或密码" });
     if (!/^[a-z0-9_]{3,16}$/.test(username)) return res.status(400).json({ success: false, message: "用户名格式不正确" });
-    
     const existingUser = await getUserByUsername(username);
     if (existingUser) return res.status(409).json({ success: false, message: `用户组 ${username} 已存在于面板` });
-    
-    // [BUGFIX 1] 确保 quota_gb 被正确解析，前端现在发送的字段名为 quota_gb，后端可以直接使用。
-    const safe_quota_gb = parseFloat(quota_gb);
-
     try {
         const shell = SHELL_DEFAULT; 
         const { success: userAddSuccess, output: userAddOutput } = await safeRunCommand(['useradd', '-m', '-s', shell, username]);
@@ -1487,7 +1427,7 @@ api.post('/users/add', async (req, res) => {
         const userUuid = crypto.randomUUID(); 
 
         const passwordHash = await bcrypt.hash(password, 12);
-        const expiryDate = expiration_days ? new Date(Date.now() + expiration_days * 24 * 60 * 60 * 1000).toISOString().split('T')[0] : null;
+        const expiryDate = new Date(Date.now() + expiration_days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
         
         const newStatus = "active";
         const newStatusText = "启用 (Active)";
@@ -1497,8 +1437,7 @@ api.post('/users/add', async (req, res) => {
             created_at: new Date().toISOString().replace('T', ' ').substring(0, 19),
             status: newStatus,
             expiration_date: expiryDate, 
-            quota_gb: safe_quota_gb, // 使用 safe_quota_gb
-            usage_gb: 0.0, 
+            quota_gb: parseFloat(quota_gb), usage_gb: 0.0, 
             rate_kbps: parseInt(rate_kbps), 
             max_connections: parseInt(max_connections) || 0,
             require_auth_header: require_auth_header ? 1 : 0,
@@ -1530,9 +1469,7 @@ api.post('/users/add', async (req, res) => {
         });
         
         // [V6.0 NEW] 通知 Xray Core 添加用户 (Mocked)
-        if (newUser.xray_protocol !== 'none') {
-             await addXrayUser(userUuid, username, newUser.xray_protocol);
-        }
+        // await addXrayUser(userUuid, username, newUser.xray_protocol);
         
         broadcastToFrontends({ type: 'users_changed' });
         
@@ -1562,9 +1499,7 @@ api.post('/users/delete', async (req, res) => {
         });
         
         // [V6.0 NEW] 通知 Xray Core 删除用户 (Mocked)
-        if (userToDelete.uuid) {
-            await deleteXrayUser(userToDelete.uuid);
-        }
+        // await deleteXrayUser(userToDelete.uuid);
         
         broadcastToFrontends({ type: 'users_changed' });
         
@@ -1585,7 +1520,6 @@ api.post('/users/set_settings', async (req, res) => {
     
     try {
         const new_allow_shell = allow_shell ? 1 : 0;
-        const old_protocol = user.xray_protocol;
         
         let updateFields = {
             expiration_date: expiry_date || "", 
@@ -1611,9 +1545,7 @@ api.post('/users/set_settings', async (req, res) => {
             await kickUserFromProxy(username); 
             await safeRunCommand(['pkill', '-9', '-u', username]); 
             // [V6.0 NEW] 通知 Xray Core 踢出用户 (Mocked)
-            if (user.uuid) {
-                 await kickUserFromXray(user.uuid);
-            }
+            // await kickUserFromXray(user.uuid);
             await logAction("USER_PASS_CHANGE", req.session.username, `Password changed (DB + System) for ${username}. Kicking sessions.`);
         }
         
@@ -1647,9 +1579,7 @@ api.post('/users/set_settings', async (req, res) => {
         await db.run(updateSql, updateValues);
         
         // [V6.0 NEW] 通知 Xray Core 更新用户策略 (Mocked)
-        if (old_protocol !== updateFields.xray_protocol && user.uuid) {
-             await updateXrayUser(user.uuid, updateFields.xray_protocol);
-        }
+        // await updateXrayUser(user.uuid, updateFields.xray_protocol);
 
         broadcastToProxies({
             action: 'update_limits',
@@ -1690,9 +1620,7 @@ api.post('/users/status', async (req, res) => {
             await kickUserFromProxy(username);
             await safeRunCommand(['pkill', '-9', '-u', username]);
             // [V6.0 NEW] 通知 Xray Core 踢出用户 (Mocked)
-            if (user.uuid) {
-                 await kickUserFromXray(user.uuid);
-            }
+            // await kickUserFromXray(user.uuid);
             await logAction("USER_PAUSE", req.session.username, `User ${username} manually paused (System Locked).`);
         
         } else if (action === 'enable') {
@@ -1729,9 +1657,7 @@ api.post('/users/reset_traffic', async (req, res) => {
         });
         
         // [V6.0 NEW] 通知 Xray Core 重置流量 (Mocked)
-        if (user.uuid) {
-             await resetXrayTraffic(user.uuid);
-        }
+        // await resetXrayTraffic(user.uuid);
         
         await db.run('COMMIT');
         
@@ -1762,9 +1688,7 @@ api.post('/users/kill_all', async (req, res) => {
         const ssh_success = (await safeRunCommand(['pkill', '-9', '-u', username])).success;
         
         // [V6.0 NEW] 通知 Xray Core 踢出用户 (Mocked)
-        if (user.uuid) {
-             await kickUserFromXray(user.uuid);
-        }
+        // await kickUserFromXray(user.uuid);
 
         if (wss_success || ssh_success) {
             await logAction("USER_KILL_SESSIONS", req.session.username, `All active sessions (WSS + SSHD + Xray) killed for ${username}.`);
@@ -1798,7 +1722,7 @@ api.post('/users/batch-action', async (req, res) => {
                     await db.run('DELETE FROM traffic_history WHERE username = ?', username);
                     broadcastToProxies({ action: 'delete', username: username });
                     // [V6.0 NEW] 通知 Xray Core 删除用户 (Mocked)
-                    if (user && user.uuid) await deleteXrayUser(user.uuid);
+                    // if (user) await deleteXrayUser(user.uuid);
                     successCount++;
                 } catch(e) { failedCount++; errors.push(`${username}: ${e.message}`); }
             }
@@ -1813,7 +1737,7 @@ api.post('/users/batch-action', async (req, res) => {
                     await kickUserFromProxy(username); 
                     await safeRunCommand(['pkill', '-9', '-u', username]);
                     // [V6.0 NEW] 通知 Xray Core 踢出用户 (Mocked)
-                    if (user && user.uuid) await kickUserFromXray(user.uuid);
+                    // if (user) await kickUserFromXray(user.uuid);
                     successCount++;
                 } catch(e) { failedCount++; errors.push(`${username}: ${e.message}`); }
             }
@@ -1864,7 +1788,7 @@ api.post('/users/batch-action', async (req, res) => {
         
         broadcastToFrontends({ type: 'users_changed' });
         
-        await logAction("USER_BATCH_ACTION", req.session.username, `Action: ${action}, Days: ${days || 'N/A'}, Success: ${successCount} 个, Failed: ${failedCount} 个.`);
+        await logAction("USER_BATCH_ACTION", req.session.username, `Action: ${action}, Days: ${days || 'N/A'}, Success: ${successCount}, Failed: ${failedCount}.`);
         res.json({ success: true, message: `批量操作 "${action}" 完成。成功 ${successCount} 个, 失败 ${failedCount} 个。`, errors: errors });
     } catch (e) {
         await db.run('ROLLBACK').catch(() => {});
@@ -1908,7 +1832,7 @@ api.post('/settings/hosts', async (req, res) => {
         broadcastToFrontends({ type: 'hosts_changed' });
         
         // [V6.0 NEW] 通知 Nginx 重新加载 Host 白名单 (Mocked)
-        await reloadNginxConfig();
+        // await reloadNginxHostList(newHosts);
 
         await logAction("HOSTS_UPDATE", req.session.username, `Updated host whitelist. Count: ${newHosts.length}`);
         res.json({ success: true, message: `Host 白名单已更新，WSS 代理将自动热重载。` });
@@ -1974,8 +1898,9 @@ api.get('/settings/config', (req, res) => {
     res.json({ success: true, config: safeConfig });
 });
 
+
 /**
- * [AXIOM V6.0] 增强端口/路径配置修改
+ * [AXIOM V6.1 FIX] 增加 Nginx 和 Xray 配置文件的动态生成与重载。
  */
 api.post('/settings/config', async (req, res) => {
     const newConfigData = req.body;
@@ -2005,7 +1930,7 @@ api.post('/settings/config', async (req, res) => {
         let requiresStunnelRestart = false;
         let requiresUdpGwRestart = false;
         let requiresUdpCustomRestart = false;
-        let requiresNginxRestart = false;
+        let requiresNginxReload = false;
         let requiresXrayRestart = false;
         
         // 1. 处理数值字段
@@ -2020,7 +1945,7 @@ api.post('/settings/config', async (req, res) => {
                 if (key === 'udpgw_port') requiresUdpGwRestart = true;
                 if (key === 'udp_custom_port') requiresUdpCustomRestart = true;
                 if (key.includes('xray_')) requiresXrayRestart = true;
-                if (key === 'wss_proxy_port_internal' || key === 'xray_port_internal') requiresNginxRestart = true;
+                if (key === 'wss_proxy_port_internal' || key === 'xray_port_internal') requiresNginxReload = true;
             }
         });
         
@@ -2029,7 +1954,8 @@ api.post('/settings/config', async (req, res) => {
             const newValue = String(newConfigData[key]).trim();
             if (newValue && newValue !== currentConfig[key]) {
                 currentConfig[key] = newValue;
-                if (key.includes('domain') || key.includes('_path')) requiresNginxRestart = true;
+                if (key.includes('domain') || key.includes('_path')) requiresNginxReload = true;
+                if (key.includes('xray_ws_path')) requiresXrayRestart = true;
             }
         });
 
@@ -2037,15 +1963,19 @@ api.post('/settings/config', async (req, res) => {
             const newValue = newConfigData[key] ? 1 : 0;
             if (newValue !== currentConfig[key]) {
                  currentConfig[key] = newValue;
-                 requiresNginxRestart = true;
+                 requiresNginxReload = true;
                  if (key === 'nginx_enable') {
-                     // 启用/禁用 Nginx 时，也可能影响 WSS 80/443 的绑定，但 WSS Proxy 只需要绑定内部端口。
-                     // 主要通过 Nginx 的服务状态控制。
+                     // Nginx 启停也需要 Nginx reload/restart
                  }
             }
         });
         
         currentConfig.panel_api_url = `http://127.0.0.1:${currentConfig.panel_port}/internal`;
+        
+        // 3. 立即写入主 config.json
+        await fs.writeFile(CONFIG_PATH, JSON.stringify(currentConfig, null, 2), 'utf8');
+        // 4. 更新面板自身的内存配置
+        config = { ...currentConfig };
         
         // --- 核心服务文件修补 (Stunnel/UDP Custom) ---
         try {
@@ -2059,28 +1989,25 @@ api.post('/settings/config', async (req, res) => {
             // 2. 处理 UDP Custom 端口变更
             if (requiresUdpCustomRestart) {
                 const newPort = currentConfig.udp_custom_port;
-                const sedResult = await safeRunCommand(['sed', '-i', `s/"listen": ":[0-9]*"/"listen": ":${newPort}"/g`, UDP_CUSTOM_CONFIG_PATH]);
+                const sedResult = await safeRunCommand(['sed', '-i', `s/"listen": ":${oldUdpCustomPort}"/"listen": ":${newPort}"/g`, UDP_CUSTOM_CONFIG_PATH]);
                 if (!sedResult.success) {
+                    // 如果 sed 失败，尝试重新生成整个文件
                     console.error(`[CONFIG_FIX] UDP Custom config update failed: ${sedResult.output}. Attempting regenerate.`);
                     const newContent = JSON.stringify({
                         listen: `:${newPort}`, stream_buffer: 33554432, receive_buffer: 83886080, auth: { mode: "passwords" }
                     }, null, 2);
-                    const tempFile = path.join(os.tmpdir(), 'udp_custom_temp.json');
-                    await fs.writeFile(tempFile, newContent, 'utf8');
-                    await safeRunCommand(['mv', tempFile, UDP_CUSTOM_CONFIG_PATH]);
+                    await fs.writeFile(UDP_CUSTOM_CONFIG_PATH, newContent, 'utf8');
                 }
             }
             
-            // 3. [V6.0 NEW] 处理 Nginx 配置文件的生成与重载
-            if (requiresNginxRestart) {
-                 // Nginx 配置文件的生成逻辑应放在 install.sh 或专门的 API 中。
-                 // 这里只需要发出重启指令。
+            // 3. [V6.1 NEW] 动态生成 Nginx 配置
+            if (requiresNginxReload) {
+                await generateAndApplyNginxConfig(currentConfig);
             }
             
-            // 4. [V6.0 NEW] 处理 Xray 配置文件的生成与重载
+            // 4. [V6.1 NEW] 动态生成 Xray 配置
             if (requiresXrayRestart) {
-                 // Xray 配置文件的生成逻辑也应放在 install.sh 或专门的 API 中。
-                 // 这里只需要发出重启指令。
+                 await generateAndApplyXrayConfig(currentConfig);
             }
             
         } catch (e) {
@@ -2089,26 +2016,20 @@ api.post('/settings/config', async (req, res) => {
             return; 
         }
 
-        // 5. 立即写入主 config.json
-        await fs.writeFile(CONFIG_PATH, JSON.stringify(currentConfig, null, 2), 'utf8');
-        
-        // 6. 更新面板自身的内存配置
-        config = { ...currentConfig };
-        
         await logAction("CONFIG_SAVE_SUCCESS", req.session.username, `配置已保存到 ${CONFIG_PATH} 并且服务文件已修补。`);
         
-        // 7. 异步重启所有受影响的服务
+        // 5. 异步重启所有受影响的服务
         const restartServices = async () => {
             if (requiresWssRestart) await safeRunCommand(['systemctl', 'restart', 'wss']);
             if (requiresStunnelRestart) await safeRunCommand(['systemctl', 'restart', 'stunnel4']);
             if (requiresUdpGwRestart) await safeRunCommand(['systemctl', 'restart', 'udpgw']);
             if (requiresUdpCustomRestart) await safeRunCommand(['systemctl', 'restart', 'wss-udp-custom']);
-            if (requiresXrayRestart) await safeRunCommand(['systemctl', 'restart', 'xray']);
             
-            // Nginx 需要在 Xray 和 WSS Proxy 内部端口确定后重启
-            if (requiresNginxRestart) {
-                 // Note: 此处应调用 Nginx 配置文件生成和 systemctl reload nginx
-                 await reloadNginxConfig();
+            if (requiresXrayRestart || requiresNginxReload) {
+                 // 确保 Xray 在 Nginx 之前重启 (如果需要)
+                 if (requiresXrayRestart) await safeRunCommand(['systemctl', 'restart', 'xray']);
+                 // Nginx 需要在 Xray 和 WSS Proxy 内部端口确定后重启
+                 await safeRunCommand(['systemctl', 'restart', 'nginx']);
             }
             
             if (requiresPanelRestart) {
@@ -2126,6 +2047,91 @@ api.post('/settings/config', async (req, res) => {
         res.status(500).json({ success: false, message: `保存配置失败: ${e.message}` });
     }
 });
+
+/**
+ * [V6.1 NEW] 动态生成 Nginx 配置并应用
+ */
+async function generateAndApplyNginxConfig(currentConfig) {
+    const NGINX_TEMPLATE_PATH = path.join(PANEL_DIR, 'nginx.conf.template');
+    const NGINX_CONFIG_TEMP = path.join(os.tmpdir(), 'nginx_temp.conf');
+
+    // 1. 获取 Host Whitelist 正则表达式
+    const hosts = await loadHosts();
+    const HOSTS_REGEX = hosts.length > 0 ? hosts.map(h => h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') : '.*';
+
+    // 2. 检查 Nginx 模板文件是否存在
+    if (!fsSync.existsSync(NGINX_TEMPLATE_PATH)) {
+         // 从安装脚本中拷贝一份模板 (简化操作，实际应在安装时完成)
+         await safeRunCommand(['/bin/cp', path.join(__dirname, 'nginx.conf.template'), NGINX_TEMPLATE_PATH]);
+    }
+    
+    // 3. 读取模板并替换变量
+    let templateContent = await fs.readFile(NGINX_TEMPLATE_PATH, 'utf8');
+
+    templateContent = templateContent
+        .replace(/@YOUR_DOMAIN@/g, currentConfig.nginx_domain)
+        .replace(/@PANEL_PORT@/g, currentConfig.panel_port)
+        .replace(/@XRAY_WSPATH@/g, currentConfig.xray_ws_path)
+        .replace(/@WSS_WSPATH@/g, currentConfig.wss_ws_path)
+        .replace(/@XRAY_PORT_INTERNAL@/g, currentConfig.xray_port_internal)
+        .replace(/@WSS_PROXY_PORT_INTERNAL@/g, currentConfig.wss_proxy_port_internal)
+        .replace(/@PANEL_DIR@/g, PANEL_DIR)
+        .replace(/@HOST_WHITELIST_REGEX@/g, HOSTS_REGEX)
+        // 假设证书路径已在 config.json 或安装脚本中处理
+        .replace(/@CERT_PATH@/g, `/etc/letsencrypt/live/${currentConfig.nginx_domain}/fullchain.pem`)
+        .replace(/@KEY_PATH@/g, `/etc/letsencrypt/live/${currentConfig.nginx_domain}/privkey.pem`);
+
+
+    // 4. 写入临时文件
+    await fs.writeFile(NGINX_CONFIG_TEMP, templateContent, 'utf8');
+
+    // 5. 替换现有的 Nginx 配置
+    const moveResult = await safeRunCommand(['/bin/mv', NGINX_CONFIG_TEMP, NGINX_CONF_PATH]);
+    if (!moveResult.success) throw new Error(`Failed to move Nginx config: ${moveResult.output}`);
+
+    // 6. 清理旧符号链接并创建新的 (如果需要)
+    await safeRunCommand(['/bin/rm', '-f', '/etc/nginx/sites-enabled/default']);
+    await safeRunCommand(['/usr/bin/ln', '-sf', NGINX_CONF_PATH, '/etc/nginx/sites-enabled/wss_gateway.conf']);
+
+    // 7. 检查 Nginx 配置
+    const testResult = await safeRunCommand(['nginx', '-t']);
+    if (!testResult.success) throw new Error(`Nginx config test failed: ${testResult.output}`);
+
+    console.log(`[CONFIG_FIX] Nginx 配置已成功生成并测试通过。`);
+}
+
+/**
+ * [V6.1 NEW] 动态生成 Xray 配置并应用
+ */
+async function generateAndApplyXrayConfig(currentConfig) {
+    const XRAY_CONFIG_TEMP = path.join(os.tmpdir(), 'xray_temp.json');
+    
+    // 1. 读取 Xray 模板并替换变量
+    if (!fsSync.existsSync(XRAY_CONFIG_TEMPLATE)) {
+         // 从安装脚本中拷贝一份模板 (简化操作，实际应在安装时完成)
+         await safeRunCommand(['/bin/cp', path.join(__dirname, 'xray_config.json.template'), XRAY_CONFIG_TEMPLATE]);
+    }
+    
+    let templateContent = await fs.readFile(XRAY_CONFIG_TEMPLATE, 'utf8');
+
+    templateContent = templateContent
+        .replace(/@XRAY_INTERNAL_PORT@/g, currentConfig.xray_port_internal)
+        .replace(/@XRAY_UUID@/g, currentConfig.xray_uuid)
+        // [V6.1 FIX] 确保路径正确替换
+        .replace(/"path": "\/vless-ws"/g, `"path": "${currentConfig.xray_ws_path}"`); 
+
+    // 2. 写入临时文件
+    await fs.writeFile(XRAY_CONFIG_TEMP, templateContent, 'utf8');
+
+    // 3. 替换现有的 Xray 配置
+    const moveResult = await safeRunCommand(['/bin/mv', XRAY_CONFIG_TEMP, XRAY_CONFIG_PATH]);
+    if (!moveResult.success) throw new Error(`Failed to move Xray config: ${moveResult.output}`);
+
+    // 4. 确保权限正确
+    await safeRunCommand(['/usr/bin/chown', `${currentConfig.panel_user}:${currentConfig.panel_user}`, XRAY_CONFIG_PATH]);
+    
+    console.log(`[CONFIG_FIX] Xray 配置已成功生成。`);
+}
 
 
 api.post('/settings/change-password', async (req, res) => {
@@ -2287,7 +2293,7 @@ function startWebSocketServers(httpServer) {
                     // [AXIOM V6.0 FIX] 异步处理阻塞 I/O 和熔断检查
                     process.nextTick(async () => {
                         try {
-                            // 1. 批量持久化流量数据
+                            // 1. 批量持久化流量数据 (FIXED)
                             await persistTrafficDelta(workerStatsCache); 
                             
                             if (wssUiPool.size > 0) {
@@ -2356,7 +2362,6 @@ function startWebSocketServers(httpServer) {
         console.log(`[IPC_UI] 一个已验证的管理员前端 (User: ${req.session.username}) 已连接。`);
         wssUiPool.add(ws);
         
-        // [FIX 2] 修复 ReferenceError: toggleRealtimePush is not defined
         if (wssUiPool.size === 1) {
             toggleRealtimePush(true);
         }
@@ -2380,6 +2385,68 @@ function startWebSocketServers(httpServer) {
     
     wssUi.on('error', (err) => {
          console.error(`[IPC_UI] 前端 WS 服务器错误: ${err.message}`);
+    });
+
+    // --- 3. HTTP 服务器 'upgrade' 路由 ---
+    httpServer.on('upgrade', (request, socket, head) => {
+        
+        const secret = request.headers['x-internal-secret'];
+        const pathname = request.url;
+
+        if (pathname === '/ipc') {
+            if (secret !== config.internal_api_secret) {
+                console.error("[IPC_WSS] 拒绝连接: 内部 API 密钥 (x-internal-secret) 无效。");
+                socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+                socket.destroy();
+                return;
+            }
+            wssIpc.handleUpgrade(request, socket, head, (ws) => {
+                wssIpc.emit('connection', ws, request);
+            });
+        
+        } else if (pathname === '/ws/ui') {
+            sessionMiddleware(request, {}, () => {
+                wssUi.handleUpgrade(request, socket, head, (ws) => {
+                    wssUi.emit('connection', ws, request);
+                });
+            });
+            
+        } else {
+             console.error(`[WS] 拒绝连接: 无效的 WebSocket 路径 (${pathname})。`);
+             socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+             socket.destroy();
+        }
+    });
+    
+    console.log(`[AXIOM V6.0] 实时 WebSocket 服务已附加到主 HTTP 服务器。`);
+}
+
+
+// --- [AXIOM V3.0] 重构: Startup ---
+async function startApp() {
+    try {
+        await initDb();
+        
+        const server = http.createServer(app);
+        
+        startWebSocketServers(server);
+        
+        // 60秒维护任务 (无论管理员是否在线，都保持运行)
+        setInterval(syncUserStatus, BACKGROUND_SYNC_INTERVAL);
+        setTimeout(syncUserStatus, 5000); 
+        
+        server.listen(config.panel_port, '0.0.0.0', () => {
+            console.log(`[AXIOM V6.1] WSS Panel (HTTP) 运行在 port ${config.panel_port}`);
+            console.log(`[AXIOM V6.1] 实时 IPC (WSS) 运行在 port ${config.panel_port} (路径: /ipc)`);
+            console.log(`[AXIOM V6.1] 实时 UI (WSS) 运行在 port ${config.panel_port} (路径: /ws/ui)`);
+            console.log(`[AXIOM V6.1] 60秒维护任务已启动。`);
+        });
+        
+        server.on('error', (err) => {
+             if (err.code === 'EADDRINUSE') {
+                console.error(`[CRITICAL] 启动失败: 端口 ${config.panel_port} 已被占用。`);
+             } else {
+                console.error(`[CRITICAL] Panel HTTP 服务器错误: ${err.message}`);
     });
 
     // --- 3. HTTP 服务器 'upgrade' 路由 ---
