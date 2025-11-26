@@ -1,95 +1,37 @@
-# NGINX 核心配置模板 (WSS Panel V6.0 - Watchdog Gateway)
-
-user www-data;
-worker_processes auto;
-pid /run/nginx.pid;
-include /etc/nginx/modules-enabled/*.conf;
-
-events {
-worker_connections 4096;
-multi_accept on;
-}
-
-http {
-##
-# 基本设置
-##
-sendfile on;
-tcp_nopush on;
-tcp_nodelay on;
-keepalive_timeout 65;
-types_hash_max_size 2048;
-server_tokens off;
-
-include /etc/nginx/mime.types;
-default_type application/octet-stream;
-
-##
-# WebSocket Upgrade 映射
-##
 map $http_upgrade $connection_upgrade {
     default upgrade;
     ''      close;
 }
 
-##
-# TLS 设置
-##
-ssl_protocols TLSv1.2 TLSv1.3;
-ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384';
-ssl_prefer_server_ciphers on;
-ssl_session_cache shared:SSL:10m;
-ssl_session_timeout 10m;
-ssl_early_data on;
-
-##
-# 日志设置
-##
-access_log /var/log/nginx/access.log;
-error_log /var/log/nginx/error.log;
-
-##
-# Gzip 设置
-##
-gzip on;
-gzip_vary on;
-gzip_proxied any;
-gzip_comp_level 6;
-gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
-
-##
-# 核心服务器配置 (80 端口 - ACME 和重定向)
-##
 server {
     listen 80;
     listen [::]:80;
     server_name @YOUR_DOMAIN@;
 
-    # 1. ACME 证书挑战
     location ^~ /.well-known/acme-challenge/ {
         root /var/www/certbot;
     }
 
-    # 2. HTTP 到 HTTPS 的强制重定向
     location / {
         return 301 https://$host$request_uri;
     }
 }
 
-##
-# 核心服务器配置 (443 端口 - TLS 卸载和 Watchdog 分流)
-##
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
     server_name @YOUR_DOMAIN@;
 
-    # 证书路径 (由 acme.sh/certbot 管理)
     ssl_certificate     @CERT_PATH@;
     ssl_certificate_key @KEY_PATH@;
-    
-    # 1. 管理面板 (转发到 Node.js Panel 端口)
-    # 允许通过 /panel-path 路径访问 UI，避免端口直接暴露
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+    ssl_early_data on;
+
     location /panel-path {
         proxy_pass http://127.0.0.1:@PANEL_PORT@;
         proxy_redirect default;
@@ -98,13 +40,10 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        
-        # WebSocket 支持 (用于 Panel 的 /ws/ui)
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
     }
-    
-    # 2. Xray VLESS/VMESS WebSocket 流量 (转发到 Xray 内部端口)
+
     location @XRAY_WSPATH@ {
         if ($host !~* ^(@HOST_WHITELIST_REGEX@)$) {
             return 403;
@@ -119,7 +58,6 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 
-    # 3. WSS Proxy SSH WebSocket 流量 (转发到 Node.js Proxy 内部端口)
     location @WSS_WSPATH@ {
         if ($host !~* ^(@HOST_WHITELIST_REGEX@)$) {
             return 403;
@@ -134,16 +72,10 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 
-    # 4. 看门狗 Fallback / 伪装站点
-    # 所有不匹配上述路径的 443 流量，进行伪装。
     location / {
         root @PANEL_DIR@/static;
         index index.html;
         try_files $uri $uri/ =404;
     }
 }
-
-include /etc/nginx/conf.d/*.conf;
-
-
-}
+```
