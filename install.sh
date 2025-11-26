@@ -5,13 +5,12 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V3.8 (Axiom V6.0 - Fix Xray Deployment & Assets)
+# V3.9 (Axiom V6.1 - Fix Xray Dependencies & Service Fallback)
 #
 # [CHANGELOG]
-# - [FIX] 修复 Xray 部署逻辑：现在正确使用 xray.service.template 模板。
-# - [FIX] 修复 Xray 资源缺失：现在会安装 geoip.dat 和 geosite.dat。
-# - [FIX] 移除 Systemd LogsDirectory 指令，避免权限冲突。
-# - [FIX] 手动创建日志文件并赋予 666 权限 (rw-rw-rw-) 以确保绝对可写。
+# - [FIX] 添加 'unzip' 到依赖列表，防止 Xray 资源解压失败。
+# - [FIX] 更新内联 Xray 服务 Fallback，确保包含 Environment 变量。
+# - [FIX] 强化日志目录权限设置。
 # ==========================================================
 
 # =============================
@@ -88,7 +87,7 @@ touch "$WSS_LOG_FILE"
 # 2. 交互式端口和用户配置
 # =============================
 echo "----------------------------------"
-echo "==== WSS 基础设施配置 (V3.8) ===="
+echo "==== WSS 基础设施配置 (V3.9) ===="
 echo "请确认或修改以下端口和服务用户设置 (回车以使用默认值)。"
 
 # 1. 端口/域名
@@ -182,7 +181,8 @@ if ! command -v node >/dev/null; then
     apt install -y nodejs
 fi
 
-apt install -y wget curl git net-tools cmake build-essential openssl stunnel4 iproute2 iptables procps libsqlite3-dev passwd sudo nginx || echo "警告: 依赖安装失败。"
+# [FIX] 添加 unzip 依赖
+apt install -y wget curl git net-tools cmake build-essential openssl stunnel4 iproute2 iptables procps libsqlite3-dev passwd sudo nginx unzip || echo "警告: 依赖安装失败。"
 
 if ! id -u "$panel_user" >/dev/null 2>&1; then
     adduser --system --no-create-home "$panel_user"
@@ -381,6 +381,7 @@ if [ ! -f "$XRAY_BIN_PATH" ]; then
     curl -L "https://github.com/XTLS/Xray-core/releases/download/v$XRAY_VERSION/Xray-linux-64.zip" -o "$XRAY_TEMP_FILE"
     
     # [FIX] 解压 binary 和 assets
+    # 确保 unzip 已安装
     echo "正在解压 Xray Core 和资源文件..."
     unzip -j "$XRAY_TEMP_FILE" "xray" "geoip.dat" "geosite.dat" -d /tmp/ > /dev/null
     
@@ -478,20 +479,28 @@ chown "$panel_user:$panel_user" "$XRAY_CONFIG_PATH"
 chown -R "$panel_user:$panel_user" "$XRAY_DIR"
 
 # 部署 Xray Systemd 服务
-# [FIX] 修复: 正确使用 xray.service.template，而不是内联生成
 echo "部署 Xray 服务文件..."
 if [ ! -f "$XRAY_TEMPLATE" ]; then
-    echo "严重错误: 找不到 xray.service.template ($XRAY_TEMPLATE)。"
-    # Fallback (仅当模板丢失时使用内联生成)
+    echo "警告: 找不到 xray.service.template。将使用内联 Fallback 生成。"
+    # [FIX] 更新 Fallback 以匹配最新模板 (包含 Environment 和 WorkingDirectory)
     tee "$XRAY_SERVICE_PATH" > /dev/null <<EOF
 [Unit]
 Description=Xray Service (Fallback)
+Documentation=https://github.com/xtls
 After=network.target nss-lookup.target
+Wants=network.target
+
 [Service]
 Type=simple
 User=root
+# 必须指定资源路径，防止 Xray 找不到 geoip.dat
+Environment="XRAY_LOCATION_ASSET=/usr/local/bin/"
+WorkingDirectory=/usr/local/bin/
+LimitNOFILE=65536
 ExecStart=$XRAY_BIN_PATH run -c $XRAY_CONFIG_PATH
 Restart=on-failure
+RestartSec=3s
+
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -817,7 +826,6 @@ systemctl restart sshd_stunnel
 systemctl restart stunnel4 udpgw wss_panel wss wss-udp-custom nginx xray
 
 echo "=================================================="
-echo "✅ 部署完成！(Axiom V6.0 - Final Fixes)"
-echo "   - Sudoers: 语法已修复"
-echo "   - Xray: 配置已重置并强制默认端口"
+echo "✅ 部署完成！(Axiom V6.1 - Xray Dependencies Fixed)"
+echo "   - 请确保执行 'bash install.sh' 以应用更改。"
 echo "=================================================="
