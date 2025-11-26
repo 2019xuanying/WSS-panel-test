@@ -5,9 +5,10 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V3.9 (Axiom V7.0 - Revert Xray Deployment to NG Simple Style)
+# V3.9.1 (Axiom V7.1 - Nginx Fix for SNI & WS Headers)
 #
 # [CHANGELOG]
+# - [FIX] Nginx 模板更新：强制 default_server 和硬编码 WebSocket 头部。
 # - [REVERT] Xray 部署路径改为 /etc/wss-panel。
 # - [REVERT] 移除 GeoIP/GeoSite 资产下载。
 # - [REVERT] 简化 Xray 配置文件生成逻辑。
@@ -516,7 +517,7 @@ if [ ! -f "$WSS_TEMPLATE" ]; then
 fi
 cp "$WSS_TEMPLATE" "$WSS_SERVICE_PATH"
 sed -i "s|@WSS_LOG_FILE_PATH@|$WSS_LOG_FILE|g" "$WSS_SERVICE_PATH"
-sed -i "s|@WSS_PROXY_SCRIPT_PATH@|$WSS_PROXY_PATH|g" "$WSS_SERVICE_PATH"
+sed -i "s|@WSS_PROXY_SCRIPT_PATH@|$WSS_PROXY_SCRIPT_PATH|g" "$WSS_SERVICE_PATH"
 
 # wss_panel service
 if [ ! -f "$PANEL_TEMPLATE" ]; then
