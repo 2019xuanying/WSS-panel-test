@@ -1,57 +1,89 @@
 {
-// ==========================================================
-// Xray Core VLESS + WebSocket 配置模板 (NG Style)
-// 配置路径: /etc/wss-panel/xray_config.json
-// ==========================================================
-
-"log": {
+  "log": {
     "loglevel": "warning",
     "access": "/var/log/xray/access.log",
     "error": "/var/log/xray/error.log"
-},
-
-// Xray Inbound: 接收来自 Nginx 的 WebSocket 流量
-"inbounds": [
-    {
-        "port": @XRAY_INTERNAL_PORT@,
-        "protocol": "vless",
-        "listen": "127.0.0.1",
-        "settings": {
-            "clients": [
-                {
-                    "id": "@XRAY_UUID@",
-                    "level": 0
-                }
-            ],
-            "decryption": "none"
-        },
-        "streamSettings": {
-            "network": "ws",
-            "wsSettings": {
-                // Xray 的 WebSocket 路径，与 Nginx 配置保持一致
-                "path": "/vless-ws" 
-            }
-        }
+  },
+  "api": {
+    "tag": "api",
+    "services": [
+      "HandlerService",
+      "LoggerService",
+      "StatsService"
+    ]
+  },
+  "stats": {},
+  "policy": {
+    "levels": {
+      "0": {
+        "statsUserUplink": true,
+        "statsUserDownlink": true
+      }
+    },
+    "system": {
+      "statsInboundUplink": true,
+      "statsInboundDownlink": true
     }
-],
-
-// Xray Outbound: 流量出口，freedom 表示直接出网
-"outbounds": [
+  },
+  "inbounds": [
     {
-        "protocol": "freedom",
-        "settings": {},
-        "tag": "direct"
+      "port": @XRAY_INTERNAL_PORT@,
+      "listen": "127.0.0.1",
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "@XRAY_UUID@",
+            "level": 0,
+            "email": "root@server"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "/vless-ws"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls"
+        ]
+      }
     },
     {
-        "protocol": "blackhole",
-        "tag": "blocked"
+      "port": @XRAY_API_PORT@,
+      "listen": "127.0.0.1",
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1"
+      },
+      "tag": "api"
     }
-],
-
-"routing": {
-    "domainStrategy": "AsIs",
-    "rules": []
-}
-
-
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {}
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "blocked"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "inboundTag": [
+          "api"
+        ],
+        "outboundTag": "api",
+        "type": "field"
+      }
+    ]
+  }
 }
