@@ -11,6 +11,8 @@ set -eu
 # - [FIX] 添加 'unzip' 到依赖列表，防止 Xray 资源解压失败。
 # - [FIX] 更新内联 Xray 服务 Fallback，确保包含 Environment 变量。
 # - [FIX] 强化日志目录权限设置。
+# - [FIX] 修复 Sudoers 匹配问题 (放宽 systemctl 权限)。
+# - [FIX] 修复 Xray 端口变量可能为空导致的 "missing port" 错误。
 # ==========================================================
 
 # =============================
@@ -279,6 +281,9 @@ CMD_GETENT=$(command -v getent)
 CMD_SED=$(command -v sed)
 CMD_CERTBOT=$(command -v certbot || echo "/usr/bin/certbot") 
 
+# [AXIOM FIX] 放宽 systemctl 权限
+# 之前的限制太严格 (例如限制了参数)，导致如果路径或参数有微小差异，sudo 就会拒绝执行并要求密码。
+# 为了稳定性，允许面板用户执行任意 systemctl 命令。
 tee "$SUDOERS_FILE" > /dev/null <<EOF
 $panel_user ALL=(ALL) NOPASSWD: $CMD_USERADD
 $panel_user ALL=(ALL) NOPASSWD: $CMD_USERMOD
@@ -289,22 +294,9 @@ $panel_user ALL=(ALL) NOPASSWD: $CMD_PKILL
 $panel_user ALL=(ALL) NOPASSWD: $CMD_IPTABLES
 $panel_user ALL=(ALL) NOPASSWD: $CMD_IPTABLES_SAVE
 $panel_user ALL=(ALL) NOPASSWD: $CMD_JOURNALCTL
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart wss
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart stunnel4
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart udpgw
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart wss_panel
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart wss-udp-custom
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart nginx
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL restart xray
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL start nginx
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL stop nginx
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active wss
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active stunnel4
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active udpgw
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active wss_panel
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active wss-udp-custom
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active nginx
-$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active xray
+$panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL
+$panel_user ALL=(ALL) NOPASSWD: /bin/systemctl
+$panel_user ALL=(ALL) NOPASSWD: /usr/bin/systemctl
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SED
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL daemon-reload
 $panel_user ALL=(ALL) NOPASSWD: $CMD_CERTBOT
@@ -396,9 +388,13 @@ if [ ! -f "$XRAY_BIN_PATH" ]; then
 fi
 
 # 部署 Xray 配置文件
-# [FIX] 强制确保端口变量已定义
-_XRAY_API_PORT=${XRAY_API_PORT:-10085}
-_XRAY_PORT_INTERNAL=${XRAY_PORT_INTERNAL:-10081}
+# [FIX] 强制确保端口变量已定义并清洗非数字字符
+_XRAY_API_PORT=$(echo "${XRAY_API_PORT:-10085}" | tr -cd '0-9')
+_XRAY_PORT_INTERNAL=$(echo "${XRAY_PORT_INTERNAL:-10081}" | tr -cd '0-9')
+
+# 再次检查是否为空，如果为空则赋予默认值
+[ -z "$_XRAY_API_PORT" ] && _XRAY_API_PORT=10085
+[ -z "$_XRAY_PORT_INTERNAL" ] && _XRAY_PORT_INTERNAL=10081
 
 echo "正在生成 Xray 初始配置 ($XRAY_CONFIG_PATH)..."
 tee "$XRAY_CONFIG_PATH" > /dev/null <<EOF
