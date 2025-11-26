@@ -1,13 +1,10 @@
 /**
  * WSS Proxy Core (Node.js)
- * V8.7.0 (Axiom Refactor V6.0 - QoS, Idle/Zombie Cleanup & Concurrency Fix)
+ * V8.7.2 (Axiom Refactor V6.2 - Fix: Real IP from Nginx Headers)
  *
- * [AXIOM V6.0 CHANGELOG]
- * - [QoS NEW] 实现了动态 QoS (Quality of Service) 节流机制，响应 Panel 的 'throttle' 指令。
- * - [CLEANUP NEW] 实现了僵尸连接清理机制，销毁超过 60 秒无数据的连接。
- * - [CONCURRENCY FIX] 移除本地并发检查，现在并发授权在 /internal/auth API 中一步完成。
- * - [STATS FIX] 在 statsReport 中包含 lastActivityTime 用于调试和前端展示。
- * - [ERROR HANDLING] 增强了 IPC 消息处理的健壮性。
+ * [AXIOM V6.2 CHANGELOG]
+ * - [FIX] 实现了从 Nginx 转发的 'X-Real-IP' 或 'X-Forwarded-For' 头部中提取真实客户端 IP 的逻辑。
+ * 解决了面板中活跃连接显示为 127.0.0.1 的问题。
  */
 
 const net = require('net');
@@ -762,6 +759,15 @@ function handleClient(clientSocket, isTls) {
             let dataAfterHeaders = fullRequest.subarray(headerEndIndex + 4);
             const headers = headersRaw.toString('utf8', 0, headersRaw.length);
             
+            // [AXIOM V6.2 FIX] Extract Real IP from Nginx Headers
+            // 由于 Nginx 反代，socket.remoteAddress 总是 127.0.0.1。
+            // 我们需要从 HTTP 头部提取真实 IP (X-Real-IP 或 X-Forwarded-For)。
+            const realIpMatch = headers.match(/X-Real-IP:\s*([^\s\r\n]+)/i) || 
+                                headers.match(/X-Forwarded-For:\s*([^\s\r\n,]+)/i);
+            if (realIpMatch) {
+                clientIp = realIpMatch[1];
+            }
+
             fullRequest = dataAfterHeaders;
             
             if (!checkHost(headers)) {
@@ -772,8 +778,10 @@ function handleClient(clientSocket, isTls) {
             
             const auth = parseAuth(headers);
             
-            const isWebsocketRequest = headers.includes('Upgrade: websocket') || 
-                                       headers.includes('Connection: Upgrade') || 
+            // [V6.1 FIX] 使用正则进行不区分大小写的 WebSocket 头部检测
+            // 解决 Nginx 传递小写 'upgrade' 头导致 200 OK 的问题
+            const isWebsocketRequest = /upgrade:\s*websocket/i.test(headers) || 
+                                       /connection:\s*upgrade/i.test(headers) || 
                                        headers.includes('GET-RAY');
 
             if (!isWebsocketRequest) {
@@ -889,7 +897,7 @@ function handleClient(clientSocket, isTls) {
                 const now = new Date().toISOString();
                 stats.connections.set(clientSocket, {
                     id: connectionId,
-                    clientIp: clientIp,
+                    clientIp: clientIp, // 使用已从 Header 更新的 clientIp
                     startTime: now,
                     lastActivityTime: Date.now(), // [V6.0 NEW]
                     workerId: WORKER_ID
