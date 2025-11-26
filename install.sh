@@ -5,12 +5,11 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V3.2 (Axiom V6.0 - Fix SSL & Nginx Regex)
+# V3.3 (Axiom V6.0 - Fix Nginx Regex via Node.js)
 #
 # [CHANGELOG]
-# - [FIX] 修复 Nginx 启动时的 pcre_compile 错误 (空 Host 白名单导致)。
+# - [FIX] 使用 Node.js 健壮地生成 Nginx Host 正则表达式，彻底解决 pcre_compile 错误。
 # - [FIX] 自动生成自签名 SSL 证书以解决 Nginx 首次启动失败的问题。
-# - [FIX] 修正 Nginx 模板变量替换逻辑。
 # ==========================================================
 
 # =============================
@@ -85,7 +84,7 @@ touch "$WSS_LOG_FILE"
 # 2. 交互式端口和用户配置
 # =============================
 echo "----------------------------------"
-echo "==== WSS 基础设施配置 (V3.1) ===="
+echo "==== WSS 基础设施配置 (V3.3) ===="
 echo "请确认或修改以下端口和服务用户设置 (回车以使用默认值)。"
 
 # 1. 端口/域名
@@ -631,15 +630,40 @@ if [ ! -f "$NGINX_TEMPLATE" ]; then
 else
     cp "$NGINX_TEMPLATE" "$NGINX_CONF_PATH"
     
-    HOSTS_REGEX=$(cat "$PANEL_DIR/hosts.json" | grep -v '^\s*$' | tr '\n' '|')
-    # [FIX] Ensure valid regex even if hosts list is empty
-    if [ -z "$HOSTS_REGEX" ]; then
-        # Default to match nothing if list is empty, preventing empty regex error
-        HOSTS_REGEX="^$"
-    else
-        # Remove trailing pipe
-        HOSTS_REGEX="${HOSTS_REGEX%|}"
-    fi
+    # [CRITICAL FIX] 使用 Node.js 安全生成 Regex，避免 Shell 文本处理陷阱
+    echo "正在生成 Nginx Host 匹配规则..."
+    # 创建一个临时的 Node.js 脚本来解析 JSON 并输出 Regex
+    REGEX_GEN_SCRIPT=$(mktemp)
+    cat > "$REGEX_GEN_SCRIPT" <<'NODEEOF'
+const fs = require('fs');
+try {
+    const data = fs.readFileSync(process.argv[2], 'utf8');
+    const hosts = JSON.parse(data);
+    if (!Array.isArray(hosts) || hosts.length === 0) {
+        // 如果列表为空，输出一个不可能匹配域名的 Regex (例如匹配不可见字符)
+        // 这将导致 if ($host !~* ...) 始终为真，从而拒绝所有请求 (Strict Mode)
+        // 或者，如果您希望默认允许所有，可以输出 "^.*$"。
+        // 这里我们保持 Strict Mode: 白名单为空 = 拒绝所有非空 Host
+        console.log("^$");
+    } else {
+        // 过滤空字符串，转义正则特殊字符
+        const validHosts = hosts.filter(h => h && h.trim().length > 0).map(h => h.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+        if (validHosts.length === 0) {
+             console.log("^$");
+        } else {
+             console.log(validHosts.join('|'));
+        }
+    }
+} catch (e) {
+    console.error("Error parsing hosts.json:", e.message);
+    console.log("^$"); // Fallback
+}
+NODEEOF
+    
+    HOSTS_REGEX=$(node "$REGEX_GEN_SCRIPT" "$PANEL_DIR/hosts.json")
+    rm "$REGEX_GEN_SCRIPT"
+    
+    echo "生成的 Host Regex: $HOSTS_REGEX"
 
     sed -i "s|@YOUR_DOMAIN@|$NGINX_DOMAIN|g" "$NGINX_CONF_PATH"
     sed -i "s|@PANEL_PORT@|$PANEL_PORT|g" "$NGINX_CONF_PATH"
