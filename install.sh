@@ -5,13 +5,11 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V3.0 (Axiom V6.0 - Xray/Nginx/GeoIP/QoS Integration)
+# V3.1 (Axiom V6.0 - Fix SSL Bootstrap)
 #
 # [CHANGELOG]
-# - [NEW] 集成 Xray Core 和 Nginx Gateway。
-# - [NET] Nginx 接管 80/443 端口进行智能分流和 TLS 卸载。
-# - [SECURITY] 准备 Certbot/ACME 环境。
-# - [SUDOERS] 扩展权限以支持 Nginx/Xray 服务控制和证书管理。
+# - [FIX] 自动生成自签名 SSL 证书以解决 Nginx 首次启动失败的问题。
+# - [FIX] 修正 Nginx 模板变量替换逻辑。
 # ==========================================================
 
 # =============================
@@ -86,7 +84,7 @@ touch "$WSS_LOG_FILE"
 # 2. 交互式端口和用户配置
 # =============================
 echo "----------------------------------"
-echo "==== WSS 基础设施配置 (V3.0) ===="
+echo "==== WSS 基础设施配置 (V3.1) ===="
 echo "请确认或修改以下端口和服务用户设置 (回车以使用默认值)。"
 
 # 1. 端口/域名
@@ -602,26 +600,39 @@ systemctl restart wss-udp-custom
 echo "----------------------------------"
 
 # =============================
-# 11. Nginx Gateway 配置 (V6.0 NEW)
+# 11. Nginx Gateway 配置 (V6.0 NEW - Fixed SSL)
 # =============================
 echo "==== 配置 Nginx 网关 ===="
 
-# 1. 部署 Nginx 配置文件 (使用之前生成的模板)
+# 1. SSL 证书预检与自动生成 (CRITICAL FIX)
+CERT_DIR="/etc/letsencrypt/live/$NGINX_DOMAIN"
+CERT_PATH="$CERT_DIR/fullchain.pem"
+KEY_PATH="$CERT_DIR/privkey.pem"
+
+if [ ! -f "$CERT_PATH" ] || [ ! -f "$KEY_PATH" ]; then
+    echo "警告: 未检测到域名 $NGINX_DOMAIN 的 SSL 证书。"
+    echo "正在生成自签名证书以确保 Nginx 可以启动..."
+    
+    mkdir -p "$CERT_DIR"
+    
+    openssl req -x509 -nodes -newkey rsa:2048 \
+        -keyout "$KEY_PATH" \
+        -out "$CERT_PATH" \
+        -days 365 \
+        -subj "/CN=$NGINX_DOMAIN" > /dev/null 2>&1
+        
+    echo "自签名证书已生成: $CERT_DIR"
+fi
+
+# 2. 部署 Nginx 配置文件
 if [ ! -f "$NGINX_TEMPLATE" ]; then
     echo "错误: 找不到 nginx.conf.template ($NGINX_TEMPLATE)。跳过 Nginx 配置。"
 else
     cp "$NGINX_TEMPLATE" "$NGINX_CONF_PATH"
     
-    # 替换模板中的变量
     HOSTS_REGEX=$(cat "$PANEL_DIR/hosts.json" | grep -v '^\s*$' | tr '\n' '|')
-    # 去除尾部 | 符号
-    if [ -n "$HOSTS_REGEX" ]; then
-        HOSTS_REGEX="${HOSTS_REGEX%|}"
-    else
-        HOSTS_REGEX="^$" # 默认不匹配任何内容
-    fi
+    if [ -n "$HOSTS_REGEX" ]; then HOSTS_REGEX="${HOSTS_REGEX%|}"; else HOSTS_REGEX="^$"; fi
 
-    # 简单地使用 sed 替换配置文件中的占位符
     sed -i "s|@YOUR_DOMAIN@|$NGINX_DOMAIN|g" "$NGINX_CONF_PATH"
     sed -i "s|@PANEL_PORT@|$PANEL_PORT|g" "$NGINX_CONF_PATH"
     sed -i "s|@XRAY_WSPATH@|$XRAY_WS_PATH|g" "$NGINX_CONF_PATH"
@@ -629,17 +640,18 @@ else
     sed -i "s|@XRAY_PORT_INTERNAL@|$XRAY_PORT_INTERNAL|g" "$NGINX_CONF_PATH"
     sed -i "s|@WSS_PROXY_PORT_INTERNAL@|$WSS_PROXY_PORT_INTERNAL|g" "$NGINX_CONF_PATH"
     sed -i "s|@PANEL_DIR@|$PANEL_DIR|g" "$NGINX_CONF_PATH"
-    # Certbot 证书路径 (默认占位符)
-    sed -i "s|@CERT_PATH@|/etc/letsencrypt/live/$NGINX_DOMAIN/fullchain.pem|g" "$NGINX_CONF_PATH"
-    sed -i "s|@KEY_PATH@|/etc/letsencrypt/live/$NGINX_DOMAIN/privkey.pem|g" "$NGINX_CONF_PATH"
-    # Host 白名单正则表达式
+    
+    # 替换证书路径
+    sed -i "s|@CERT_PATH@|$CERT_PATH|g" "$NGINX_CONF_PATH"
+    sed -i "s|@KEY_PATH@|$KEY_PATH|g" "$NGINX_CONF_PATH"
+    
     sed -i "s|@HOST_WHITELIST_REGEX@|$HOSTS_REGEX|g" "$NGINX_CONF_PATH"
 
-    # 2. 启用站点并清理旧配置
+    # 3. 启用站点并清理旧配置
     ln -sf "$NGINX_CONF_PATH" "$NGINX_CONF_SYMLINK"
     rm -f /etc/nginx/sites-enabled/default
 
-    # 3. 检查配置并重启 Nginx
+    # 4. 检查配置并重启 Nginx
     nginx -t || echo "警告: Nginx 配置测试失败，但将尝试重启。"
     systemctl restart nginx || true
 fi
@@ -770,7 +782,7 @@ systemctl restart stunnel4 udpgw wss_panel wss wss-udp-custom nginx xray
 
 echo "=================================================="
 echo "✅ 部署完成！(Axiom V6.0 - Xray/Nginx Multi-Protocol)"
-echo "   - Nginx 网关: 0.0.0.0:80/443 (需手动申请证书)"
+echo "   - Nginx 网关: 0.0.0.0:80/443 (已生成自签名证书)"
 echo "   - Web Panel: 0.0.0.0:$PANEL_PORT"
 echo "   - Xray Core: 127.0.0.1:$XRAY_PORT_INTERNAL (API: $XRAY_API_PORT)"
 echo "   - SSH WSS Proxy: 127.0.0.1:$WSS_PROXY_PORT_INTERNAL"
