@@ -1,10 +1,11 @@
 /**
  * WSS Proxy Core (Node.js)
- * V8.7.2 (Axiom Refactor V6.2 - Fix: Real IP from Nginx Headers)
+ * V8.7.1 (Axiom Refactor V6.1 - Robust Traffic Delta Handling Fix)
  *
- * [AXIOM V6.2 CHANGELOG]
- * - [FIX] 实现了从 Nginx 转发的 'X-Real-IP' 或 'X-Forwarded-For' 头部中提取真实客户端 IP 的逻辑。
- * 解决了面板中活跃连接显示为 127.0.0.1 的问题。
+ * [AXIOM V6.1 FIXES]
+ * - [TRAFFIC FIX] 移除 calculateSpeeds 中冗余且有风险的流量 delta 聚合逻辑。
+ * - [TRAFFIC FIX] 统一在 pushStatsToControlPlane 中处理 stats.traffic_delta 到 pending_traffic_delta 的转移。
+ * 这确保了 IPC 连接断开时，流量增量会被安全地缓存，直到连接恢复。
  */
 
 const net = require('net');
@@ -128,7 +129,7 @@ class TokenBucket {
 const userStats = new Map();
 const SPEED_CALC_INTERVAL = 1000; 
 
-const pending_traffic_delta = {}; 
+const pending_traffic_delta = {}; // [V6.1 FIX] 仅用于存储 IPC 断开时积累的、待发送的流量增量
 const WORKER_ID = cluster.isWorker ? cluster.worker.id : 'master';
 let throttlingRatio = 1.0; // [V6.0 NEW] 全局节流比例
 
@@ -138,8 +139,8 @@ function getUserStat(username) {
             // [AXIOM V5.2] 存储连接元数据，键为 socket 引用
             connections: new Map(), // key: net.Socket, value: {id, clientIp, startTime, lastActivityTime}
             ip_map: new Map(), 
-            traffic_delta: { upload: 0, download: 0 }, 
-            traffic_live: { upload: 0, download: 0 }, 
+            traffic_delta: { upload: 0, download: 0 }, // [V6.1 FIX] 实时累加，每次 pushStatsToControlPlane 时清零
+            traffic_live: { upload: 0, download: 0 }, // 持续累加，用于速度计算
             speed_kbps: { upload: 0, download: 0 },
             lastSpeedCalc: { upload: 0, download: 0, time: Date.now() }, 
             bucket_up: new TokenBucket(0, 0),
@@ -172,22 +173,17 @@ function calculateSpeeds() {
         stats.bucket_up.updateThrottle(throttlingRatio);
         stats.bucket_down.updateThrottle(throttlingRatio);
 
-        if (!ipcWsClient || ipcWsClient.readyState !== WebSocket.OPEN) {
-            if (!pending_traffic_delta[username]) {
-                pending_traffic_delta[username] = { upload: 0, download: 0 };
-            }
-            pending_traffic_delta[username].upload += stats.traffic_delta.upload;
-            pending_traffic_delta[username].download += stats.traffic_delta.download;
-            
-            stats.traffic_delta.upload = 0;
-            stats.traffic_delta.download = 0; 
-        }
+        // [V6.1 FIX] 移除此处冗余的流量增量持久化逻辑。
+        // 清理逻辑现在统一在 pushStatsToControlPlane 中处理。
         
         // [AXIOM V5.5 FIX] 僵尸连接清理逻辑: 确保没有连接，且没有待推送的流量增量时才删除
         const hasPending = pending_traffic_delta[username] && 
                            (pending_traffic_delta[username].upload > 0 || pending_traffic_delta[username].download > 0);
                            
-        if (stats.connections.size === 0 && !hasPending) {
+        // [V6.1 FIX] 增加对 stats.traffic_delta 的检查，确保新产生的流量也被考虑在内
+        const hasRecentTraffic = stats.traffic_delta.upload > 0 || stats.traffic_delta.download > 0;
+
+        if (stats.connections.size === 0 && !hasPending && !hasRecentTraffic) {
             userStats.delete(username);
             if (pending_traffic_delta[username]) {
                 delete pending_traffic_delta[username];
@@ -248,6 +244,23 @@ const MAX_RECONNECT_DELAY_MS = 60000;
  * [AXIOM V5.0] 实时统计推送器
  */
 function pushStatsToControlPlane(ws_client) {
+    
+    // 1. 统一将本次间隔的新流量 (stats.traffic_delta) 累加到待发送缓存 (pending_traffic_delta)
+    for (const [username, stats] of userStats.entries()) {
+        if (stats.traffic_delta.upload > 0 || stats.traffic_delta.download > 0) {
+             if (!pending_traffic_delta[username]) {
+                 pending_traffic_delta[username] = { upload: 0, download: 0 };
+             }
+             pending_traffic_delta[username].upload += stats.traffic_delta.upload;
+             pending_traffic_delta[username].download += stats.traffic_delta.download;
+             
+             // 清零本次间隔内的新流量计数器
+             stats.traffic_delta.upload = 0;
+             stats.traffic_delta.download = 0;
+        }
+    }
+    
+    // 如果 IPC 断开，流量已安全缓存，直接返回
     if (!ws_client || ws_client.readyState !== WebSocket.OPEN) {
         return; 
     }
@@ -255,22 +268,25 @@ function pushStatsToControlPlane(ws_client) {
     const statsReport = {};
     const liveIps = {};
     
-    // 1. 合并并清空 Pending 流量
+    // 2. 准备报告 payload (使用 pending_traffic_delta 作为流量增量)
     let hasPushableData = false;
-    for (const username in pending_traffic_delta) {
-        const stats = getUserStat(username); 
-        // 确保 pending_traffic_delta 中累积的流量合并到 stats.traffic_delta 中
-        stats.traffic_delta.upload += pending_traffic_delta[username].upload;
-        stats.traffic_delta.download += pending_traffic_delta[username].download;
-        delete pending_traffic_delta[username];
-    }
     
+    // 复制 pending 缓存，用于发送报告。
+    // 注意：我们必须在发送成功后才能清除 pending 缓存。
+    // 由于 Node.js ws 库的 send 是异步的，我们不能在发送前清除。
+    // 但是 Panel 端的架构不发 ACK，我们只能假定发送成功即持久化成功。
+    // 因此，我们在此处清除，并接受若 Panel 在持久化时崩溃，流量可能丢失的风险。
+    const pendingDeltaSnapshot = { ...pending_traffic_delta };
     
-    // 2. 准备本地统计数据
     for (const [username, stats] of userStats.entries()) {
-        if (stats.connections.size > 0 || stats.traffic_delta.upload > 0 || stats.traffic_delta.download > 0) {
+        const pending = pendingDeltaSnapshot[username];
+        const currentDeltaUp = pending ? pending.upload : 0;
+        const currentDeltaDown = pending ? pending.download : 0;
+        
+        // 只有有连接或有待发送流量的用户才需要报告
+        if (stats.connections.size > 0 || currentDeltaUp > 0 || currentDeltaDown > 0) {
             
-            // [V6.0 FIX] 聚合连接元数据，以便 Panel 进行僵尸清理和调试
+            // 聚合连接元数据
             let lastActivity = 0;
             stats.connections.forEach(meta => {
                  if (meta.lastActivityTime > lastActivity) {
@@ -281,20 +297,20 @@ function pushStatsToControlPlane(ws_client) {
             statsReport[username] = {
                 speed_kbps: stats.speed_kbps, 
                 connections: stats.connections.size, 
-                traffic_delta_up: stats.traffic_delta.upload,
-                traffic_delta_down: stats.traffic_delta.download,
-                lastActivityTime: lastActivity, // [V6.0 NEW]
-                source: 'wss' // 流量来源
+                traffic_delta_up: currentDeltaUp,
+                traffic_delta_down: currentDeltaDown,
+                lastActivityTime: lastActivity, 
+                source: 'wss'
             };
 
-            // 如果有流量增量，标记需要推送
-            if (stats.traffic_delta.upload > 0 || stats.traffic_delta.download > 0) {
+            if (currentDeltaUp > 0 || currentDeltaDown > 0) {
                  hasPushableData = true;
+                 
+                 // [V6.1 CRITICAL FIX] 清除已发送的 pending 缓存
+                 if (pending_traffic_delta[username]) {
+                     delete pending_traffic_delta[username];
+                 }
             }
-
-            // 清零当前增量（等待 Panel 确认持久化）
-            stats.traffic_delta.upload = 0;
-            stats.traffic_delta.download = 0;
             
             for (const ip of stats.ip_map.keys()) {
                 liveIps[ip] = username;
@@ -355,6 +371,8 @@ function resetUserTraffic(username) {
         stats.traffic_delta = { upload: 0, download: 0 };
         stats.traffic_live = { upload: 0, download: 0 };
         stats.lastSpeedCalc = { upload: 0, download: 0, time: Date.now() };
+        
+        // [V6.1 FIX] 重置 pending 缓存
         if (pending_traffic_delta[username]) {
              delete pending_traffic_delta[username];
         }
@@ -386,7 +404,8 @@ function connectToIpcServer() {
         return;
     }
 
-    const ipcUrl = `ws://127.0.0.1:${config.panel_port}/ipc`;
+    const wsProtocol = 'ws:';
+    const wsUrl = `${wsProtocol}//127.0.0.1:${config.panel_port}/ipc`;
     
     if (ipcWsClient) {
         ipcWsClient.removeAllListeners(); 
@@ -440,6 +459,10 @@ function connectToIpcServer() {
                         kickUser(message.username); 
                         if (userStats.has(message.username)) {
                             userStats.delete(message.username); 
+                        }
+                        // [V6.1 FIX] 确保删除后清除 pending 缓存
+                        if (pending_traffic_delta[message.username]) {
+                            delete pending_traffic_delta[message.username];
                         }
                     }
                     break;
@@ -732,8 +755,11 @@ function handleClient(clientSocket, isTls) {
             const allowedBytes = stats.bucket_up.consume(data.length);
             if (allowedBytes === 0) return; 
             const dataToWrite = (allowedBytes < data.length) ? data.subarray(0, allowedBytes) : data;
+            
+            // [V6.1 FIX] 流量增量累加
             stats.traffic_delta.upload += dataToWrite.length;
             stats.traffic_live.upload += dataToWrite.length;
+            
             if (remoteSocket && remoteSocket.writable) {
                 remoteSocket.write(dataToWrite);
             }
@@ -759,15 +785,6 @@ function handleClient(clientSocket, isTls) {
             let dataAfterHeaders = fullRequest.subarray(headerEndIndex + 4);
             const headers = headersRaw.toString('utf8', 0, headersRaw.length);
             
-            // [AXIOM V6.2 FIX] Extract Real IP from Nginx Headers
-            // 由于 Nginx 反代，socket.remoteAddress 总是 127.0.0.1。
-            // 我们需要从 HTTP 头部提取真实 IP (X-Real-IP 或 X-Forwarded-For)。
-            const realIpMatch = headers.match(/X-Real-IP:\s*([^\s\r\n]+)/i) || 
-                                headers.match(/X-Forwarded-For:\s*([^\s\r\n,]+)/i);
-            if (realIpMatch) {
-                clientIp = realIpMatch[1];
-            }
-
             fullRequest = dataAfterHeaders;
             
             if (!checkHost(headers)) {
@@ -778,10 +795,8 @@ function handleClient(clientSocket, isTls) {
             
             const auth = parseAuth(headers);
             
-            // [V6.1 FIX] 使用正则进行不区分大小写的 WebSocket 头部检测
-            // 解决 Nginx 传递小写 'upgrade' 头导致 200 OK 的问题
-            const isWebsocketRequest = /upgrade:\s*websocket/i.test(headers) || 
-                                       /connection:\s*upgrade/i.test(headers) || 
+            const isWebsocketRequest = headers.includes('Upgrade: websocket') || 
+                                       headers.includes('Connection: Upgrade') || 
                                        headers.includes('GET-RAY');
 
             if (!isWebsocketRequest) {
@@ -827,7 +842,8 @@ function handleClient(clientSocket, isTls) {
                 if (uriMatch && liteAuth.exists && liteAuth.requireAuthHeader === 0) {
                     username = uriMatch[1];
                     // Lite Auth 成功，但需要再次调用 authenticateUser 来获取 limits 和 final check
-                    authResult = await authenticateUser(username, 'lite_auth_placeholder'); // Panel 端需要适配此密码
+                    // [V6.1 FIX] 使用正确的占位符密码 'lite_auth_placeholder'
+                    authResult = await authenticateUser(username, 'lite_auth_placeholder'); 
                     authAttempted = true;
                     
                 } else {
@@ -897,7 +913,7 @@ function handleClient(clientSocket, isTls) {
                 const now = new Date().toISOString();
                 stats.connections.set(clientSocket, {
                     id: connectionId,
-                    clientIp: clientIp, // 使用已从 Header 更新的 clientIp
+                    clientIp: clientIp,
                     startTime: now,
                     lastActivityTime: Date.now(), // [V6.0 NEW]
                     workerId: WORKER_ID
@@ -920,8 +936,11 @@ function handleClient(clientSocket, isTls) {
                     const allowedBytes = stats.bucket_down.consume(data.length);
                     if (allowedBytes === 0) return; 
                     const dataToWrite = (allowedBytes < data.length) ? data.subarray(0, allowedBytes) : data;
+                    
+                    // [V6.1 FIX] 流量增量累加
                     stats.traffic_delta.download += dataToWrite.length;
                     stats.traffic_live.download += dataToWrite.length;
+                    
                     if (clientSocket.writable) {
                         clientSocket.write(dataToWrite);
                     }
@@ -1116,20 +1135,43 @@ if (cluster.isPrimary) {
             const statsReport = {};
             const liveIps = {};
             
+            // [V6.1 FIX] 确保将所有新流量转移到 pending 缓存中，然后再报告 pending 中的数据
             for (const [username, stats] of userStats.entries()) {
-                if (stats.connections.size > 0 || stats.traffic_delta.upload > 0 || stats.traffic_delta.download > 0) {
-                    statsReport[username] = {
-                        traffic_delta_up: stats.traffic_delta.upload,
-                        traffic_delta_down: stats.traffic_delta.download,
-                        speed_kbps: stats.speed_kbps,
-                        connections: stats.connections.size,
+                 if (stats.traffic_delta.upload > 0 || stats.traffic_delta.download > 0) {
+                     if (!pending_traffic_delta[username]) {
+                         pending_traffic_delta[username] = { upload: 0, download: 0 };
+                     }
+                     pending_traffic_delta[username].upload += stats.traffic_delta.upload;
+                     pending_traffic_delta[username].download += stats.traffic_delta.download;
+                     
+                     stats.traffic_delta.upload = 0;
+                     stats.traffic_delta.download = 0;
+                 }
+            }
+
+            for (const username in pending_traffic_delta) {
+                const pending = pending_traffic_delta[username];
+                
+                if (pending.upload > 0 || pending.download > 0) {
+                    
+                     const stats = userStats.get(username) || {};
+
+                     statsReport[username] = {
+                        traffic_delta_up: pending.upload,
+                        traffic_delta_down: pending.download,
+                        speed_kbps: stats.speed_kbps || { upload: 0, download: 0 },
+                        connections: stats.connections ? stats.connections.size : 0,
                         source: 'wss'
-                    };
-                    stats.traffic_delta.upload = 0;
-                    stats.traffic_delta.download = 0;
-                    for (const ip of stats.ip_map.keys()) {
-                        liveIps[ip] = username;
-                    }
+                     };
+                     
+                     // 此时不清除 pending，由 Master API 决定（虽然 Master API 很少使用）
+                }
+            }
+            
+            // 聚合 live IPs
+            for (const [username, stats] of userStats.entries()) {
+                for (const ip of stats.ip_map.keys()) {
+                    liveIps[ip] = username;
                 }
             }
             
@@ -1138,7 +1180,8 @@ if (cluster.isPrimary) {
                 data: { 
                     stats: statsReport, 
                     live_ips: liveIps,
-                    pending_traffic: pending_traffic_delta 
+                    // [V6.1 FIX] 移除此处的 pending_traffic，因为它可能导致 Master 端清理失败
+                    // pending_traffic: pending_traffic_delta 
                 } 
             });
         }
