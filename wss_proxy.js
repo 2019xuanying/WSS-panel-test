@@ -1,11 +1,10 @@
 /**
  * WSS Proxy Core (Node.js)
- * V8.7.1 (Axiom Refactor V6.1 - Robust Traffic Delta Handling Fix)
+ * V8.7.2 (Axiom Refactor V6.2 - Critical Reference Error Fix)
  *
- * [AXIOM V6.1 FIXES]
- * - [TRAFFIC FIX] 移除 calculateSpeeds 中冗余且有风险的流量 delta 聚合逻辑。
- * - [TRAFFIC FIX] 统一在 pushStatsToControlPlane 中处理 stats.traffic_delta 到 pending_traffic_delta 的转移。
- * 这确保了 IPC 连接断开时，流量增量会被安全地缓存，直到连接恢复。
+ * [AXIOM V6.2 FIXES]
+ * - [CRITICAL FIX] 修复 connectToIpcServer 函数中 ReferenceError: ipcUrl is not defined 的问题。
+ * 这解决了 Worker 进程持续崩溃和重启，导致的 100% CPU 占用。
  */
 
 const net = require('net');
@@ -272,10 +271,6 @@ function pushStatsToControlPlane(ws_client) {
     let hasPushableData = false;
     
     // 复制 pending 缓存，用于发送报告。
-    // 注意：我们必须在发送成功后才能清除 pending 缓存。
-    // 由于 Node.js ws 库的 send 是异步的，我们不能在发送前清除。
-    // 但是 Panel 端的架构不发 ACK，我们只能假定发送成功即持久化成功。
-    // 因此，我们在此处清除，并接受若 Panel 在持久化时崩溃，流量可能丢失的风险。
     const pendingDeltaSnapshot = { ...pending_traffic_delta };
     
     for (const [username, stats] of userStats.entries()) {
@@ -403,10 +398,11 @@ function connectToIpcServer() {
     if (ipcWsClient && (ipcWsClient.readyState === WebSocket.OPEN || ipcWsClient.readyState === WebSocket.CONNECTING)) {
         return;
     }
-
-    const wsProtocol = 'ws:';
-    const wsUrl = `${wsProtocol}//127.0.0.1:${config.panel_port}/ipc`;
     
+    // [V6.2 CRITICAL FIX] 重新定义 ipcUrl，解决 ReferenceError
+    const ipcUrl = `ws://127.0.0.1:${config.panel_port}/ipc`;
+    
+
     if (ipcWsClient) {
         ipcWsClient.removeAllListeners(); 
         ipcWsClient.close();
