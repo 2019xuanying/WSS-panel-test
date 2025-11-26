@@ -1,5 +1,5 @@
 [Unit]
-Description=Xray Service (Axiom V6.0)
+Description=Xray Service (Axiom V6.0 Stable)
 Documentation=https://github.com/xtls
 After=network.target nss-lookup.target
 Wants=network.target
@@ -8,16 +8,22 @@ Wants=network.target
 Type=simple
 User=root
 
-# 提升文件描述符限制，对高并发代理至关重要
+# [AXIOM FIX] 显式指定资源文件目录，防止 Xray 找不到 geoip/geosite 导致启动失败
+# 假设 install.sh 将 binary 和 dat 文件都放在 /usr/local/bin
+Environment="XRAY_LOCATION_ASSET=/usr/local/bin/"
+WorkingDirectory=/usr/local/bin/
 
+# 提升文件描述符限制，对高并发代理至关重要
 LimitNOFILE=65536
 
-# 赋予绑定特权端口(443/80)和原始套接字的能力
+# [AXIOM FIX] 移除 Capabilities 限制
+# 原有的 CapabilityBoundingSet/AmbientCapabilities 在 LXC/OpenVZ 容器中
+# 会导致服务无法启动 (报错 218/CAPABILITIES)。
+# 既然已经是 User=root，这些限制是不必要的兼容性隐患。
 
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-NoNewPrivileges=true
 ExecStart=/usr/local/bin/xray run -c /etc/xray/config.json
+
+# 故障重启策略
 Restart=on-failure
 RestartSec=3s
 
