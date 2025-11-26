@@ -1,29 +1,22 @@
 [Unit]
-Description=Xray Service (Axiom V6.0 Stable)
+Description=Xray Core (VLESS over WS)
 Documentation=https://github.com/xtls
 After=network.target nss-lookup.target
-Wants=network.target
 
 [Service]
 Type=simple
 User=root
+Group=root
 
-# [AXIOM FIX] 显式指定资源文件目录，防止 Xray 找不到 geoip/geosite 导致启动失败
-# 假设 install.sh 将 binary 和 dat 文件都放在 /usr/local/bin
-Environment="XRAY_LOCATION_ASSET=/usr/local/bin/"
-WorkingDirectory=/usr/local/bin/
+# [AXIOM NG FIX] 使用模板生成的配置文件路径
+ExecStart=/usr/local/bin/xray run -c /etc/wss-panel/xray_config.json
 
-# 提升文件描述符限制，对高并发代理至关重要
+# [AXIOM NG FIX] 确保日志目录存在且有权限
+ExecStartPre=/bin/bash -c "mkdir -p /var/log/xray && touch /var/log/xray/access.log && touch /var/log/xray/error.log && chmod -R 777 /var/log/xray"
+
+# 提升文件描述符限制
 LimitNOFILE=65536
 
-# [AXIOM FIX] 移除 Capabilities 限制
-# 原有的 CapabilityBoundingSet/AmbientCapabilities 在 LXC/OpenVZ 容器中
-# 会导致服务无法启动 (报错 218/CAPABILITIES)。
-# 既然已经是 User=root，这些限制是不必要的兼容性隐患。
-
-ExecStart=/usr/local/bin/xray run -c /etc/xray/config.json
-
-# 故障重启策略
 Restart=on-failure
 RestartSec=3s
 
