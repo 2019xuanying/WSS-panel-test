@@ -1,24 +1,27 @@
 [Unit]
-Description=Xray Core (VLESS over WS)
-Documentation=https://github.com/xtls
-After=network.target nss-lookup.target
+Description=Xray Core (VLESS/VMess over WS+TLS)
+After=network.target
 
 [Service]
 Type=simple
+
+核心启动命令：配置文件位于 /etc/wss-panel 目录下
+
+ExecStart=/usr/local/bin/xray run -c /etc/wss-panel/xray_config.json
+
+确保在启动前创建日志目录和文件
+
+ExecStartPre=/bin/bash -c "mkdir -p /var/log/xray && touch /var/log/xray/access.log && touch /var/log/xray/error.log"
+
+Xray 默认使用 root 运行以绑定 443 等特权端口，简化权限配置。
+
 User=root
 Group=root
 
-# [AXIOM NG FIX] 使用模板生成的配置文件路径
-ExecStart=/usr/local/bin/xray run -c /etc/wss-panel/xray_config.json
-
-# [AXIOM NG FIX] 确保日志目录存在且有权限
-ExecStartPre=/bin/bash -c "mkdir -p /var/log/xray && touch /var/log/xray/access.log && touch /var/log/xray/error.log && chmod -R 777 /var/log/xray"
-
-# 提升文件描述符限制
-LimitNOFILE=65536
+重启策略
 
 Restart=on-failure
-RestartSec=3s
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
