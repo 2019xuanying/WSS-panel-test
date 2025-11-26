@@ -5,20 +5,20 @@ After=network.target
 [Service]
 Type=simple
 
-核心启动命令：配置文件位于 /etc/wss-panel 目录下
+# 核心启动命令：配置文件位于 /etc/wss-panel 目录下
 
 ExecStart=/usr/local/bin/xray run -c /etc/wss-panel/xray_config.json
 
-确保在启动前创建日志目录和文件
+# 确保在启动前创建日志目录和文件
 
 ExecStartPre=/bin/bash -c "mkdir -p /var/log/xray && touch /var/log/xray/access.log && touch /var/log/xray/error.log"
 
-Xray 默认使用 root 运行以绑定 443 等特权端口，简化权限配置。
+# Xray 默认使用 root 运行以绑定 443 等特权端口，简化权限配置。
 
 User=root
 Group=root
 
-重启策略
+# 重启策略
 
 Restart=on-failure
 RestartSec=5
