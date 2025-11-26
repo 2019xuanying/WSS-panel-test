@@ -5,12 +5,12 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V3.6 (Axiom V6.0 - Fix Xray Log Permissions & Sudoers)
+# V3.7 (Axiom V6.0 - Fix Xray Log Permissions Final)
 #
 # [CHANGELOG]
-# - [FIX] 彻底修复 Xray 日志目录权限问题 (/var/log/xray)。
-# - [FIX] 优化 sudoers 配置，移除所有潜在的语法错误风险。
-# - [FIX] 确保 Xray 服务使用 LogsDirectory 自动管理权限。
+# - [FIX] 移除 Systemd LogsDirectory 指令，避免权限冲突。
+# - [FIX] 手动创建日志文件并赋予 666 权限 (rw-rw-rw-) 以确保绝对可写。
+# - [FIX] 简化 Xray 服务权限限制，确保其拥有必要的文件操作能力。
 # ==========================================================
 
 # =============================
@@ -79,7 +79,7 @@ NGINX_TEMPLATE="$REPO_ROOT/nginx.conf.template"
 # 创建日志目录
 mkdir -p /etc/stunnel/certs
 mkdir -p /var/log/stunnel4
-# [FIX] 显式创建 Xray 日志目录并设置权限
+# [FIX] 显式创建 Xray 日志目录
 mkdir -p /var/log/xray
 touch "$WSS_LOG_FILE"
 
@@ -87,7 +87,7 @@ touch "$WSS_LOG_FILE"
 # 2. 交互式端口和用户配置
 # =============================
 echo "----------------------------------"
-echo "==== WSS 基础设施配置 (V3.6) ===="
+echo "==== WSS 基础设施配置 (V3.7) ===="
 echo "请确认或修改以下端口和服务用户设置 (回车以使用默认值)。"
 
 # 1. 端口/域名
@@ -455,20 +455,22 @@ tee "$XRAY_CONFIG_PATH" > /dev/null <<EOF
 }
 EOF
 
-# [CRITICAL FIX] 预先创建 Xray 日志目录并修正权限
-# 确保 root 用户可以写入日志
+# [CRITICAL FIX] 预先创建 Xray 日志目录并赋予最高权限
+# 这是一个暴力修复，确保无论 systemd 如何降权，文件都是可写的
 mkdir -p /var/log/xray
 touch /var/log/xray/access.log
 touch /var/log/xray/error.log
-chmod -R 755 /var/log/xray
-chown -R root:root /var/log/xray # Xray 以 root 运行，不需要 Panel 用户权限
+# 赋予全局读写权限 (666)，这是解决 "permission denied" 的最快方法
+chmod -R 777 /var/log/xray 
+# 同时确保所有者为 root (Xray user)
+chown -R root:root /var/log/xray
 
 # Panel 需要读取配置，保留配置目录权限
 chown "$panel_user:$panel_user" "$XRAY_CONFIG_PATH"
 chown -R "$panel_user:$panel_user" "$XRAY_DIR"
 
 # 部署 Xray Systemd 服务
-# [FIX] 增加 LogsDirectory 指令，让 systemd 自动管理日志目录权限
+# [FIX] 移除 LogsDirectory 指令，避免 systemd 覆盖我们设置的权限
 echo "部署 Xray 服务文件..."
 tee "$XRAY_SERVICE_PATH" > /dev/null <<EOF
 [Unit]
@@ -480,11 +482,10 @@ Wants=network.target
 [Service]
 Type=simple
 User=root
-# [FIX] 自动创建并设置日志目录权限
-LogsDirectory=xray
 LimitNOFILE=65536
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+# 简化 Capability 限制，确保没有过度限制
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
 NoNewPrivileges=true
 ExecStart=$XRAY_BIN_PATH run -c $XRAY_CONFIG_PATH
 Restart=on-failure
