@@ -5,13 +5,11 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V3.9.1 (Axiom V7.1 - Nginx Fix for SNI & WS Headers)
+# V3.9.1 (Axiom V7.1 - Xray Config Fix)
 #
 # [CHANGELOG]
-# - [FIX] Nginx 模板更新：强制 default_server 和硬编码 WebSocket 头部。
-# - [REVERT] Xray 部署路径改为 /etc/wss-panel。
-# - [REVERT] 移除 GeoIP/GeoSite 资产下载。
-# - [REVERT] 简化 Xray 配置文件生成逻辑。
+# - [FIX] 确保 Xray 配置模板中的 @XRAY_WSPATH@ 和 @XRAY_API_PORT@ 变量被正确替换。
+# - [FIX] 简化 Xray UUID 生成。
 # ==========================================================
 
 # =============================
@@ -90,7 +88,7 @@ touch "$WSS_LOG_FILE"
 # 2. 交互式端口和用户配置
 # =============================
 echo "----------------------------------"
-echo "==== WSS 基础设施配置 (V3.9) ===="
+echo "==== WSS 基础设施配置 (V3.9.1) ===="
 echo "请确认或修改以下端口和服务用户设置 (回车以使用默认值)。"
 
 # 1. 端口/域名
@@ -283,6 +281,9 @@ CMD_SYSTEMCTL=$(command -v systemctl)
 CMD_GETENT=$(command -v getent)
 CMD_SED=$(command -v sed)
 CMD_CERTBOT=$(command -v certbot || echo "/usr/bin/certbot") 
+CMD_MV=$(command -v mv)
+CMD_CP=$(command -v cp)
+CMD_RM=$(command -v rm)
 
 tee "$SUDOERS_FILE" > /dev/null <<EOF
 $panel_user ALL=(ALL) NOPASSWD: $CMD_USERADD
@@ -313,6 +314,9 @@ $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL is-active xray
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SED
 $panel_user ALL=(ALL) NOPASSWD: $CMD_SYSTEMCTL daemon-reload
 $panel_user ALL=(ALL) NOPASSWD: $CMD_CERTBOT
+$panel_user ALL=(ALL) NOPASSWD: $CMD_MV
+$panel_user ALL=(ALL) NOPASSWD: $CMD_CP
+$panel_user ALL=(ALL) NOPASSWD: $CMD_RM
 $panel_user ALL=(ALL) NOPASSWD: /usr/bin/mkdir -p $NGINX_ROOT_CERTBOT
 $panel_user ALL=(ALL) NOPASSWD: /bin/rm -f /etc/nginx/sites-enabled/default
 EOF
@@ -358,6 +362,8 @@ chmod +x "$PANEL_BACKEND_DEST"
 cp "$REPO_ROOT/index.html" "$PANEL_HTML_DEST"
 cp "$REPO_ROOT/app.js" "$PANEL_JS_DEST"
 cp "$REPO_ROOT/login.html" "$LOGIN_HTML_DEST"
+# [V6.1 FIX] 确保 Xray config template 被复制，以便 panel.js 可以在运行时访问它
+cp "$REPO_ROOT/xray_config.json.template" "$PANEL_DIR/xray_config.json.template"
 if [ ! -f "$DB_PATH" ]; then echo "Database will be initialized on start."; fi
 [ ! -f "$WSS_LOG_FILE" ] && touch "$WSS_LOG_FILE"
 [ ! -f "$PANEL_DIR/audit.log" ] && touch "$PANEL_DIR/audit.log"
@@ -400,14 +406,18 @@ fi
 # 部署 Xray 配置文件 (NG 风格: /etc/wss-panel)
 # [REVERT] 使用 NG 风格模板并替换变量
 _XRAY_PORT_INTERNAL=${XRAY_PORT_INTERNAL:-10081}
+_XRAY_API_PORT=${XRAY_API_PORT:-10085} # [V6.1 NEW]
+_XRAY_WSPATH=${XRAY_WS_PATH:-/vless-ws} # [V6.1 NEW]
 _XRAY_UUID=${XRAY_UUID}
 
 echo "正在生成 Xray 初始配置 ($XRAY_CONFIG_PATH)..."
 cp "$XRAY_CONFIG_TEMPLATE" "$XRAY_CONFIG_PATH"
 
 sed -i "s|@XRAY_INTERNAL_PORT@|$_XRAY_PORT_INTERNAL|g" "$XRAY_CONFIG_PATH"
-# [REVERT] 移除 @INTERNAL_FORWARD_PORT@ 替换，NG 模板中没有此变量
 sed -i "s|@XRAY_UUID@|$_XRAY_UUID|g" "$XRAY_CONFIG_PATH"
+# [V6.1 CRITICAL FIX] 新增替换 Xray WS PATH 和 API PORT
+sed -i "s|@XRAY_WSPATH@|$_XRAY_WSPATH|g" "$XRAY_CONFIG_PATH"
+sed -i "s|@XRAY_API_PORT@|$_XRAY_API_PORT|g" "$XRAY_CONFIG_PATH"
 
 
 # [CRITICAL FIX] 预先创建 Xray 日志目录并赋予权限
@@ -517,7 +527,7 @@ if [ ! -f "$WSS_TEMPLATE" ]; then
 fi
 cp "$WSS_TEMPLATE" "$WSS_SERVICE_PATH"
 sed -i "s|@WSS_LOG_FILE_PATH@|$WSS_LOG_FILE|g" "$WSS_SERVICE_PATH"
-sed -i "s|@WSS_PROXY_SCRIPT_PATH@|$WSS_PROXY_SCRIPT_PATH|g" "$WSS_SERVICE_PATH"
+sed -i "s|@WSS_PROXY_SCRIPT_PATH@|$WSS_PROXY_PATH|g" "$WSS_SERVICE_PATH"
 
 # wss_panel service
 if [ ! -f "$PANEL_TEMPLATE" ]; then
@@ -670,7 +680,7 @@ iptables -I INPUT -p tcp --dport 80 -j ACCEPT
 iptables -I INPUT -p tcp --dport 443 -j ACCEPT
 iptables -I INPUT -p tcp --dport $STUNNEL_PORT -j ACCEPT
 iptables -I INPUT -p tcp --dport $PANEL_PORT -j ACCEPT
-iptables -I INPUT -p tcp --dport $UDPGW_PORT -j ACCEPT 
+iptables -I INPUT -p tcp --dport $UDPGW_PORT -j ACCEPT
 iptables -I INPUT -p udp --dport $UDPGW_PORT -j ACCEPT 
 iptables -I INPUT -p udp --dport $UDP_CUSTOM_PORT -j ACCEPT
 
