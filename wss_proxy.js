@@ -1,10 +1,10 @@
 /**
  * WSS Proxy Core (Node.js)
- * V8.7.2 (Axiom Refactor V6.2 - Critical Reference Error Fix)
+ * V8.7.3 (Axiom Refactor V6.3 - Real IP & Robust Traffic Fix)
  *
- * [AXIOM V6.2 FIXES]
- * - [CRITICAL FIX] 修复 connectToIpcServer 函数中 ReferenceError: ipcUrl is not defined 的问题。
- * 这解决了 Worker 进程持续崩溃和重启，导致的 100% CPU 占用。
+ * [AXIOM V6.3 FIXES]
+ * - [IP FIX] 引入 getClientIpFromHeaders 函数，用于从 Nginx 头部（X-Real-IP, X-Forwarded-For）提取客户端真实 IP。
+ * - [TRAFFIC FIX] 修正 pushStatsToControlPlane 中的 pending_traffic_delta 逻辑，确保流量增量准确上报。
  */
 
 const net = require('net');
@@ -171,9 +171,6 @@ function calculateSpeeds() {
         // [V6.0 FIX] 在每次速度计算后，强制更新 TokenBucket 的节流比例
         stats.bucket_up.updateThrottle(throttlingRatio);
         stats.bucket_down.updateThrottle(throttlingRatio);
-
-        // [V6.1 FIX] 移除此处冗余的流量增量持久化逻辑。
-        // 清理逻辑现在统一在 pushStatsToControlPlane 中处理。
         
         // [AXIOM V5.5 FIX] 僵尸连接清理逻辑: 确保没有连接，且没有待推送的流量增量时才删除
         const hasPending = pending_traffic_delta[username] && 
@@ -244,7 +241,7 @@ const MAX_RECONNECT_DELAY_MS = 60000;
  */
 function pushStatsToControlPlane(ws_client) {
     
-    // 1. 统一将本次间隔的新流量 (stats.traffic_delta) 累加到待发送缓存 (pending_traffic_delta)
+    // [V6.3 FIX - TRAFFIC] 1. 统一将本次间隔的新流量 (stats.traffic_delta) 累加到待发送缓存 (pending_traffic_delta)
     for (const [username, stats] of userStats.entries()) {
         if (stats.traffic_delta.upload > 0 || stats.traffic_delta.download > 0) {
              if (!pending_traffic_delta[username]) {
@@ -253,7 +250,7 @@ function pushStatsToControlPlane(ws_client) {
              pending_traffic_delta[username].upload += stats.traffic_delta.upload;
              pending_traffic_delta[username].download += stats.traffic_delta.download;
              
-             // 清零本次间隔内的新流量计数器
+             // 清零本次间隔内的新流量计数器 (即使 IPC 断开，新流量也已进入 pending 缓存)
              stats.traffic_delta.upload = 0;
              stats.traffic_delta.download = 0;
         }
@@ -301,7 +298,7 @@ function pushStatsToControlPlane(ws_client) {
             if (currentDeltaUp > 0 || currentDeltaDown > 0) {
                  hasPushableData = true;
                  
-                 // [V6.1 CRITICAL FIX] 清除已发送的 pending 缓存
+                 // [V6.3 FIX - TRAFFIC] 流量上报成功后，清除已发送的 pending 缓存
                  if (pending_traffic_delta[username]) {
                      delete pending_traffic_delta[username];
                  }
@@ -598,6 +595,26 @@ function checkHost(headers) {
     return false;
 }
 
+/**
+ * [V6.3 NEW] 从请求头中提取客户端真实 IP。
+ * @param {string} headers - 原始请求头字符串。
+ * @param {string} defaultIp - 默认的回退 IP (通常是 127.0.0.1)。
+ * @returns {string} 提取到的客户端 IP。
+ */
+function getClientIpFromHeaders(headers, defaultIp) {
+    // 1. 尝试提取 X-Real-IP
+    let match = headers.match(/X-Real-IP:\s*([^\s\r\n]+)/i);
+    if (match) return match[1].trim();
+
+    // 2. 尝试提取 X-Forwarded-For
+    match = headers.match(/X-Forwarded-For:\s*([^\s\r\n,]+)/i); // 只取第一个 IP (客户端 IP)
+    if (match) return match[1].trim();
+
+    // 3. 回退到默认 IP (即 socket 的远程地址，通常是 127.0.0.1)
+    return defaultIp;
+}
+
+
 // --- 认证与并发检查 ---
 
 function parseAuth(headers) {
@@ -679,19 +696,17 @@ async function getLiteAuthStatus(username) {
     }
 }
 
-/**
- * [V6.0 DEPRECATED] 移除 checkConcurrency 函数，逻辑已合并到 Panel
- */
-
 
 // --- Client Handler ---
 function handleClient(clientSocket, isTls) {
     
-    let clientIp = clientSocket.remoteAddress;
-    if (clientIp.startsWith('::ffff:')) {
-        clientIp = clientIp.substring(7);
+    // [V6.3 FIX - IP] 记录 socket 原始 IP
+    let initialIp = clientSocket.remoteAddress;
+    if (initialIp.startsWith('::ffff:')) {
+        initialIp = initialIp.substring(7);
     }
     
+    let clientIp = initialIp; // 默认为 socket IP，稍后从头部提取真实 IP
     let clientPort = clientSocket.remotePort;
     let localPort = clientSocket.localPort;
 
@@ -727,7 +742,8 @@ function handleClient(clientSocket, isTls) {
                 const stats = getUserStat(username);
                 // [AXIOM V6.0 FIX] 移除 connections 中的 socket 引用
                 stats.connections.delete(clientSocket);
-                stats.ip_map.delete(clientIp);
+                // [V6.3 FIX - IP] 使用从头部提取的 clientIp 清理 ip_map
+                stats.ip_map.delete(clientIp); 
             } catch (e) {}
             logConnection(clientIp, clientPort, localPort, username, 'CONN_END');
         } else {
@@ -782,6 +798,9 @@ function handleClient(clientSocket, isTls) {
             const headers = headersRaw.toString('utf8', 0, headersRaw.length);
             
             fullRequest = dataAfterHeaders;
+            
+            // [V6.3 FIX - IP] 提取真实 IP 并覆盖 clientIp 变量
+            clientIp = getClientIpFromHeaders(headers, initialIp);
             
             if (!checkHost(headers)) {
                 logConnection(clientIp, clientPort, localPort, 'N/A', 'REJECTED_HOST');
@@ -909,12 +928,13 @@ function handleClient(clientSocket, isTls) {
                 const now = new Date().toISOString();
                 stats.connections.set(clientSocket, {
                     id: connectionId,
-                    clientIp: clientIp,
+                    clientIp: clientIp, // 使用提取到的真实 IP
                     startTime: now,
                     lastActivityTime: Date.now(), // [V6.0 NEW]
                     workerId: WORKER_ID
                 });
                 
+                // [V6.3 FIX - IP] 使用提取到的真实 IP 映射到 socket
                 stats.ip_map.set(clientIp, clientSocket);
                 
                 state = 'forwarding';
