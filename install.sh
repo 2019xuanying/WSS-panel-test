@@ -5,9 +5,10 @@ set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板模块化部署脚本
-# V3.1 (Axiom V6.0 - Fix SSL Bootstrap)
+# V3.2 (Axiom V6.0 - Fix SSL & Nginx Regex)
 #
 # [CHANGELOG]
+# - [FIX] 修复 Nginx 启动时的 pcre_compile 错误 (空 Host 白名单导致)。
 # - [FIX] 自动生成自签名 SSL 证书以解决 Nginx 首次启动失败的问题。
 # - [FIX] 修正 Nginx 模板变量替换逻辑。
 # ==========================================================
@@ -631,7 +632,14 @@ else
     cp "$NGINX_TEMPLATE" "$NGINX_CONF_PATH"
     
     HOSTS_REGEX=$(cat "$PANEL_DIR/hosts.json" | grep -v '^\s*$' | tr '\n' '|')
-    if [ -n "$HOSTS_REGEX" ]; then HOSTS_REGEX="${HOSTS_REGEX%|}"; else HOSTS_REGEX="^$"; fi
+    # [FIX] Ensure valid regex even if hosts list is empty
+    if [ -z "$HOSTS_REGEX" ]; then
+        # Default to match nothing if list is empty, preventing empty regex error
+        HOSTS_REGEX="^$"
+    else
+        # Remove trailing pipe
+        HOSTS_REGEX="${HOSTS_REGEX%|}"
+    fi
 
     sed -i "s|@YOUR_DOMAIN@|$NGINX_DOMAIN|g" "$NGINX_CONF_PATH"
     sed -i "s|@PANEL_PORT@|$PANEL_PORT|g" "$NGINX_CONF_PATH"
