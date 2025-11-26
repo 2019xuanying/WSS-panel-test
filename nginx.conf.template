@@ -18,8 +18,9 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    # [FIX] 强制设置为默认服务器，处理 SNI 不匹配的情况 (免流 Host vs 服务器域名)
+    listen 443 ssl http2 default_server;
+    listen [::]:443 ssl http2 default_server;
     server_name @YOUR_DOMAIN@;
 
     ssl_certificate     @CERT_PATH@;
@@ -51,8 +52,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:@XRAY_PORT_INTERNAL@;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
+        # [FIX] 强制硬编码 WebSocket 头部，避免 Nginx 小写转换导致后端识别失败
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -65,8 +67,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:@WSS_PROXY_PORT_INTERNAL@;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
+        # [FIX] 强制硬编码 WebSocket 头部，避免 Nginx 小写转换导致后端识别失败
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
